@@ -1,4 +1,5 @@
 import cv2
+import json
 
 def get_panel_edges(cv2_image) -> list:
     """
@@ -68,6 +69,7 @@ def plot_points_on_image(cv2_image, points):
     cv2.destroyAllWindows()
 
 def map_panel_into_dot_points(panel_image):
+    json_path = "center_locations.json"
     panel = cv2.imread(panel_image)
     width, hight = panel.shape[:2]
     images_in_row = 15
@@ -76,9 +78,14 @@ def map_panel_into_dot_points(panel_image):
     dist_between_images_in_row = (panel_edges[1][0]-panel_edges[0][0])/14
     dist_between_rows_in_panel = (panel_edges[2][1] - panel_edges[0][1])/7
     center_locations = []
-    for dot_i in range(images_in_row):
-        for dot_j in range(rows_in_panel):
+    for dot_j in range(rows_in_panel):
+        for dot_i in range(images_in_row):
             center_locations.append((panel_edges[0][0] + (dist_between_images_in_row*dot_i),
                                         panel_edges[0][1] +  (dist_between_rows_in_panel*dot_j)))
+    # plot_points_on_image(panel, center_locations)
+    data = {"center_locations":center_locations}
+    with open(json_path, "w") as f:
+        json.dump(data, f, indent = 4)
     return center_locations
-    plot_points_on_image(panel, center_locations)
+
+

@@ -19,13 +19,9 @@ def show_running_video_live(eye_data, img_path):
     """
     # Read the image
     img = plt.imread(img_path)
-
-    # Extract the image dimensions
-    img_height, img_width, _ = img.shape
-
     # Extract the eye movement coordinates and fixation from the DataFrame
-    eye_x = eye_data[FIXATION_CSV_KEY_EYE_H].values * img_width  # Scale x from [0,1] to [0, image width]
-    eye_y = eye_data[FIXATION_CSV_KEY_EYE_V].values * img_height    # Scale y from [0,1] to [0, image height]
+    eye_x = eye_data[FIXATION_CSV_KEY_EYE_H].values * SCREEN_SIZE[1]  # Scale x from [0,1] to [0, image width]
+    eye_y = eye_data[FIXATION_CSV_KEY_EYE_V].values * SCREEN_SIZE[0]    # Scale y from [0,1] to [0, image height]
     fixation = eye_data[FIXATION_CSV_KEY_FIXATION].values  # Get fixation data
 
     # Create figure and axis for the video
@@ -73,8 +69,8 @@ def show_running_video(subject, task_code, output_path):
     img_height, img_width, _ = img.shape
 
     # Extract the eye movement coordinates and timestamps
-    eye_x = eye_data[:, 0][::6] * img_width  # Scale x from [0,1] to [0, image width]
-    eye_y = eye_data[:, 1][::6] * img_height  # Scale y from [0,1] to [0, image height]
+    eye_x = eye_data[:, 0][::6] * SCREEN_SIZE[1]  # Scale x from [0,1] to [0, image width]
+    eye_y = eye_data[:, 1][::6] * SCREEN_SIZE[0]  # Scale y from [0,1] to [0, image height]
 
     # Set up OpenCV video writer
     video_output_path = os.path.join(output_path, VIDEO_FILENAME_TEMPLATE.format(task_code=task_code, subject_name=subject.name))
@@ -95,7 +91,7 @@ def show_running_video(subject, task_code, output_path):
 
 
 
-def show_heatmap(subject_data, task_code, output_path):
+def show_heatmap(subject_data, task_code, output_path = "", show_plot = True):
     """
     Plots and saves a heat map of the eye movement for a given task.
     Saves the figure to <output_path> under the name "task_{task_code}_heatmap.jpg".
@@ -107,15 +103,12 @@ def show_heatmap(subject_data, task_code, output_path):
     eye_data = task_data[KEY_TOBII_DATA]
     img = plt.imread(task_data[KEY_TASK_PANEL_IMG])
 
-    # Extract the image dimensions
-    img_height, img_width, _ = img.shape
-
-    eye_x = eye_data[:, 0] * img_width  # Scale x from [0,1] to [0, image width]
-    eye_y = (1 - eye_data[:, 1]) * img_height  # Scale y from [0,1] to [0, image height]
+    eye_x = eye_data[:, 0] * SCREEN_SIZE[0]  # Scale x from [0,1] to [0, image width]
+    eye_y = (1 - eye_data[:, 1]) * SCREEN_SIZE[1]  # Scale y from [0,1] to [0, image height]
 
     # Create a 2D histogram (heatmap) of the eye positions
-    heatmap, _, _ = np.histogram2d(eye_x, eye_y, bins=[img_width, img_height], range=[[0, img_width], [0, img_height]])
-
+    heatmap, _, _ = np.histogram2d(eye_x, eye_y, bins=[SCREEN_SIZE[0], SCREEN_SIZE[1]], range=[[0, SCREEN_SIZE[0]], [0, SCREEN_SIZE[1]]])
+    img_height, img_width = SCREEN_SIZE
     # Apply Gaussian filter to smooth the heatmap
     heatmap = gaussian_filter(heatmap, sigma=GAUSSIAN_SIGMA)
 
@@ -124,11 +117,12 @@ def show_heatmap(subject_data, task_code, output_path):
     ax.imshow(img, extent=[0, img_width, 0, img_height], alpha=0.8)
     ax.imshow(heatmap.T, extent=[0, img_width, 0, img_height], origin='lower', cmap=HEATMAP_COLOR_MAP, alpha=HEATMAP_ALPHA)
 
-    # Save the heatmap
-    heatmap_output_path = os.path.join(output_path, HEATMAP_FILENAME_TEMPLATE.format(task_code=task_code, subject_name=subject_data.name))
-    plt.savefig(heatmap_output_path)
-
-    # plt.show()
+    if len(output_path) > 0:
+        # Save the heatmap
+        heatmap_output_path = os.path.join(output_path, HEATMAP_FILENAME_TEMPLATE.format(task_code=task_code, subject_name=subject_data.name))
+        plt.savefig(heatmap_output_path)
+    if show_plot:
+        plt.show()
 
 
 def create_gaze_heatmap_movie(img, func_gaze_data, output_filename):
@@ -188,11 +182,12 @@ def create_gaze_heatmap_movie(img, func_gaze_data, output_filename):
 
     print(GAZE_MOVIE_COMPLETE)
 
-def plot_histogram(data, x_title, title):
+def plot_histogram(data, x_title, title, label = ''):
     plt.clf()
-    plt.hist(data)
+    plt.hist(data, label=label)
     plt.xlabel(x_title)
     plt.title(title)
+    plt.legend()
     plt.show()
     plt.clf()
 
@@ -205,14 +200,25 @@ def plot_barplot(x_axis, y_axis, x_title, y_title, fig_title):
     plt.show()
     plt.clf()
 
+def plot_gaze_over_img(subject_data:ParticipantGazeDataManager, img_path, task_code):
+    img = plt.imread(img_path)
+    matching_dictionary = subject_data.matched_data
+    task_data = matching_dictionary[task_code]
+    eye_data = task_data[KEY_TOBII_DATA]
+    eye_x = eye_data[:, 0] * SCREEN_SIZE[1]  # Scale x from [0,1] to [0, image width]
+    eye_y = (eye_data[:, 1]) * SCREEN_SIZE[0]  # Scale y from [0,1] to [0, image height]
+    plt.imshow(img)
+    plt.scatter(eye_x, eye_y, s=3)
+    plt.show()
+
 if __name__=="__main__":
-    from glob import glob
-    
-    p_name = "LA627"
+    p_name = "FZ767"
     task = "SDMT"
-    group = "pwMS"
+    group = "HC"
+    panel = "i1"
+    panel_path = "/Users/nitzankarby/Desktop/dev/Nitzan_K/data/panels_images/panel_a5.jpg"
     data_path = "/Users/nitzankarby/Desktop/dev/Nitzan_K/data"
-            
-    subject_AA562 = ParticipantGazeDataManager(p_name, data_path, task, group)
-    show_running_video(subject_AA562, "l4", "/Users/nitzankarby/Desktop/dev/Nitzan_K/MS_processing/preprocessing_output")
-    # show_running_video_live(subject_AA562.save_fixation_to_csv("l4"), "/Users/nitzankarby/Desktop/dev/Nitzan_K/data/panels_images/panel_l4.jpg")
+    subject_data= ParticipantGazeDataManager(p_name, data_path, "SDMT", group)
+    plot_gaze_over_img(subject_data, panel_path,"l4")
+
+    

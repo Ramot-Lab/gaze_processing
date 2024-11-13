@@ -50,6 +50,7 @@ class ParticipantGazeDataManager:
     def group_task_info(self, tobii_data_file, task_png, audio_recordings, task_data, mat_file):
         matched_data_files = {}
         for i, task_name in enumerate(list(task_data.keys())[1::2]):
+            if f"panel_{i+1}" not in tobii_data_file.keys(): continue
             task_code = (task_name[-2:]).replace("_", "")
             task_code_lower = task_code.lower()
             png_img = [img for img in task_png if img.endswith(f"_{task_code_lower}.jpg")][0]
@@ -98,7 +99,7 @@ class ParticipantGazeDataManager:
 
         # Validate Dom_Eye
         Dom_Eye = data['Dom_Eye']
-        assert Dom_Eye in ['r', 'l'], 'Dom_Eye must be either "r" or "l"'
+        assert Dom_Eye.lower() in ['r', 'l'], 'Dom_Eye must be either "r" or "l"'
 
         # Select gaze data for each panel based on the dominant eye
         gaze_data = {}
@@ -107,10 +108,12 @@ class ParticipantGazeDataManager:
                 panel_data = np.concatenate((right_gaze[:, panel_presentation_indices[i]].T, np.reshape(tobi_ts[panel_presentation_indices[i]], (-1,1))), axis=1)
                 if (np.count_nonzero(np.isnan(panel_data))//2) / len(panel_data) < MAX_VALID_NAN_VALUES:
                     gaze_data[f'panel_{i+1}'] = panel_data
+
             else:
                 panel_data = np.concatenate((left_gaze[:, panel_presentation_indices[i]].T, np.reshape(tobi_ts[panel_presentation_indices[i]], (-1,1))), axis=1)
                 if (np.count_nonzero(np.isnan(panel_data))//2) / len(panel_data) < MAX_VALID_NAN_VALUES:
                     gaze_data[f'panel_{i+1}'] = panel_data
+
 
         # Calculate presentation durations
         presentation_info = {}
@@ -125,55 +128,60 @@ class ParticipantGazeDataManager:
         task_data = data['task_data'].__dict__
         return task_data, messages, gaze_data, presentation_info, Dom_Eye
     
-    def compute_sentence_boundaries_wav(self, panel, save_csv = False, show_result = False, save_image_path = ""):
+    def compute_sentence_boundaries_wav(self, panel, save_csv=False, show_result=False, save_image_path=""):
         audio_path = self.matched_data[panel]["audio_data"]
         signal, sr = librosa.load(audio_path, sr=None)
         signal_shape = len(signal)
         
         # Compute RMS energy
-        frame_length = 4096*2
-        hop_length = 1024*2
+        frame_length = 4096 * 2  # the window size within the average calculation
+        hop_length = 1024*2  # step size of the windows
         rms = librosa.feature.rms(y=signal, frame_length=frame_length, hop_length=hop_length)[0]
+        
+        # Check microphone quality
         median_signal = np.median(abs(signal))
         if median_signal > 0.01:
-            print(f"old microphone date, impossible to process panel: {panel} subject: {self.name}, date: {self.matched_data[panel][KEY_RECORDING_DATE]}")
+            print(f"Old microphone data, cannot process panel: {panel} subject: {self.name}, date: {self.matched_data[panel][KEY_RECORDING_DATE]}")
             return []
-        # Normalize the RMS values
+        
         rms_normalized = (rms - np.min(rms)) / (np.max(rms) - np.min(rms))
 
         # Detect speech based on a threshold
-        threshold = np.median(rms_normalized)
+        threshold = np.median(rms_normalized) + (np.std(rms_normalized) / 4)
         silence_indices = rms_normalized < threshold
-        rms_normalized[silence_indices]= 0
-        rms_normalized[rms_normalized!=0] = 1
-        rms_normalized_borders = np.diff(rms_normalized) 
+        rms_normalized[silence_indices] = 0
+        rms_normalized[rms_normalized != 0] = 1
+        rms_normalized_borders = np.diff(rms_normalized)
 
         # Translate frame indices to sample indices
         start_indices = np.where(rms_normalized_borders == 1)[0] * hop_length
         end_indices = np.where(rms_normalized_borders == -1)[0] * hop_length
-        start_indices_cleaned = []
-        end_indices_cleaned = []
-        min_speaking_time = 0.4 * sr
-        for s, e, in zip(start_indices, end_indices):
-            if e - s < min_speaking_time:
-                continue
-            else:
-                start_indices_cleaned.append(s)
-                end_indices_cleaned.append(e)
-        time_array = (np.arange(signal_shape) / sr) * 1000000  # translate to miliseconds
-        time_array = np.round((time_array), decimals=5) 
+
+        # Handle missing last end index if the last frame is a speech frame
+        if len(start_indices) > len(end_indices):
+            end_indices = np.append(end_indices, signal_shape - 1)  # append last index of signal if unclosed
+
+        min_speaking_time = 0.25 * sr # 0.25 * sec
+        time_array = (np.arange(signal_shape) / sr) * 1000000  # translate to milliseconds
+        time_array = np.round(time_array, decimals=5)
 
         output_map = []
-        for s, e in zip(start_indices_cleaned, end_indices_cleaned):
+        diff_array_start_end = end_indices - start_indices[:len(end_indices)]  # filter out short noises
+        declaration_diff_array_filter = diff_array_start_end < min_speaking_time
+        start_indices = start_indices[:len(end_indices)][~declaration_diff_array_filter]
+        end_indices = end_indices[~declaration_diff_array_filter]
+
+        for s, e in zip(start_indices, end_indices):
             output_map.append([time_array[s], s, 1])
-            output_map.append([time_array[min(e, len(time_array)-1)], e, -1])
+            output_map.append([time_array[min(e, len(time_array) - 1)], e, -1])
 
         out = pd.DataFrame(output_map, columns=[TIME_STAMP, SIGNAL_IDX, SENTENCE_BREAK])
+        
         if save_csv:
             out.to_csv(os.path.join(self.output_path, f"task_{panel}_audio_preprocess.csv"))
         if show_result or len(save_image_path) > 0:
             plt.plot(signal)
-            for i, j in zip(start_indices_cleaned, end_indices_cleaned):
+            for i, j in zip(start_indices, end_indices):
                 plt.vlines(x=i, ymin = -0.15, ymax=0.15, color = "g")
                 plt.vlines(x=j, ymin = -0.15, ymax=0.15, color = "r")
             # Create a time array based on sample rate
@@ -200,6 +208,10 @@ class ParticipantGazeDataManager:
         eyes[:, 0] = self.clean_outliers_single_eye(eyes[:, 0])
         eyes[:, 1] = self.clean_outliers_single_eye(eyes[:, 1])
         return eyes
+    
+    def clean_outliers_nan_removal(self, eyes):
+        eyes = eyes[~np.isnan(eyes[:,0])] 
+        return eyes
 
     def clean_outliers_single_eye(self, eye):
         eye_movment_l  = abs(eye[1:]-eye[:-1])
@@ -215,7 +227,6 @@ class ParticipantGazeDataManager:
 
     def fixation_finder(self, gaze_horizontal_deg, gaze_vertical_deg, sacc_parameters, tobii_fps=600):
         # Initialize parameters
-        saccade_vec = np.zeros((3, int(len(gaze_horizontal_deg))))  # Max number of saccades = 10/s
         # 1. smooth the data points with 15 ms kernel size
         smoothing_window = int(sacc_parameters["smoothing_window"] / ((1/tobii_fps)*1000))
         smooth_kernel = np.ones(shape=(smoothing_window,)) / smoothing_window
@@ -236,15 +247,16 @@ class ParticipantGazeDataManager:
         sample_difangle_vec_rad = np.diff(np.arctan2(np.deg2rad(gaze_vertical_deg), np.deg2rad(gaze_horizontal_deg)))
         sample_difangle_vec = np.rad2deg(np.abs(sample_difangle_vec_rad))
         movement = np.array([sample_speed_vec_per_sec, sample_difangle_vec]).T
+        minimum_fixation_period = int(sacc_parameters["min_fixation_time"]*tobii_fps)
         potantial_saccade = np.where((movement[:,0] > minimum_velocity_per_sample) & (movement[:,1] < maximum_angle_change))
         saccade = np.zeros_like(gaze_horizontal_deg)
         saccade[potantial_saccade] = 1
         result = []
         for i in range(len(saccade)):
-            if len(saccade[i: i+minimum_sacade_time_sec]) == sum(saccade[i: i+minimum_sacade_time_sec]):
-                result.append(0)
-            else:
+            if sum(saccade[i: i+minimum_fixation_period]) == 0:
                 result.append(1)
+            else:
+                result.append(0)
         return result
 
     
@@ -255,6 +267,13 @@ class ParticipantGazeDataManager:
         eyes_data[:,2] -= eyes_data[:,2][0]
         matched_data = np.concatenate((np.expand_dims(eyes_data[:,2], 1), np.expand_dims(eyes_data[:,0],1), np.expand_dims(eyes_data[:,1],1), np.expand_dims(fixation_array,1)), axis=1)
         df_data = pd.DataFrame(matched_data, columns= [TIME_STAMP, FIXATION_CSV_KEY_EYE_H, FIXATION_CSV_KEY_EYE_V, FIXATION_CSV_KEY_FIXATION])
+        ###### VALIDATION PLOT #######
+        # img = cv2.imread("/Users/nitzankarby/Desktop/dev/Nitzan_K/data/panels_images/panel_a5.jpg")#self.matched_data[panel][KEY_TASK_PANEL_IMG])
+        # plt.imshow(img)
+        # plt.scatter(matched_data[matched_data[:,-1]==1][:,1] * img.shape[1],
+        #             matched_data[matched_data[:,-1]==1][:,2]*img.shape[0], s=5)
+        # plt.show()
+        ##############################
         df_data.to_csv(os.path.join(self.output_path, f"task_{panel}_fixation.csv"))
         return df_data
 
@@ -275,6 +294,7 @@ class ParticipantGazeDataManager:
             'saccade_peak_velocity': 150,      # Peak velocity of a saccade (degrees/sec)
             'saccade_min_duration': 0.009,       # Minimum duration of a saccade (seconds)
             'saccade_angle_threshold': 30.0, # Maximum angle within a saccade (degrees)
+            'min_fixation_time' : 0.01, # Minimum time for a non-saccade movement to be considered as fixation
             'merge_overshoot': True,
             'overshoot_min_amp': 0.5,
             'merge_intrusions': 0,
@@ -284,8 +304,8 @@ class ParticipantGazeDataManager:
         }
         eye_data = self.matched_data[panel][KEY_TOBII_DATA]
         img_data = self.matched_data[panel][KEY_TASK_PANEL_IMG]
-        gaze_horizontal_pix = eye_data[:, 0] * 1920
-        gaze_vertical_pix = eye_data[:, 1] * 1080
+        gaze_horizontal_pix = eye_data[:, 0] * SCREEN_SIZE[1]
+        gaze_vertical_pix = eye_data[:, 1] * SCREEN_SIZE[0]
         # Convert gaze positions from pixels to degrees
         mid_of_image = np.array(cv2.imread(img_data).shape[:2]) // 2
         horizontal_offset = gaze_horizontal_pix - mid_of_image[1]
@@ -293,7 +313,7 @@ class ParticipantGazeDataManager:
         gaze_horizontal_deg = np.degrees(np.arctan2(horizontal_offset * PIXEL2METER, screenDistance))
         gaze_vertical_deg = np.degrees(np.arctan2(vertical_offset * PIXEL2METER, screenDistance))
 
-        # Call a function to detect saccades (Assumed function `saccade_workhorse_kd`)
+        # Call a function to detect saccades 
         panel_saccade_vec = self.fixation_finder(
             gaze_horizontal_deg, gaze_vertical_deg, sacc_parameters, tobii_fps)
         return panel_saccade_vec
@@ -314,19 +334,10 @@ class ParticipantGazeDataManager:
             
 if __name__=="__main__":
     from visualize_data import show_running_video_live
-    # panel_path = "/Users/nitzankarby/Desktop/dev/Nitzan_K/data/panels_images/panel_a5.jpg"
-    # dots_on_panel_location = map_panel_into_dot_points(panel_path)
-    # print(dots_on_panel_location)
-    p_name = "YS875"
+    p_name = "FZ767"
     task = "SDMT"
-    group = "pwMS"
-    # panel = "i1"
+    group = "HC"
+    panel = "i1"
+    panel_path = "/Users/nitzankarby/Desktop/dev/Nitzan_K/data/panels_images/panel_a5.jpg"
     data_path = "/Users/nitzankarby/Desktop/dev/Nitzan_K/data"
-    subject_data = ParticipantGazeDataManager(p_name, data_path, task, group)
-    # # fixation_data = subject_data.save_fixation_to_csv(panel)
-    for panel in subject_data.matched_data.keys():
-        audio_data = subject_data.compute_sentence_boundaries_wav(panel, save_csv=False, show_result=True)
-    # # correlated_data = subject_data.correlate_fixation_audio_in_time(fixation_data, audio_data)
-    # # data = pd.read_csv("/Users/nitzankarby/Desktop/dev/Nitzan_K/data/processing_results/AA562/task_0_fixation.csv")
-    # img_path = subject_data.matched_data[panel][KEY_TASK_PANEL_IMG]
-    # show_running_video_live(data, img_path)
+    subject_data= ParticipantGazeDataManager(p_name, data_path, "SDMT", group)
