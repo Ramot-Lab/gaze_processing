@@ -3,7 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
-def plot_correlation_scatter(array, l_size):
+def plot_correlation_scatter(array, l_size, subject_amount):
     """
     Plots scatter plot of the correlation matrix
     array: np.array, matrix of correlations, shape n_repetitions,
@@ -22,6 +22,7 @@ def calculate_reliability(data, L_size, repetitions, min_value, plot = True):
     repetitions: number of times the repetitions.
     """
     array_corr = np.zeros(repetitions)
+    subjects_amount = len(data)
     for i in range(repetitions):
         
         shuffle_data = np.random.permutation(np.arange(min_value))
@@ -36,7 +37,7 @@ def calculate_reliability(data, L_size, repetitions, min_value, plot = True):
         array_corr[i] = np.corrcoef(selected_matrix_1, selected_matrix_2)[0,1]
     # fig, ax = plt.subplots(1, 1, figsize=(8,6))
     if plot:
-        plot_correlation_scatter(array_corr, L_size)
+        plot_correlation_scatter(array_corr, L_size, subjects_amount)
     return np.mean(array_corr), L_size
 
 def calculate_reliability_distribution(data, min_l, max_l, repetitions, min_value):

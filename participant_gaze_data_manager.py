@@ -12,7 +12,7 @@ from datetime import datetime
 import re
 
 class ParticipantGazeDataManager:
-    def __init__(self, participant_name, main_data_path, task = "SDMT", participant_group = "pwMS") -> None:
+    def __init__(self, participant_name, main_data_path, task = "SDMT", participant_group = "pwMS", clean_gaze_data = True) -> None:
         group_path, self.name = os.path.split(participant_name)
         _,  self.group = os.path.split(group_path)
         tobii_data, task_png, audio_recordings = self.load_data(participant_name , main_data_path, task, participant_group)
@@ -22,7 +22,7 @@ class ParticipantGazeDataManager:
         os.makedirs(self.output_path, exist_ok=True)
         for mat_file in tobii_data:
             self.task_data, self.messages, self.gaze_data, self.presentation_info, self.dom_Eye = self.prepare_gaze_data_for_preprocessing(mat_file)
-            self.matched_data = {**self.matched_data, **self.group_task_info(self.gaze_data, task_png, audio_recordings, self.task_data, mat_file)}
+            self.matched_data = {**self.matched_data, **self.group_task_info(self.gaze_data, task_png, audio_recordings, self.task_data, mat_file, clean_gaze_data)}
         
 
     def get_creation_time(self, tobii_data):
@@ -47,7 +47,7 @@ class ParticipantGazeDataManager:
         return [scio.loadmat(mat, struct_as_record=False, squeeze_me=True) for mat in mat_files], task_png_files, recording_files
     
 
-    def group_task_info(self, tobii_data_file, task_png, audio_recordings, task_data, mat_file):
+    def group_task_info(self, tobii_data_file, task_png, audio_recordings, task_data, mat_file, clean_gaze_data):
         matched_data_files = {}
         for i, task_name in enumerate(list(task_data.keys())[1::2]):
             if f"panel_{i+1}" not in tobii_data_file.keys(): continue
@@ -55,13 +55,14 @@ class ParticipantGazeDataManager:
             task_code_lower = task_code.lower()
             png_img = [img for img in task_png if img.endswith(f"_{task_code_lower}.jpg")][0]
             audio_file = [audio for audio in audio_recordings if os.path.split(audio)[1].split("_")[2].lower() == task_code_lower][0]
-            matched_data_files[task_code_lower] = {KEY_TOBII_DATA: self.clean_outliers(tobii_data_file[f"panel_{i+1}"]),
+            preprocess_gaze_method = self.clean_outliers if clean_gaze_data else self.clean_outliers_no_interpolation
+            matched_data_files[task_code_lower] = {KEY_TOBII_DATA: preprocess_gaze_method(tobii_data_file[f"panel_{i+1}"]),
                                                    KEY_TASK_PANEL_IMG : png_img,
                                                    KEY_AUDIO_DATA :  audio_file,
                                                    KEY_STRIKE_SCORE : task_data[f"strikes_img_test_{task_code}"],
                                                    KEY_RECORDING_DATE : self.get_creation_time(mat_file)}
         return matched_data_files
-            
+
 
         
     def prepare_gaze_data_for_preprocessing(self, data):
@@ -204,6 +205,12 @@ class ParticipantGazeDataManager:
         eye[nans] = np.interp(eye_temp(nans), eye_temp(~nans), eye[~nans])
         return eye
     
+    def clean_outliers_no_interpolation(self,gaze_data):
+        gaze_data[:, 0] = self.clean_outliers_single_eye(gaze_data[:, 0], False)
+        gaze_data[:, 1] = self.clean_outliers_single_eye(gaze_data[:, 1], False)
+        return gaze_data
+        
+
     def clean_outliers(self, eyes):
         eyes[:, 0] = self.clean_outliers_single_eye(eyes[:, 0])
         eyes[:, 1] = self.clean_outliers_single_eye(eyes[:, 1])
@@ -213,15 +220,14 @@ class ParticipantGazeDataManager:
         eyes = eyes[~np.isnan(eyes[:,0])] 
         return eyes
 
-    def clean_outliers_single_eye(self, eye):
-        eye_movment_l  = abs(eye[1:]-eye[:-1])
-        eye_movment_r  = abs(eye[:-1]-eye[1:])
-        outlier_cutoff = np.mean([np.nanmean(eye_movment_l), np.nanmean(eye_movment_r)]) + (2*np.mean([np.nanstd(eye_movment_l), np.nanstd(eye_movment_r)]))
+    def clean_outliers_single_eye(self, eye, interpolate = True):
+        eye_movment_l  = abs(np.diff(eye))
+        outlier_cutoff = (np.nanstd(eye_movment_l)*8) + np.nanmean(eye_movment_l)
         outlier_values_l = (eye_movment_l > outlier_cutoff)
-        outlier_values_r = (eye_movment_r > outlier_cutoff)
-        outlier_values = outlier_values_l & outlier_values_r
-        outlier_values = np.concatenate(([False], outlier_values))
+        outlier_values = np.concatenate(([False], outlier_values_l))
         eye[outlier_values] = None
+        if interpolate == False:
+            return eye
         return self.interpulate_nan_values(eye)
     
 
@@ -250,13 +256,13 @@ class ParticipantGazeDataManager:
         minimum_fixation_period = int(sacc_parameters["min_fixation_time"]*tobii_fps)
         potantial_saccade = np.where((movement[:,0] > minimum_velocity_per_sample) & (movement[:,1] < maximum_angle_change))
         saccade = np.zeros_like(gaze_horizontal_deg)
-        saccade[potantial_saccade] = 1
+        saccade[potantial_saccade] = SACCADE_IDX
         result = []
         for i in range(len(saccade)):
             if sum(saccade[i: i+minimum_fixation_period]) == 0:
-                result.append(1)
+                result.append(FIXATION_IDX)
             else:
-                result.append(0)
+                result.append(SACCADE_IDX)
         return result
 
     
@@ -267,13 +273,6 @@ class ParticipantGazeDataManager:
         eyes_data[:,2] -= eyes_data[:,2][0]
         matched_data = np.concatenate((np.expand_dims(eyes_data[:,2], 1), np.expand_dims(eyes_data[:,0],1), np.expand_dims(eyes_data[:,1],1), np.expand_dims(fixation_array,1)), axis=1)
         df_data = pd.DataFrame(matched_data, columns= [TIME_STAMP, FIXATION_CSV_KEY_EYE_H, FIXATION_CSV_KEY_EYE_V, FIXATION_CSV_KEY_FIXATION])
-        ###### VALIDATION PLOT #######
-        # img = cv2.imread("/Users/nitzankarby/Desktop/dev/Nitzan_K/data/panels_images/panel_a5.jpg")#self.matched_data[panel][KEY_TASK_PANEL_IMG])
-        # plt.imshow(img)
-        # plt.scatter(matched_data[matched_data[:,-1]==1][:,1] * img.shape[1],
-        #             matched_data[matched_data[:,-1]==1][:,2]*img.shape[0], s=5)
-        # plt.show()
-        ##############################
         df_data.to_csv(os.path.join(self.output_path, f"task_{panel}_fixation.csv"))
         return df_data
 

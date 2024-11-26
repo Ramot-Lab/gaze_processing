@@ -12,6 +12,16 @@ from constants import *
 MARKER_SIZE = 10  # Set your marker size
 ANIMATION_INTERVAL = 20  # Set your animation interval
 BLIT = True  # Use blitting to optimize performance
+evt_color_map = dict({
+        0: 'gray',  #0. Undefined
+        1: 'b',     #1. Fixation
+        2: 'r',     #2. Saccade
+        3: 'y',     #3. Post-saccadic oscillation
+        4: 'm',     #4. Smooth pursuit
+        5: 'k',     #5. Blink
+        9: 'k',     #9. Other
+    })
+
 
 def show_running_video_live(eye_data, img_path):
     """
@@ -34,10 +44,10 @@ def show_running_video_live(eye_data, img_path):
     # Update function for animation
     def update(i):
         # Change color based on fixation
-        if fixation[i] == 0:
-            eye_plot.set_color('red')  # Fixation 0 -> red
+        if fixation[i] == SACCADE_IDX:
+            eye_plot.set_color('red')  # saccade  -> red
         else:
-            eye_plot.set_color('blue')  # Fixation 1 -> blue
+            eye_plot.set_color('blue')  # Fixation  -> blue
         
         eye_plot.set_data(eye_x[i], eye_y[i])  # Update eye position
         return eye_plot,
@@ -211,14 +221,55 @@ def plot_gaze_over_img(subject_data:ParticipantGazeDataManager, img_path, task_c
     plt.scatter(eye_x, eye_y, s=3)
     plt.show()
 
+def plot_gazeNet_fig(data, spath = None, save=False, show=True, title=None):
+    '''Plots trial
+    '''
+    if show:
+        plt.ion()
+    else:
+        plt.ioff()
+    if 'x' in data.keys():
+        horizontal, vertical, time = ('x', 'y', 't')
+    else:
+        horizontal, vertical, time = (FIXATION_CSV_KEY_EYE_H, FIXATION_CSV_KEY_EYE_V, TIME_STAMP)
+    fig = plt.figure(figsize=(10,6))
+    ax00 = plt.subplot2grid((2, 2), (0, 0))
+    ax10 = plt.subplot2grid((2, 2), (1, 0), sharex=ax00)
+    ax01 = plt.subplot2grid((2, 2), (0, 1), rowspan=2)
+
+    ax00.plot(data[time], data[horizontal], '-')
+    ax10.plot(data[time], data[vertical], '-')
+    ax01.plot(data[horizontal], data[vertical], '-')
+    for e, c in evt_color_map.items():
+        mask = data['evt'] == e
+        ax00.plot(data[time][mask], data[horizontal][mask], '.', color = c)
+        ax10.plot(data[time][mask], data[vertical][mask], '.', color = c)
+        ax01.plot(data[horizontal][mask], data[vertical][mask], '.', color = c)
+
+    etdata_extent = np.nanmax([np.abs(data[horizontal]), np.abs(data[vertical])])+1
+
+    ax00.axis([data[time].min(), data[time].max(), -etdata_extent, etdata_extent])
+    ax10.axis([data[time].min(), data[time].max(), -etdata_extent, etdata_extent])
+    ax01.axis([-etdata_extent, etdata_extent, -etdata_extent, etdata_extent])
+
+    if title is not None:
+        plt.suptitle(title)
+    plt.tight_layout()
+
+    plt.show()
+    if save and not(spath is None):
+        plt.savefig('%s.png' % (spath))
+        plt.close()
+
 if __name__=="__main__":
-    p_name = "FZ767"
+    p_name = "LE750"
     task = "SDMT"
     group = "HC"
     panel = "i1"
     panel_path = "/Users/nitzankarby/Desktop/dev/Nitzan_K/data/panels_images/panel_a5.jpg"
-    data_path = "/Users/nitzankarby/Desktop/dev/Nitzan_K/data"
+    data_path = "/Volumes/labs/ramot/rotation_students/Nitzan_K/MS/Results/Behavior"
     subject_data= ParticipantGazeDataManager(p_name, data_path, "SDMT", group)
-    plot_gaze_over_img(subject_data, panel_path,"l4")
+    fixation_data = subject_data.save_fixation_to_csv('l4')
+    plot_gazeNet_fig(fixation_data)
 
     

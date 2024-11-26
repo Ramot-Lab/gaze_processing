@@ -1,3 +1,5 @@
+import math
+
 KEY_TOBII_DATA = "tobii_data"  # Key for Tobii eye movement data
 KEY_TASK_PANEL_IMG = "task_panel_img"  # Key for the image of the task panel
 KEY_AUDIO_DATA = "audio_data"  # Key for the audio data file path
@@ -60,12 +62,16 @@ VIDEO_OUTPUT_WITH_AUDIO = "participant_task_{task_code}_{subject_name}_audio.mp4
 
 FIXATION_CSV_KEY_EYE_H ="eye_horizontal"
 FIXATION_CSV_KEY_EYE_V ="eye_vertical"
-FIXATION_CSV_KEY_FIXATION ="fixation"
+FIXATION_CSV_KEY_FIXATION ="evt"
+SACCADE_IDX = 2
+FIXATION_IDX = 1
 
 PIXEL2METER = 0.000264583
 ROW_SIZE = 8
 SCREEN_SIZE = [1080,1920] #(height, width), (vertical, horizontal)
-
+PIXEL2METER = 0.000264583  # Conversion factor for 96 DPI (pixels to meters)
+screenDistance = 0.65  
+deg_per_pixel = 2 * math.degrees(math.atan((PIXEL2METER / 2) / screenDistance))
 
 panel_center_locations = [
         [537.0,296.0],

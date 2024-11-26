@@ -177,7 +177,7 @@ def eye_location_in_declaration(correlated_data, panel_name, subject_name):
         percent_looking_key = len(eye_ver_seg[eye_ver_seg < KEYS_LOCATION[1]]) / len(eye_ver_seg)
         percent_looking_board = 1 - percent_looking_key
         location_at_declaration_start = "up" if np.mean(eye_ver_seg[:30]) < KEYS_LOCATION[1] else "down"
-        time_at_fixation = len(segment[segment["fixation"] == 0]) / len(segment)
+        time_at_fixation = len(segment[segment["fixation"] == FIXATION_IDX]) / len(segment)
 
         # Append results to lists
         percent_looking_key_list.append(percent_looking_key)
@@ -288,15 +288,19 @@ def calculate_all_subjects_declaration_time(data_path, task, minimal_declaration
                     bar_plot_array.append([np.median(panel_declaration_score), np.std(panel_declaration_score)])
                     number_of_panels += 1
                     declaration_time_samples.extend(panel_declaration_score)
+                else:
+                    print(cur.name, panel_name)
             bar_plot_array = np.array(bar_plot_array)
             if number_of_panels == 6:
+                # if len(declaration_time_samples) == 0 : continue
                 participants_results_matrix.append(np.array(declaration_time_samples))
                 data_for_plotting_map[cur.name] = {"mean":np.median(bar_plot_array[:,0]),
-                                                   "std": np.median(bar_plot_array[:,1]),
-                                                   "group": cur.group}
+                                                    "std": np.median(bar_plot_array[:,1]),
+                                                    "group": cur.group}
     plot_data(data_for_plotting_map, y_label="Mean Declaration Time (ms)", title= f"Mean Declaration Time; {len(data_for_plotting_map.keys())} subjects")
-    distribution = calculate_reliability_distribution(participants_results_matrix, 20, 60, 10000, minimal_declaration_count*PANEL_AMOUNT)
-    plot_barplot(list(range(20,60)) ,distribution, "L value","reliability value", "reliability distribution over different L values")
+    min_val = min([len(participant_arr) for participant_arr in participants_results_matrix])
+    distribution = calculate_reliability_distribution(participants_results_matrix, 10, int(min_val//2), 10000, min_val)
+    plot_barplot(list(range(10,int(min_val//2))) ,distribution, "L value","reliability value", "reliability distribution over different L values")
     
 
 def distance_from_target_symbol_analysis(cur_data : ParticipantGazeDataManager):
@@ -340,7 +344,7 @@ def get_closest_fixation_distance(correlated_data, target, panel_img):
     end = np.where([segments_fixation==-1])[1]
     best_dist = np.inf
     # fixation = None
-    if correlated_array[0,-1] == 1:
+    if correlated_array[0,-1] == FIXATION_IDX:
         start = np.concatenate([[0], start])
     for s, e in zip(start, end):
         relevant_array = correlated_array[s:e]
@@ -386,7 +390,7 @@ def calculate_dist_from_target(data_path, task):
     distribution = calculate_reliability_distribution(participants_results_matrix, 5, int(min_val//2), 10000, min_val)
     plot_barplot(list(range(5,int(min_val//2))) ,distribution, "L value","reliability value", "reliability distribution over different L values")
 
-def plot_grades(data_path):
+def plot_grades(data_path, task = "SDMT"):
     grades = {}
     for cur_group in ["pwMS", "HC"]:
         for subject_name in glob(os.path.join(data_path, cur_group, "*")):
@@ -401,12 +405,13 @@ def plot_grades(data_path):
             for panel in cur.matched_data.keys():
                 panels_grade.append(cur.matched_data[panel][KEY_STRIKE_SCORE])
             grades[cur.name] = {"mean":np.mean(panels_grade),
-                                "std":np.std(panels_grade)}
+                                "std":np.std(panels_grade),
+                                "group" : cur_group}
     plot_data(grades, "SDMT panel scores", "SDMT final score")
             
 
 if __name__=="__main__":
     data_path = "/Users/nitzankarby/Desktop/dev/Nitzan_K/data"
-    plot_grades(data_path)
-    calculate_dist_from_target(data_path, task='SDMT')
+    # plot_grades(data_path)
+    # calculate_dist_from_target(data_path, task='SDMT')
     calculate_all_subjects_declaration_time(data_path, task='SDMT', minimal_declaration_count=30)
