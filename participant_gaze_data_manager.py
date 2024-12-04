@@ -59,10 +59,10 @@ class ParticipantGazeDataManager:
             if f"panel_{i+1}" not in tobii_data_file.keys(): continue
             task_code = (task_name[-2:]).replace("_", "")
             task_code_lower = task_code.lower()
-            png_img = [img for img in task_png if img.endswith(f"_{task_code_lower}.jpg")][0]
+            png_imgs = [img for img in task_png if img.endswith(f"_{task_code_lower}.jpg")]
+            png_img = None if len(png_imgs) == 0 else png_imgs[0]
             audio_files = [audio for audio in audio_recordings if task_code_lower in os.path.split(audio)[1].split("_")[audio_idx].lower()]
-            if len(audio_files) == 0: continue
-            audio_file = audio_files[0]
+            audio_file = None if len(audio_files) == 0 else audio_files[0]
             preprocess_gaze_method = self.clean_outliers if clean_gaze_data else self.clean_outliers_no_interpolation
             matched_data_files[task_code_lower] = {KEY_TOBII_DATA: preprocess_gaze_method(tobii_data_file[f"panel_{i+1}"]),
                                                    KEY_TASK_PANEL_IMG : png_img,
@@ -150,6 +150,9 @@ class ParticipantGazeDataManager:
 
     def compute_sentence_boundaries_wav(self, panel, save_csv=False, show_result=False, save_image_path=""):
         audio_path = self.matched_data[panel]["audio_data"]
+        if audio_path is None:
+            print(f"No audio data for panel: {panel} subject: {self.name}, date: {self.matched_data[panel][KEY_RECORDING_DATE]}")
+            return []
         signal, sr = librosa.load(audio_path, sr=None)
         signal_shape = len(signal)
         

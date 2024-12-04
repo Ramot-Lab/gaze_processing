@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from torch.utils.data.sampler import Sampler
 import os
+from constants import *
 from utils import BoxMuller_gaussian
 
 def load_npy_files(data_path, config, train_val='train'):
@@ -32,6 +33,9 @@ def load_npy_files(data_path, config, train_val='train'):
     data_list = []
     for _fpath in FILES:
         _data = np.load(_fpath)
+        if _data.dtype.names is None or not set(_data.dtype.names).issuperset({'t', 'x', 'y', 'evt', 'status'}):
+            _data = np.core.records.fromarrays([_data[:,0], _data[:,1], _data[:,2], _data[:,3], _data[:,4]],
+                                               dtype=[('t', '<f8'), ('x', '<f4'), ('y', '<f4'), ('status', '<u1'), ('evt', '<u1')])
         _mask = np.in1d(_data['evt'], config['events'])
         _data['status'][~_mask] = False
 
@@ -56,7 +60,7 @@ def filter_relevant_files(npy_files, config, train_val='train'):
     filtered_files : list
         List of filtered npy files.
     """
-    return [f for f in npy_files if f.split()[-1].split('_')[0] in config['filter'][train_val]]
+    return [f for f in npy_files if os.path.split(f)[-1].split("_")[0] in config['filter'][train_val]]
 
 class EventParser(object):
     def __init__(self, config):
@@ -203,3 +207,25 @@ class GazeDataLoader(DataLoader):
         np.random.seed(seed)
         self.collate_fn = _collate_fn
         #self.sampler = RandomSampler(*args)
+
+
+class FixationDataset(EMDataset):
+    
+    def __init__(self, config, gaze_data):
+        self.config = config
+        gaze_data = self.break_data_into_fixaitons(gaze_data)
+        super().__init__(config, gaze_data)
+
+    def break_data_into_fixaitons(self, gaze_data):
+        fixation_gaze_data = []
+        for recording in gaze_data:
+            recording = recording[recording['evt'] == FIXATION_IDX]
+            separation_parts = np.where(np.diff(recording['t'])>np.median(np.diff(recording['t'])))[0]
+            i = 0
+            for j in separation_parts:
+                if j - i < self.config['seq_len']: 
+                    i = j
+                    continue
+                fixation_gaze_data.append(recording[i:j+1])
+                i = j+1
+        return fixation_gaze_data

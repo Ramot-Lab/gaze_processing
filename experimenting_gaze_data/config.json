@@ -1,6 +1,6 @@
 {
     "cuda": false, 
-    "mode": "test", 
+    "mode": "train", 
     "seq_len": 200, 
     "split_seqs": true, 
     "events": [
@@ -14,28 +14,27 @@
         0.5, 
         0.005
     ], 
-    "train_data_path":  "/Users/nitzankarby/Desktop/dev/Nitzan_K/MS_processing/data_for_training_gazeNet", 
+    "train_data_path":  "data_for_training", 
     
     "val_data_path": 
-        "/Users/nitzankarby/Desktop/dev/Nitzan_K/MS_processing/data_for_training_gazeNet" , 
+        "data_for_training" , 
     "filter":{
         "train" : ["l4", "l3", "a3","a5","i1"],
         "val" : ["0"]
     },
-    "data_train_gen": [
-        "data.unpaired_clean.pkl"
-    ], 
     "save_every": 50, 
     "val_every": 50, 
     "batch_size": 20, 
     "keep_prob": 0.75, 
     "learning_rate": 0.001, 
-    "latent_dim" : 16,
+    "latent_dim" : 24,
     "learning_rate_anneal": 1.0, 
     "test_interval": 20,
     "model_name": [
         "gazeNET_0004_00003750.pth.tar"
     ], 
+    "logs_path" : "model_runs",
+
     "max_to_keep": 0, 
     "architecture": {
         "conv_stack": [

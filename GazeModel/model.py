@@ -15,20 +15,6 @@ import torch.nn as nn
 
 from tensorboard import summary
 
-# def checkpoint(model, step=None, epoch=None):
-#     package = {
-#         'epoch': epoch if epoch else 'N/A',
-#         'step': step if step else 'N/A',
-#         'state_dict': model.state_dict(),
-#     }
-#     return package
-
-# def anneal_learning_rate(optimizer, lr):
-#     optim_state = optimizer.state_dict()
-#     optim_state['param_groups'][0]['lr'] = lr
-#     optimizer.load_state_dict(optim_state)
-#     print('Learning rate annealed to: {lr:.6f}'.format(lr=optim_state['param_groups'][0]['lr']))
-
 def load(model, fpath_model):
     print (fpath_model)
     if os.path.exists(fpath_model) :
@@ -58,24 +44,6 @@ def load(model, fpath_model):
         epoch = 1
         print ("Pretrained model not found")
     return model, epoch
-
-
-# def calc_params(model):
-#     all_params = OrderedDict()
-#     params = model.state_dict()
-
-#     for _p in params.keys():
-#         #if not('ih_l0_reverse' in _p):
-#         all_params[_p] = params[_p].nelement()
-#     return all_params
-
-# def param_summary(model, writer, step):
-#     state = model.state_dict()
-#     for _p in state.keys():
-#         param = state[_p].cpu().numpy()
-
-#         s = summary.histogram(_p, param.flatten())
-#         writer.add_summary(s, global_step = step)
 
 class SequenceWise(nn.Module):
     def __init__(self, module):
