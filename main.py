@@ -1,5 +1,5 @@
 from participant_gaze_data_manager import ParticipantGazeDataManager
-from training_npy_generator import GazeDataProcessor
+from data_processing.training_npy_generator import MultipleGazeDataProcessor
 import os
 import glob
 
@@ -9,7 +9,7 @@ def convert_recordings_to_npy(data_path: str, task: str) -> None:
 
     This function loads the recordings from the SDMT task and converts them to npy files.
     The recordings are loaded using the ParticipantGazeDataManager class and then processed
-    using the GazeDataProcessor class.
+    using the MultipleGazeDataProcessor class.
 
     Parameters
     ----------
@@ -28,8 +28,9 @@ def convert_recordings_to_npy(data_path: str, task: str) -> None:
             data_managers.append(
                 ParticipantGazeDataManager(subject_name, data_path, task, group, clean_gaze_data=True)
             )
-    processor = GazeDataProcessor(data_managers)
+    processor = MultipleGazeDataProcessor(data_managers)
     processor.process_gaze_data("data_for_training", show=True)
 
 data_path = "/Volumes/labs/ramot/rotation_students/Nitzan_K/MS/Results/Behavior"
 convert_recordings_to_npy(data_path, "SDMT")
+convert_recordings_to_npy(data_path, "KD") 

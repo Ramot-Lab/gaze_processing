@@ -1,4 +1,5 @@
 import math
+from enum import Enum
 
 KEY_TOBII_DATA = "tobii_data"  # Key for Tobii eye movement data
 KEY_TASK_PANEL_IMG = "task_panel_img"  # Key for the image of the task panel
@@ -63,8 +64,15 @@ VIDEO_OUTPUT_WITH_AUDIO = "participant_task_{task_code}_{subject_name}_audio.mp4
 FIXATION_CSV_KEY_EYE_H ="eye_horizontal"
 FIXATION_CSV_KEY_EYE_V ="eye_vertical"
 FIXATION_CSV_KEY_FIXATION ="evt"
+FIXATION_VALID_STATUS = "status"
 SACCADE_IDX = 2
 FIXATION_IDX = 1
+
+class ModelPropertise(Enum):
+    MODEL_PATH = "/Users/nitzankarby/Desktop/dev/Nitzan_K/MS_processing/GazeModel/gazeNET_0004_00003750.pth.tar"
+    EVENTS = [1,2,3]
+
+
 
 PIXEL2METER = 0.000264583
 ROW_SIZE = 8

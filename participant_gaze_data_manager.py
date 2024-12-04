@@ -3,22 +3,27 @@ import numpy as np
 import pandas as pd
 import os
 from glob import glob
-import cv2
+import torch
 import librosa
 from constants import *
 from utils import *
 import matplotlib.pyplot as plt
 from datetime import datetime
+import GazeModel.model as gazeNET_model
+from GazeModel.recording_data_runner import RecordingDataRunner, generate_fixation_model_based
 import re
 
 class ParticipantGazeDataManager:
     def __init__(self, participant_name, main_data_path, task = "SDMT", participant_group = "pwMS", clean_gaze_data = True) -> None:
         group_path, self.name = os.path.split(participant_name)
         _,  self.group = os.path.split(group_path)
+        self.task = task
+        self.task_validation_filter_param = "run" if task == "SDMT" else "kd"
         tobii_data, task_png, audio_recordings = self.load_data(participant_name , main_data_path, task, participant_group)
         self.matched_data = {}
         self.main_data_path = main_data_path
         self.output_path = os.path.join(main_data_path, "processing_results", self.name)
+        self.model = None
         os.makedirs(self.output_path, exist_ok=True)
         for mat_file in tobii_data:
             self.task_data, self.messages, self.gaze_data, self.presentation_info, self.dom_Eye = self.prepare_gaze_data_for_preprocessing(mat_file)
@@ -41,25 +46,28 @@ class ParticipantGazeDataManager:
         if not os.path.exists(task_files_path):
             raise f"no such path {task_files_path}"
         mat_files = glob(os.path.join(task_files_path, "*.mat"))
-        mat_files = [file_path for file_path in mat_files if "run" in os.path.split(file_path)[1].lower()]
-        task_png_files = glob(os.path.join(main_data_path, "panels_images", "*.jpg"))
-        recording_files = glob(os.path.join(task_files_path, "*.wav"))
+        mat_files = [file_path for file_path in mat_files if self.task_validation_filter_param in os.path.split(file_path)[1].lower()]
+        task_png_files = glob(os.path.join(main_data_path, "panels_images", task,"*.jpg"))
+        recording_files = glob(os.path.join(task_files_path, "**","*.wav"), recursive=True)
         return [scio.loadmat(mat, struct_as_record=False, squeeze_me=True) for mat in mat_files], task_png_files, recording_files
     
 
     def group_task_info(self, tobii_data_file, task_png, audio_recordings, task_data, mat_file, clean_gaze_data):
         matched_data_files = {}
+        audio_idx = 2 if self.task == "SDMT" else 1
         for i, task_name in enumerate(list(task_data.keys())[1::2]):
             if f"panel_{i+1}" not in tobii_data_file.keys(): continue
             task_code = (task_name[-2:]).replace("_", "")
             task_code_lower = task_code.lower()
             png_img = [img for img in task_png if img.endswith(f"_{task_code_lower}.jpg")][0]
-            audio_file = [audio for audio in audio_recordings if os.path.split(audio)[1].split("_")[2].lower() == task_code_lower][0]
+            audio_files = [audio for audio in audio_recordings if task_code_lower in os.path.split(audio)[1].split("_")[audio_idx].lower()]
+            if len(audio_files) == 0: continue
+            audio_file = audio_files[0]
             preprocess_gaze_method = self.clean_outliers if clean_gaze_data else self.clean_outliers_no_interpolation
             matched_data_files[task_code_lower] = {KEY_TOBII_DATA: preprocess_gaze_method(tobii_data_file[f"panel_{i+1}"]),
                                                    KEY_TASK_PANEL_IMG : png_img,
                                                    KEY_AUDIO_DATA :  audio_file,
-                                                   KEY_STRIKE_SCORE : task_data[f"strikes_img_test_{task_code}"],
+                                                   KEY_STRIKE_SCORE : 0 if list(task_data.keys())[0] == "dummy" else task_data[f"strikes_img_test_{task_code}"],
                                                    KEY_RECORDING_DATE : self.get_creation_time(mat_file)}
         return matched_data_files
 
@@ -73,16 +81,8 @@ class ParticipantGazeDataManager:
 
         # Extract messages
         messages = data['messages']
-
         # Find indices for presentation times of each panel and break
-        panel_indices = []
-        break_indices = []
-        for i, message in enumerate(messages):
-            if message[1] in ['panel number 1', 'panel number 2', 'panel number 3']:
-                panel_indices.append(i)
-            elif message[1] in ['break panel number 1', 'break panel number 2', 'finished']:
-                break_indices.append(i)
-
+        panel_indices , break_indices = self.break_mat_into_pannels(messages)
         # Ensure we found the expected number of indices
         assert len(panel_indices) == 3, f'Expected 3 panel indices, but found {len(panel_indices)}'
         assert len(break_indices) == 3, f'Expected 3 break indices, but found {len(break_indices)}'
@@ -126,9 +126,28 @@ class ParticipantGazeDataManager:
             }
 
         # Extract time_of_slides
-        task_data = data['task_data'].__dict__
+        if self.task == "KD":
+            task_data = {"dummy": None, "1":None, "0":None,"2": None, "00":None, "3":None, "000":None} # TODO: how to get the real task results.
+        elif self.task == "SDMT":
+            task_data = data["task_data"].__dict__
         return task_data, messages, gaze_data, presentation_info, Dom_Eye
     
+    def break_mat_into_pannels(self, mat_file_messages):
+        panel_indices = []
+        break_indices = []
+        if self.task == "SDMT":
+            panel_names = [f"panel number {i+1}" for i in range(3)]
+            break_names = [f"break panel number {i+1}" for i in range(3)] + ["finished"]
+        elif self.task == "KD":
+            panel_names = [f"slide {(2*i)+1}" for i in range(3)]
+            break_names = [f"slide {(2*i)+2}" for i in range(2)] + ["done with slides"]
+        for i, message in enumerate(mat_file_messages):
+            if message[1] in panel_names:
+                panel_indices.append(i)
+            elif message[1] in break_names:
+                break_indices.append(i)
+        return panel_indices, break_indices
+
     def compute_sentence_boundaries_wav(self, panel, save_csv=False, show_result=False, save_image_path=""):
         audio_path = self.matched_data[panel]["audio_data"]
         signal, sr = librosa.load(audio_path, sr=None)
@@ -229,94 +248,24 @@ class ParticipantGazeDataManager:
         if interpolate == False:
             return eye
         return self.interpulate_nan_values(eye)
-    
 
-    def fixation_finder(self, gaze_horizontal_deg, gaze_vertical_deg, sacc_parameters, tobii_fps=600):
-        # Initialize parameters
-        # 1. smooth the data points with 15 ms kernel size
-        smoothing_window = int(sacc_parameters["smoothing_window"] / ((1/tobii_fps)*1000))
-        smooth_kernel = np.ones(shape=(smoothing_window,)) / smoothing_window
-        gaze_horizontal_deg = np.convolve(a=gaze_horizontal_deg, v = smooth_kernel, mode='same')
-        gaze_vertical_deg = np.convolve(a=gaze_vertical_deg, v = smooth_kernel, mode='same')
+    def annotate_gaze_events(self, annotation_method, panel):
+        if annotation_method == "threshold_based":
+            return generate_fixations_threshold_based(self, panel)
+        elif annotation_method == "model_based":
+            if self.model is None:
+                self.load_model()
+            return generate_fixation_model_based(self.matched_data[panel][KEY_TOBII_DATA], model = self.model)
+        else:
+            raise Exception(f"unknown annotation method: {annotation_method} choose from ['threshold_based', 'model_based']")
 
-        minimum_velocity_per_sample = sacc_parameters['saccade_min_velocity']
-        maximum_angle_change = sacc_parameters['saccade_angle_threshold']
-        overshoot_max_gap = int(10 * tobii_fps / 1000)  # 10ms
-        minimum_sacade_time_sec = int(9 / ((1/tobii_fps)*1000)) + 1
-
-        # Tangential velocity, speed, and angle difference
-        velocity_h = np.diff(gaze_horizontal_deg) # deg per (1/tobii_fps sec)
-        velocity_v = np.diff(gaze_vertical_deg) # deg per  (1/tobii_fps sec)
-        velocity_h_deg_sec = velocity_h * tobii_fps
-        velocity_v_deg_sec = velocity_v * tobii_fps
-        sample_speed_vec_per_sec = np.sqrt(velocity_h_deg_sec ** 2 + velocity_v_deg_sec ** 2)
-        sample_difangle_vec_rad = np.diff(np.arctan2(np.deg2rad(gaze_vertical_deg), np.deg2rad(gaze_horizontal_deg)))
-        sample_difangle_vec = np.rad2deg(np.abs(sample_difangle_vec_rad))
-        movement = np.array([sample_speed_vec_per_sec, sample_difangle_vec]).T
-        minimum_fixation_period = int(sacc_parameters["min_fixation_time"]*tobii_fps)
-        potantial_saccade = np.where((movement[:,0] > minimum_velocity_per_sample) & (movement[:,1] < maximum_angle_change))
-        saccade = np.zeros_like(gaze_horizontal_deg)
-        saccade[potantial_saccade] = SACCADE_IDX
-        result = []
-        for i in range(len(saccade)):
-            if sum(saccade[i: i+minimum_fixation_period]) == 0:
-                result.append(FIXATION_IDX)
-            else:
-                result.append(SACCADE_IDX)
-        return result
-
-    
-        
-    def save_fixation_to_csv(self, panel):
-        fixation_array = self.calculate_fixation(panel)
-        eyes_data = self.matched_data[panel][KEY_TOBII_DATA]
-        eyes_data[:,2] -= eyes_data[:,2][0]
-        matched_data = np.concatenate((np.expand_dims(eyes_data[:,2], 1), np.expand_dims(eyes_data[:,0],1), np.expand_dims(eyes_data[:,1],1), np.expand_dims(fixation_array,1)), axis=1)
-        df_data = pd.DataFrame(matched_data, columns= [TIME_STAMP, FIXATION_CSV_KEY_EYE_H, FIXATION_CSV_KEY_EYE_V, FIXATION_CSV_KEY_FIXATION])
-        df_data.to_csv(os.path.join(self.output_path, f"task_{panel}_fixation.csv"))
-        return df_data
-
-    def calculate_fixation(self, panel):
-        """
-        returns a fixation points calculated from a given eye_data
-        """
-        tobii_fps = 600  # Frame rate of Tobii eye tracker
-
-        # Saccade/Fixation parameters
-        PIXEL2METER = 0.000264583  # Conversion factor for 96 DPI (pixels to meters)
-        screenDistance = 0.65       # Distance from screen to participant (meters)
-
-        sacc_parameters = {
-            'saccade_min_amp': 0.08,          # Minimum amplitude of a saccade (degrees)
-            'saccade_max_amp': 2,           # Maximum amplitude of a saccade (degrees)
-            'saccade_min_velocity': 15,       # Minimum velocity of a saccade (degrees/sec)
-            'saccade_peak_velocity': 150,      # Peak velocity of a saccade (degrees/sec)
-            'saccade_min_duration': 0.009,       # Minimum duration of a saccade (seconds)
-            'saccade_angle_threshold': 30.0, # Maximum angle within a saccade (degrees)
-            'min_fixation_time' : 0.01, # Minimum time for a non-saccade movement to be considered as fixation
-            'merge_overshoot': True,
-            'overshoot_min_amp': 0.5,
-            'merge_intrusions': 0,
-            'intrusion_range': 300,
-            "smoothing_window" : 15, # ms
-            'intrusion_angle_threshold': 90.0
-        }
-        eye_data = self.matched_data[panel][KEY_TOBII_DATA]
-        img_data = self.matched_data[panel][KEY_TASK_PANEL_IMG]
-        gaze_horizontal_pix = eye_data[:, 0] * SCREEN_SIZE[1]
-        gaze_vertical_pix = eye_data[:, 1] * SCREEN_SIZE[0]
-        # Convert gaze positions from pixels to degrees
-        mid_of_image = np.array(cv2.imread(img_data).shape[:2]) // 2
-        horizontal_offset = gaze_horizontal_pix - mid_of_image[1]
-        vertical_offset = gaze_vertical_pix - mid_of_image[0]
-        gaze_horizontal_deg = np.degrees(np.arctan2(horizontal_offset * PIXEL2METER, screenDistance))
-        gaze_vertical_deg = np.degrees(np.arctan2(vertical_offset * PIXEL2METER, screenDistance))
-
-        # Call a function to detect saccades 
-        panel_saccade_vec = self.fixation_finder(
-            gaze_horizontal_deg, gaze_vertical_deg, sacc_parameters, tobii_fps)
-        return panel_saccade_vec
-
+    def load_model(self):
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        num_classes = len(ModelPropertise.EVENTS.value)
+        self.model = gazeNET_model.gazeNET(num_classes)
+        self.model, _ = gazeNET_model.load(self.model, ModelPropertise.MODEL_PATH.value)
+        self.model = self.model.to(self.device)
+        self.model.eval()
 
     def correlate_fixation_audio_in_time(self, fixation_df, audio_df):
         """
@@ -333,10 +282,11 @@ class ParticipantGazeDataManager:
             
 if __name__=="__main__":
     from visualize_data import show_running_video_live
-    p_name = "FZ767"
+    p_name = "RD707"
     task = "SDMT"
-    group = "HC"
-    panel = "i1"
+    group = "pwMS"
+    panel = "3"
     panel_path = "/Users/nitzankarby/Desktop/dev/Nitzan_K/data/panels_images/panel_a5.jpg"
-    data_path = "/Users/nitzankarby/Desktop/dev/Nitzan_K/data"
-    subject_data= ParticipantGazeDataManager(p_name, data_path, "SDMT", group)
+    data_path = "/Volumes/labs/ramot/rotation_students/Nitzan_K/MS/Results/Behavior"
+    subject_data= ParticipantGazeDataManager(p_name, data_path, "KD", group)
+    print(subject_data.annotate_gaze_events("model_based", panel)[:20])

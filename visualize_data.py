@@ -262,14 +262,14 @@ def plot_gazeNet_fig(data, spath = None, save=False, show=True, title=None):
         plt.close()
 
 if __name__=="__main__":
-    p_name = "LE750"
+    p_name = "RD707"
     task = "SDMT"
-    group = "HC"
+    group = "pwMS"
     panel = "i1"
     panel_path = "/Users/nitzankarby/Desktop/dev/Nitzan_K/data/panels_images/panel_a5.jpg"
     data_path = "/Volumes/labs/ramot/rotation_students/Nitzan_K/MS/Results/Behavior"
     subject_data= ParticipantGazeDataManager(p_name, data_path, "SDMT", group)
-    fixation_data = subject_data.save_fixation_to_csv('l4')
+    fixation_data = subject_data.save_fixation_to_csv('l3')
     plot_gazeNet_fig(fixation_data)
 
     

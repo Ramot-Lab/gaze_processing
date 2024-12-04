@@ -4,6 +4,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from constants import *
 import numpy as np
+import os
 
 def get_panel_edges(image) -> list:
     """
@@ -156,7 +157,7 @@ def compair_fixation_results(
     ax_movements.plot(fixation_2[TIME_STAMP], fixation_2[FIXATION_CSV_KEY_EYE_V], label="Vertical Movement", color='red')
     ax_movements.set_ylabel("Eye Position")
     ax_movements.legend()
-    ax_movements.set_title(f"Horizontal and Vertical Eye Movements fixation correlation : {np.corrcoef(fixation_1[FIXATION_CSV_KEY_EYE_H],fixation_1[FIXATION_CSV_KEY_EYE_V])[0][1]}")
+    ax_movements.set_title(f"Horizontal and Vertical Eye Movements fixation agreement percentage : {agreement.mean() * 100:.2f}%")
     
     # Bar height and positions for fixation results
     y_positions = [1, 2]  # Fixation 1 and Fixation 2 positions
@@ -202,7 +203,101 @@ def compair_fixation_results(
     plt.show()
 
 
+####### Fixation threshold finder ##########
+def __fixation_finder(gaze_horizontal_deg, gaze_vertical_deg, sacc_parameters, tobii_fps=600):
+    # Initialize parameters
+    # 1. smooth the data points with 15 ms kernel size
+    smoothing_window = int(sacc_parameters["smoothing_window"] / ((1/tobii_fps)*1000))
+    smooth_kernel = np.ones(shape=(smoothing_window,)) / smoothing_window
+    gaze_horizontal_deg = np.convolve(a=gaze_horizontal_deg, v = smooth_kernel, mode='same')
+    gaze_vertical_deg = np.convolve(a=gaze_vertical_deg, v = smooth_kernel, mode='same')
 
-threshold_based = '/Volumes/labs/ramot/rotation_students/Nitzan_K/MS/Results/Behavior/processing_results/LE750/task_l4_fixation.csv'
-model_based = '/Users/nitzankarby/Desktop/dev/Nitzan_K/MS_processing/data_for_training_gazeNet/LE750/l3_gaze_data.npy'
-compair_fixation_results(threshold_based, model_based, 3000)
+    minimum_velocity_per_sample = sacc_parameters['saccade_min_velocity']
+    maximum_angle_change = sacc_parameters['saccade_angle_threshold']
+
+    # Tangential velocity, speed, and angle difference
+    velocity_h = np.diff(gaze_horizontal_deg) # deg per (1/tobii_fps sec)
+    velocity_v = np.diff(gaze_vertical_deg) # deg per  (1/tobii_fps sec)
+    velocity_h_deg_sec = velocity_h * tobii_fps
+    velocity_v_deg_sec = velocity_v * tobii_fps
+    sample_speed_vec_per_sec = np.sqrt(velocity_h_deg_sec ** 2 + velocity_v_deg_sec ** 2)
+    sample_difangle_vec_rad = np.diff(np.arctan2(np.deg2rad(gaze_vertical_deg), np.deg2rad(gaze_horizontal_deg)))
+    sample_difangle_vec = np.rad2deg(np.abs(sample_difangle_vec_rad))
+    movement = np.array([sample_speed_vec_per_sec, sample_difangle_vec]).T
+    minimum_fixation_period = int(sacc_parameters["min_fixation_time"]*tobii_fps)
+    potantial_saccade = np.where((movement[:,0] > minimum_velocity_per_sample) & (movement[:,1] < maximum_angle_change))
+    saccade = np.zeros_like(gaze_horizontal_deg)
+    saccade[potantial_saccade] = SACCADE_IDX
+    result = []
+    for i in range(len(saccade)):
+        if sum(saccade[i: i+minimum_fixation_period]) == 0:
+            result.append(FIXATION_IDX)
+        else:
+            result.append(SACCADE_IDX)
+    return result
+
+
+    
+def generate_fixations_threshold_based(participants_data ,panel):
+    fixation_array = _calculate_fixation(participants_data,panel)
+    eyes_data = participants_data.matched_data[panel][KEY_TOBII_DATA]
+    eyes_data[:,2] -= eyes_data[:,2][0]
+    matched_data = np.concatenate((np.expand_dims(eyes_data[:,2], 1), np.expand_dims(eyes_data[:,0],1), np.expand_dims(eyes_data[:,1],1),
+                                   np.expand_dims(np.ones_like(fixation_array),1),np.expand_dims(fixation_array,1)), axis=1)
+    df_data = pd.DataFrame(matched_data, columns= [TIME_STAMP, FIXATION_CSV_KEY_EYE_H, FIXATION_CSV_KEY_EYE_V, FIXATION_VALID_STATUS,FIXATION_CSV_KEY_FIXATION])
+    df_data.to_csv(os.path.join(participants_data.output_path, f"task_{panel}_fixation.csv"))
+    return df_data
+
+def _calculate_fixation(participants_data, panel):
+    """
+    returns a fixation points calculated from a given eye_data
+    """
+    tobii_fps = 600  # Frame rate of Tobii eye tracker
+
+    # Saccade/Fixation parameters
+    PIXEL2METER = 0.000264583  # Conversion factor for 96 DPI (pixels to meters)
+    screenDistance = 0.65       # Distance from screen to participant (meters)
+
+    sacc_parameters = {
+        'saccade_min_amp': 0.08,          # Minimum amplitude of a saccade (degrees)
+        'saccade_max_amp': 2,           # Maximum amplitude of a saccade (degrees)
+        'saccade_min_velocity': 15,       # Minimum velocity of a saccade (degrees/sec)
+        'saccade_peak_velocity': 150,      # Peak velocity of a saccade (degrees/sec)
+        'saccade_min_duration': 0.009,       # Minimum duration of a saccade (seconds)
+        'saccade_angle_threshold': 30.0, # Maximum angle within a saccade (degrees)
+        'min_fixation_time' : 0.01, # Minimum time for a non-saccade movement to be considered as fixation
+        'merge_overshoot': True,
+        'overshoot_min_amp': 0.5,
+        'merge_intrusions': 0,
+        'intrusion_range': 300,
+        "smoothing_window" : 15, # ms
+        'intrusion_angle_threshold': 90.0
+    }
+    eye_data = participants_data.matched_data[panel][KEY_TOBII_DATA]
+    img_data = participants_data.matched_data[panel][KEY_TASK_PANEL_IMG]
+    gaze_horizontal_pix = eye_data[:, 0] * SCREEN_SIZE[1]
+    gaze_vertical_pix = eye_data[:, 1] * SCREEN_SIZE[0]
+    # Convert gaze positions from pixels to degrees
+    mid_of_image = np.array(cv2.imread(img_data).shape[:2]) // 2
+    horizontal_offset = gaze_horizontal_pix - mid_of_image[1]
+    vertical_offset = gaze_vertical_pix - mid_of_image[0]
+    gaze_horizontal_deg = np.degrees(np.arctan2(horizontal_offset * PIXEL2METER, screenDistance))
+    gaze_vertical_deg = np.degrees(np.arctan2(vertical_offset * PIXEL2METER, screenDistance))
+
+    # Call a function to detect saccades 
+    panel_saccade_vec = __fixation_finder(
+        gaze_horizontal_deg, gaze_vertical_deg, sacc_parameters, tobii_fps)
+    return panel_saccade_vec
+
+#####################################
+
+def BoxMuller_gaussian(u1,u2):
+  z1 = np.sqrt(-2*np.log(u1))*np.cos(2*np.pi*u2)
+  z2 = np.sqrt(-2*np.log(u1))*np.sin(2*np.pi*u2)
+  return z1,z2
+
+
+if __name__=="__main__":
+    threshold_based = '/Volumes/labs/ramot/rotation_students/Nitzan_K/MS/Results/Behavior/processing_results/RD707/task_l3_fixation.csv'
+    model_based = '/Users/nitzankarby/Desktop/dev/Nitzan_K/MS_processing/data_for_training_gazeNet/RD707/l3_gaze_data.npy'
+    compair_fixation_results(threshold_based, model_based, 3000)

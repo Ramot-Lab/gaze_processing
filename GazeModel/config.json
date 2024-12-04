@@ -1,0 +1,51 @@
+{
+    "cuda": false, 
+    "mode": "test", 
+    "seq_len": 200, 
+    "split_seqs": true, 
+    "events": [
+        1, 
+        2, 
+        3
+    ], 
+    "augment": true, 
+    "augment_noise": [
+        0.0, 
+        0.5, 
+        0.005
+    ], 
+    "model_path": [
+        "gazeNET_0004_00003750.pth.tar"
+    ], 
+    "max_to_keep": 0, 
+    "architecture": {
+        "conv_stack": [
+            [
+                "conv1", 8, [    2,     11], [    1,     1]
+            ], 
+            [
+                "conv2", 8, [    2,     11], [    1,     1]
+            ]
+        ], 
+        "rnn_stack": [
+            [
+                "gru1", 
+                64, 
+                true, 
+                true
+            ], 
+            [
+                "gru2", 
+                64, 
+                true, 
+                true
+            ], 
+            [
+                "gru3", 
+                64, 
+                true, 
+                true
+            ]
+        ]
+    }
+}

@@ -1,0 +1,47 @@
+# Ignore operating system files
+.DS_Store
+Thumbs.db
+
+# Ignore Python files
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+
+# Ignore data files
+*.npy
+*.npz
+*.h5
+*.csv
+
+
+# Ignore log files
+*.log
+*.txt
+
+# Ignore temporary files
+*.tmp
+*.temp
+
+# Ignore output files
+output/
+results/
+figures/
+
+# Ignore virtual environment files
+venv/
+env/
+
+# Ignore IDE files
+.vscode/
+.idea/
+.pycharm/
+
+# Ignore other files
+*.egg-info/
+*.dist-info/
+*.whl
+*.zip
+*.tar.gz
+*.tar.bz2
+*.tar.xz

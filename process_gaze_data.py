@@ -271,13 +271,14 @@ def calculate_all_subjects_declaration_time(data_path, task, minimal_declaration
     participants_results_matrix = []
     data_for_plotting_map = {}
     for cur_group in ["pwMS", "HC"]:
-        for subject_name in glob(os.path.join(data_path, cur_group, "*")):
+        for subject_name in glob(os.path.join(data_path, cur_group, "*"))[:3]:
             if not os.path.isdir(subject_name): continue
             if "SDMT" not in os.listdir(subject_name): continue
-            try:
-                cur= ParticipantGazeDataManager(subject_name, data_path, task, cur_group)
-            except:
-                print(f"an error with processing subject : {subject_name}")
+            # try:
+            cur= ParticipantGazeDataManager(subject_name, data_path, task, cur_group)
+            # except:
+            #     print(f"an error with processing subject : {subject_name}")
+            #     continue
             #get time duration samples
             declaration_time_samples = [] #Flat vector of all participant's panel results
             bar_plot_array = []
@@ -317,7 +318,7 @@ def distance_from_target_symbol_analysis(cur_data : ParticipantGazeDataManager):
         if not 0.8 <((len(audio_data)//2) / score) < 1.2 :
             print(len(audio_data)//2, score, f"{cur_data.name} {panel_task_name}")
             continue
-        fixation_data = cur_data.save_fixation_to_csv(panel_task_name)
+        fixation_data = cur_data.annotate_gaze_events(panel_task_name)
         correlated_data = cur_data.correlate_fixation_audio_in_time(fixation_data, audio_data)
         correlated_data[[FIXATION_CSV_KEY_EYE_H, FIXATION_CSV_KEY_EYE_V]] = correlated_data[[FIXATION_CSV_KEY_EYE_H, FIXATION_CSV_KEY_EYE_V]] * np.array([horizontal_size, vertical_size])
         audio_event = correlated_data['audio_event']
@@ -411,7 +412,7 @@ def plot_grades(data_path, task = "SDMT"):
             
 
 if __name__=="__main__":
-    data_path = "/Users/nitzankarby/Desktop/dev/Nitzan_K/data"
+    data_path = "/Volumes/labs/ramot/rotation_students/Nitzan_K/MS/Results/Behavior"
     # plot_grades(data_path)
-    # calculate_dist_from_target(data_path, task='SDMT')
+    calculate_dist_from_target(data_path, task='SDMT')
     calculate_all_subjects_declaration_time(data_path, task='SDMT', minimal_declaration_count=30)
