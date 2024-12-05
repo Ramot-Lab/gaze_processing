@@ -29,25 +29,32 @@ def convert_recordings_to_npy(data_path: str, task: str, output_path: str) -> No
                 continue
             if task not in os.listdir(subject_name):
                 continue
-            par_data = ParticipantGazeDataManager(subject_name, data_path, task, group, clean_gaze_data=True)
+            try:
+                par_data = ParticipantGazeDataManager(subject_name, data_path, task, group,  clean_gaze_data=True)
+            except:
+                print(f"an error with processing subject : {subject_name}")
+                continue
             panel_output_path = os.path.join(output_path, name)
             os.makedirs(panel_output_path, exist_ok=True)
             for panel in par_data.matched_data.keys():
+                if os.path.exists(os.path.join(panel_output_path, f"{panel}_{task}_gaze_annotated_data.npy")):
+                    continue # "Lazy" annotation
                 annotated_data = par_data.annotate_gaze_events("model_based", panel)
                 np.save(os.path.join(panel_output_path, f"{panel}_{task}_gaze_annotated_data.npy"), annotated_data)
-    #         data_managers.append(
-    #             ParticipantGazeDataManager(subject_name, data_path, task, group, clean_gaze_data=True)
-    #         )
-    # processor = MultipleGazeDataProcessor(data_managers)
-    # processor.process_gaze_data("data_for_training", show=True)
+                print(f"Saved {panel} panel data for {name}")
+ 
 
 if __name__ == "__main__":
-    data_path = "/Volumes/labs/ramot/rotation_students/Nitzan_K/MS/Results/Behavior"
-    output_path = "data_for_training"
-    convert_recordings_to_npy(data_path, "SDMT", output_path)
-    # trainer = Trainer()
-    # trainer.run()
+    import sys
+    task_to_run = sys.argv[2]
+    if task_to_run == "generate_data":
+        data_path = "/Volumes/labs/ramot/rotation_students/Nitzan_K/MS/Results/Behavior"
+        output_path = "data_for_training"
+        convert_recordings_to_npy(data_path, "KD", output_path)
+        convert_recordings_to_npy(data_path, "SDMT", output_path)
+    elif task_to_run == "train":
+        trainer = Trainer()
+        trainer.run()
+    else:
+        print("Unknown command, choose from ['generate_data'- for data generation, 'train' - for auto incoder model training]")
 
-# data_path = "/Volumes/labs/ramot/rotation_students/Nitzan_K/MS/Results/Behavior"
-# convert_recordings_to_npy(data_path, "SDMT")
-# convert_recordings_to_npy(data_path, "KD") 

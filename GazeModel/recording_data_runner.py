@@ -32,7 +32,6 @@ class RecordingDataRunner:
             A list of lists, where each sublist contains the output of the model for a single recording.
             The output is of the form [[fixation, saccade, ...], ...].
         """
-        results = []
         test_loader, test_dataset = self._prepare_recording_data(recording_data)
         dataset_copy = copy.deepcopy(test_dataset.data)
         if test_loader is None:

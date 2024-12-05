@@ -1,7 +1,7 @@
 
 import argparse
 import json
-from data_processing.data_loader import load_npy_files, EMDataset, GazeDataLoader, FixationDataset
+from data_processing.data_loader import load_npy_files, GazeDataLoader, FixationDataset
 import copy
 from experimenting_gaze_data.auto_encoder import gazeAutoEncoder
 import torch
@@ -10,6 +10,7 @@ from torch.autograd import Variable
 from tqdm import tqdm
 import numpy as np
 import os
+from datetime import datetime
 
 
     
@@ -101,7 +102,16 @@ class Trainer:
         return           
 
     def save_model_checkpoint(self):
-        torch.save(self.best_model.state_dict(), os.path.join(self.config["logs_path"], f"model_{self.best_score}.pth"))
+        folder_name = datetime.now().strftime("%Y-%m-%d")
+        folder_path = os.path.join(self.config["logs_path"], folder_name)
+        os.makedirs(folder_path, exist_ok=True)
+        torch.save(self.best_model.state_dict(), os.path.join(folder_path, f"model_{self.best_score}.pth"))
+
+        # save the training config file for easier reproducibility
+        if not os.path.exists(os.path.join(folder_path, "config.json")):
+            with open(os.path.join(folder_path, "config.json"), "w") as f:  
+                json.dump(self.config, f, indent=4)
+
 
 if __name__ == "__main__":
     trainer = Trainer()

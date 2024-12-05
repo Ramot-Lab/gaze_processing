@@ -7,6 +7,7 @@ from torch.utils.data.sampler import Sampler
 import os
 from constants import *
 from utils import BoxMuller_gaussian
+import matplotlib.pyplot as plt
 
 def load_npy_files(data_path, config, train_val='train'):
     
@@ -33,6 +34,7 @@ def load_npy_files(data_path, config, train_val='train'):
     data_list = []
     for _fpath in FILES:
         _data = np.load(_fpath)
+        _data[:,-1][_data[:,-1]==0] = 1 # 0 notations are for seperation between annotation secssions (when annotated with the model) setting them to fixations for smoothness 
         if _data.dtype.names is None or not set(_data.dtype.names).issuperset({'t', 'x', 'y', 'evt', 'status'}):
             _data = np.core.records.fromarrays([_data[:,0], _data[:,1], _data[:,2], _data[:,3], _data[:,4]],
                                                dtype=[('t', '<f8'), ('x', '<f4'), ('y', '<f4'), ('status', '<u1'), ('evt', '<u1')])
@@ -108,15 +110,15 @@ class   EMDataset(Dataset, EventParser):
 
         split_seqs = config['split_seqs']
         #mode = config['mode']
-
+        center_data = config['center_data']
+        stride_step = config['stride_step']
         #input is in fact diff(input), therefore we want +1 sample
         seq_len = config['seq_len']+1
-        #seq_step = seq_len/2 if mode == 'train' else seq_len
-        seq_step = seq_len
 
         data = []
         #seqid = -1
         for d in gaze_data: #iterates over files
+            d = self.data_preprocess(d, normalize=center_data)
             dd = np.split(d, np.where(np.diff(d['status'].astype(np.int0)) != 0)[0]+1)
             dd = [_d for _d in dd if (_d['status'].all() and not(len(_d) < seq_len))]
 
@@ -127,7 +129,7 @@ class   EMDataset(Dataset, EventParser):
                     #1. overlaps the last piece of data and
                     #2. allows for overlaping sequences in general; not tested
                     seqs = [seq[pos:pos + seq_len] if (pos + seq_len) < len(seq) else
-                            seq[len(seq)-seq_len:len(seq)] for pos in range(0, len(seq), seq_step)]
+                            seq[len(seq)-seq_len:len(seq)] for pos in range(0, len(seq), stride_step)]
                 else:
                     seqs = [seq]
 
@@ -151,6 +153,11 @@ class   EMDataset(Dataset, EventParser):
 
     def __len__(self):
         return self.size
+
+    def data_preprocess(self, sample, normalize=True):  
+        if normalize:
+            sample[:,1:3] = sample[:,1:3] - sample[:,1:3].mean(axis=0)
+        return sample
 
 def _collate_fn(batch):
     def func(p):
@@ -220,7 +227,7 @@ class FixationDataset(EMDataset):
         fixation_gaze_data = []
         for recording in gaze_data:
             recording = recording[recording['evt'] == FIXATION_IDX]
-            separation_parts = np.where(np.diff(recording['t'])>np.median(np.diff(recording['t'])))[0]
+            separation_parts = np.where(np.diff(recording['t'])>np.median(np.diff(recording['t'])+2))[0]
             i = 0
             for j in separation_parts:
                 if j - i < self.config['seq_len']: 
