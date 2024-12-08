@@ -19,9 +19,14 @@
     "val_data_path": 
         "data_for_training" , 
     "filter":{
-        "train" : ["l4", "l3", "a3","a5","i1"],
+        "train" : ["l4", "l3", "a3","a5","i1","1", "2", "3"],
         "val" : ["0"]
     },
+    "center_data" : true,
+    "stride_step" : 10,
+    "n_clusters" : 7, 
+    "clustering_loss_weight" : 0.1,
+    "kmeans_iterations": 10,
     "save_every": 50, 
     "val_every": 50, 
     "batch_size": 20, 
@@ -29,7 +34,7 @@
     "learning_rate": 0.001, 
     "latent_dim" : 24,
     "learning_rate_anneal": 1.0, 
-    "test_interval": 20,
+    "test_interval": 2,
     "model_name": [
         "gazeNET_0004_00003750.pth.tar"
     ], 

@@ -36,6 +36,7 @@ def calculate_reliability(data, L_size, repetitions, min_value, plot = True):
 
         array_corr[i] = np.corrcoef(selected_matrix_1, selected_matrix_2)[0,1]
     # fig, ax = plt.subplots(1, 1, figsize=(8,6))
+    import pdb; pdb.set_trace()
     if plot:
         plot_correlation_scatter(array_corr, L_size, subjects_amount)
     return np.mean(array_corr), L_size

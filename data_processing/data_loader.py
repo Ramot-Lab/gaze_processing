@@ -156,7 +156,8 @@ class   EMDataset(Dataset, EventParser):
 
     def data_preprocess(self, sample, normalize=True):  
         if normalize:
-            sample[:,1:3] = sample[:,1:3] - sample[:,1:3].mean(axis=0)
+            sample['x'] = sample['x'] - sample['x'].mean()
+            sample['y'] = sample['y'] - sample['y'].mean()
         return sample
 
 def _collate_fn(batch):

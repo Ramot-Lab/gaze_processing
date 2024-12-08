@@ -262,8 +262,8 @@ def compute_declaration_time(cur_subject : ParticipantGazeDataManager, panel_nam
     computed_declaration_answer = cur_subject.compute_sentence_boundaries_wav(panel_name, False, False)
     panel_decliration_score = []
     for sentence_i in range(len(computed_declaration_answer)//2):
-        panel_decliration_score.append(computed_declaration_answer["time_stamp"].iloc[sentence_i+1] - 
-                                    computed_declaration_answer["time_stamp"].iloc[sentence_i])
+        panel_decliration_score.append(computed_declaration_answer[TIME_STAMP].iloc[sentence_i+1] - 
+                                    computed_declaration_answer[TIME_STAMP].iloc[sentence_i])
     return panel_decliration_score
 
 def calculate_all_subjects_declaration_time(data_path, task, minimal_declaration_count = 25):
@@ -271,7 +271,7 @@ def calculate_all_subjects_declaration_time(data_path, task, minimal_declaration
     participants_results_matrix = []
     data_for_plotting_map = {}
     for cur_group in ["pwMS", "HC"]:
-        for subject_name in glob(os.path.join(data_path, cur_group, "*"))[:3]:
+        for subject_name in glob(os.path.join(data_path, cur_group, "*")):
             if not os.path.isdir(subject_name): continue
             if "SDMT" not in os.listdir(subject_name): continue
             # try:
@@ -318,7 +318,9 @@ def distance_from_target_symbol_analysis(cur_data : ParticipantGazeDataManager):
         if not 0.8 <((len(audio_data)//2) / score) < 1.2 :
             print(len(audio_data)//2, score, f"{cur_data.name} {panel_task_name}")
             continue
-        fixation_data = cur_data.annotate_gaze_events(panel_task_name)
+        fixation_data = cur_data.annotate_gaze_events("model_based", panel_task_name)
+        fixation_data[fixation_data['evt']==0] = FIXATION_IDX
+        fixation_data[fixation_data['evt']==3] = FIXATION_IDX
         correlated_data = cur_data.correlate_fixation_audio_in_time(fixation_data, audio_data)
         correlated_data[[FIXATION_CSV_KEY_EYE_H, FIXATION_CSV_KEY_EYE_V]] = correlated_data[[FIXATION_CSV_KEY_EYE_H, FIXATION_CSV_KEY_EYE_V]] * np.array([horizontal_size, vertical_size])
         audio_event = correlated_data['audio_event']
@@ -339,7 +341,7 @@ def distance_from_target_symbol_analysis(cur_data : ParticipantGazeDataManager):
 
 def get_closest_fixation_distance(correlated_data, target, panel_img):
     target = np.array(target)
-    segments_fixation = np.diff(correlated_data["fixation"])
+    segments_fixation = np.diff(correlated_data[FIXATION_CSV_KEY_FIXATION])
     correlated_array = correlated_data.values 
     start = np.where([segments_fixation==1])[1]
     end = np.where([segments_fixation==-1])[1]
@@ -388,7 +390,7 @@ def calculate_dist_from_target(data_path, task):
     plot_data(distance_from_key_map, y_label='Mean distance (cm)', title='Mean Distance From Target Symbol')
     #plot reliability
     min_val = min([len(participant_arr) for participant_arr in participants_results_matrix])
-    distribution = calculate_reliability_distribution(participants_results_matrix, 5, int(min_val//2), 10000, min_val)
+    distribution = calculate_reliability_distribution(participants_results_matrix, int(min_val//2), int(min_val//2), 10000, min_val)
     plot_barplot(list(range(5,int(min_val//2))) ,distribution, "L value","reliability value", "reliability distribution over different L values")
 
 def plot_grades(data_path, task = "SDMT"):
@@ -415,4 +417,4 @@ if __name__=="__main__":
     data_path = "/Volumes/labs/ramot/rotation_students/Nitzan_K/MS/Results/Behavior"
     # plot_grades(data_path)
     calculate_dist_from_target(data_path, task='SDMT')
-    calculate_all_subjects_declaration_time(data_path, task='SDMT', minimal_declaration_count=30)
+    # calculate_all_subjects_declaration_time(data_path, task='SDMT', minimal_declaration_count=30)
