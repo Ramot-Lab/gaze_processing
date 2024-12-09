@@ -6,7 +6,7 @@ import copy
 from experimenting_gaze_data.auto_encoder_DTC import Autoencoder
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
+from torch.autograd import Variable 
 from tqdm import tqdm
 import numpy as np
 import os
@@ -23,7 +23,9 @@ class Trainer:
             self.config = json.load(f)
         os.makedirs(self.config["logs_path"], exist_ok=True)
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        self.model = Autoencoder(latent_dim = self.config['latent_dim'])
+        if not torch.cuda.is_available():
+            self.device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
+        self.model = Autoencoder(latent_dim = self.config['latent_dim']).to(self.device)
         self.reconstruction_criterion = nn.MSELoss()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.config['learning_rate'])
         self.loader_train = self.load_data(self.config["train_data_path"], self.config, "train")
@@ -104,7 +106,7 @@ class Trainer:
 
 
     def run(self):
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        device = self.device
         # loading data
         print("loading data...")   
         #training loop
@@ -116,17 +118,19 @@ class Trainer:
                 inputs, targets, input_percentages, target_sizes, _ = data
                 inputs = Variable(inputs)
                 y_ = Variable(targets)
-                if device == "cuda":
-                    inputs = inputs.cuda()
-                    y_ = y_.cuda()
-
+                if device != "cpu":
+                    inputs = inputs.to(device)
+                    y_ = y_.to(device)
                 ##Forward Pass
                 latent_representation, y = self.model(inputs)
                 # recornstuction_loss
                 reconstruction_loss = self.reconstruction_criterion(y,inputs)
                 # clustering loss
-                clustering_loss = self._compute_clustering_loss(latent_representation, self.config['n_clusters'])
-                loss = 100 * reconstruction_loss + clustering_loss
+                if self.config["use_clustering_loss"]:
+                    clustering_loss = self._compute_clustering_loss(latent_representation, self.config['n_clusters'])
+                    loss = 100 * reconstruction_loss + clustering_loss
+                else:
+                    loss = 100*reconstruction_loss
                 ##Backward pass
                 if np.isfinite(loss.item()):
                     self.optimizer.zero_grad()
@@ -154,15 +158,18 @@ class Trainer:
             inputs, targets, input_percentages, target_sizes, _ = data
             inputs = Variable(inputs)
             y_ = Variable(targets)
-            if self.device == "cuda":
-                inputs = inputs.cuda()
-                y_ = y_.cuda()
+            if self.device != "cpu":
+                inputs = inputs.to(self.device)
+                y_ = y_.to(self.device)
             ##Forward Pass
             latent_representation, y = self.model(inputs)
             reconstruction_loss = self.reconstruction_criterion(y,inputs)
             # clustering loss
-            clustering_loss = self._compute_clustering_loss(latent_representation, self.config['n_clusters'])
-            loss = 100 * reconstruction_loss + clustering_loss
+            if self.config["use_clustering_loss"]:
+                clustering_loss = self._compute_clustering_loss(latent_representation, self.config['n_clusters'])
+                loss = 100 * reconstruction_loss + clustering_loss
+            else:
+                loss = 100 * reconstruction_loss
             if loss < self.best_score:
                 self.best_score = loss
                 self.best_model = copy.deepcopy(self.model)

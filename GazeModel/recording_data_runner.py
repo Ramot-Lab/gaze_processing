@@ -38,7 +38,7 @@ class RecordingDataRunner:
             return None
         for data, _dataset in zip(test_loader, dataset_copy):
             inputs, _, _, target_sizes, _ = data
-            inputs = Variable(inputs, volatile=True).contiguous()
+            inputs = Variable(inputs).contiguous()
             y = self.model(inputs)
             if self.device == "cuda":
                 inputs = inputs.cuda()

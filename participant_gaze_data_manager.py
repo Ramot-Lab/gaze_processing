@@ -291,5 +291,6 @@ if __name__=="__main__":
     panel = "3"
     panel_path = "/Users/nitzankarby/Desktop/dev/Nitzan_K/data/panels_images/panel_a5.jpg"
     data_path = "/Volumes/labs/ramot/rotation_students/Nitzan_K/MS/Results/Behavior"
-    subject_data= ParticipantGazeDataManager(p_name, data_path, "KD", group)
-    print(subject_data.annotate_gaze_events("model_based", panel)[:20])
+    subject_data= ParticipantGazeDataManager(p_name, data_path, "SDMT", group)
+    # annotation = subject_data.annotate_gaze_events("model_based", panel)[:20]
+    

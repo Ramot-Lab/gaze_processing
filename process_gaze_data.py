@@ -318,7 +318,7 @@ def distance_from_target_symbol_analysis(cur_data : ParticipantGazeDataManager):
         if not 0.8 <((len(audio_data)//2) / score) < 1.2 :
             print(len(audio_data)//2, score, f"{cur_data.name} {panel_task_name}")
             continue
-        fixation_data = cur_data.annotate_gaze_events("model_based", panel_task_name)
+        fixation_data = cur_data.annotate_gaze_events("threshold_based", panel_task_name)
         fixation_data[fixation_data['evt']==0] = FIXATION_IDX
         fixation_data[fixation_data['evt']==3] = FIXATION_IDX
         correlated_data = cur_data.correlate_fixation_audio_in_time(fixation_data, audio_data)
@@ -390,8 +390,8 @@ def calculate_dist_from_target(data_path, task):
     plot_data(distance_from_key_map, y_label='Mean distance (cm)', title='Mean Distance From Target Symbol')
     #plot reliability
     min_val = min([len(participant_arr) for participant_arr in participants_results_matrix])
-    distribution = calculate_reliability_distribution(participants_results_matrix, int(min_val//2), int(min_val//2), 10000, min_val)
-    plot_barplot(list(range(5,int(min_val//2))) ,distribution, "L value","reliability value", "reliability distribution over different L values")
+    distribution = calculate_reliability_distribution(participants_results_matrix, int(min_val//2)-3, int(min_val//2), 10000, min_val)
+    plot_barplot(list(range(int(min_val//2)-3, int(min_val//2))) ,distribution, "L value","reliability value", "reliability distribution over different L values")
 
 def plot_grades(data_path, task = "SDMT"):
     grades = {}

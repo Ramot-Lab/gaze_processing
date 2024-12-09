@@ -22,8 +22,9 @@
         "train" : ["l4", "l3", "a3","a5","i1","1", "2", "3"],
         "val" : ["0"]
     },
+    "use_clustering_loss" : false,
     "center_data" : true,
-    "stride_step" : 10,
+    "stride_step" : 20,
     "n_clusters" : 7, 
     "clustering_loss_weight" : 0.1,
     "kmeans_iterations": 10,
@@ -40,35 +41,5 @@
     ], 
     "logs_path" : "model_runs",
 
-    "max_to_keep": 0, 
-    "architecture": {
-        "conv_stack": [
-            [
-                "conv1", 8, [    2,     11], [    1,     1]
-            ], 
-            [
-                "conv2", 8, [    2,     11], [    1,     1]
-            ]
-        ], 
-        "rnn_stack": [
-            [
-                "gru1", 
-                64, 
-                true, 
-                true
-            ], 
-            [
-                "gru2", 
-                64, 
-                true, 
-                true
-            ], 
-            [
-                "gru3", 
-                64, 
-                true, 
-                true
-            ]
-        ]
-    }
+    "max_to_keep": 0
 }
