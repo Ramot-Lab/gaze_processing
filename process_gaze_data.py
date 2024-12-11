@@ -416,5 +416,5 @@ def plot_grades(data_path, task = "SDMT"):
 if __name__=="__main__":
     data_path = "/Volumes/labs/ramot/rotation_students/Nitzan_K/MS/Results/Behavior"
     # plot_grades(data_path)
-    calculate_dist_from_target(data_path, task='SDMT')
-    # calculate_all_subjects_declaration_time(data_path, task='SDMT', minimal_declaration_count=30)
+    # calculate_dist_from_target(data_path, task='SDMT')
+    calculate_all_subjects_declaration_time(data_path, task='SDMT', minimal_declaration_count=30)

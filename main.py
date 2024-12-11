@@ -4,6 +4,7 @@ import os
 import glob
 import numpy as np
 from experimenting_gaze_data.trainer import Trainer
+from experimenting_gaze_data.evaluate_model import ModelEvaluator
 
 def convert_recordings_to_npy(data_path: str, task: str, output_path: str) -> None:
     """
@@ -46,7 +47,7 @@ def convert_recordings_to_npy(data_path: str, task: str, output_path: str) -> No
 
 if __name__ == "__main__":
     import sys
-    task_to_run = "train"
+    task_to_run = "eval"
     if task_to_run == "generate_data":
         data_path = "/Volumes/labs/ramot/rotation_students/Nitzan_K/MS/Results/Behavior"
         output_path = "data_for_training"
@@ -55,6 +56,10 @@ if __name__ == "__main__":
     elif task_to_run == "train":
         trainer = Trainer()
         trainer.run()
+    
+    elif task_to_run == "eval":
+        evaluater = ModelEvaluator('experimenting_gaze_data/config.json')
+        evaluater.run_evaluation(show=True)
     else:
         print("Unknown command, choose from ['generate_data'- for data generation, 'train' - for auto incoder model training]")
 

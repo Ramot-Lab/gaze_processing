@@ -29,8 +29,8 @@ class Trainer:
         self.reconstruction_criterion = nn.MSELoss()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.config['learning_rate'])
         self.loader_train = self.load_data(self.config["train_data_path"], self.config, "train")
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(self.optimizer, max_lr=self.config['learning_rate'], 
-                                                             steps_per_epoch=len(self.loader_train), epochs=self.args.num_epochs)
+        # self.scheduler = torch.optim.lr_scheduler.OneCycleLR(self.optimizer, max_lr=self.config['learning_rate'], 
+        #                                                      steps_per_epoch=len(self.loader_train), epochs=self.args.num_epochs)
         self.config_val = copy.deepcopy(self.config)
         self.config_val['split_seqs']=False
         self.config_val['batch_size']=1
@@ -51,7 +51,7 @@ class Trainer:
         return parser.parse_args()
 
     def load_data(self, data_path, config, train_val):
-        data = load_npy_files(data_path, config, train_val)[:15] #TODO: for debugging
+        data = load_npy_files(data_path, config, train_val)
         batch_size = self.config['batch_size']
         dataset = FixationDataset(config = self.config, gaze_data = data)
         loader = GazeDataLoader(dataset, batch_size=batch_size,
@@ -111,6 +111,7 @@ class Trainer:
         print("loading data...")   
         #training loop
         for epoch in range(0, self.args.num_epochs+1): 
+            running_loss = 0
             iterator = tqdm(self.loader_train)
             for step, data in enumerate(iterator):
                 global_step = len(self.loader_train)*(epoch-1) + step
@@ -128,16 +129,17 @@ class Trainer:
                 # clustering loss
                 if self.config["use_clustering_loss"]:
                     clustering_loss = self._compute_clustering_loss(latent_representation, self.config['n_clusters'])
-                    loss = 100 * reconstruction_loss + clustering_loss
+                    loss =  (100*reconstruction_loss) + clustering_loss
                 else:
-                    loss = 100*reconstruction_loss
+                    loss = 100 * reconstruction_loss
                 ##Backward pass
                 if np.isfinite(loss.item()):
                     self.optimizer.zero_grad()
                     loss.backward()
                     self.optimizer.step()
-                    self.scheduler.step()
-            print(f"Epoch: {epoch}, Loss: {loss.item()}")
+                    # self.scheduler.step()
+                    running_loss += loss.item()
+            print(f"Epoch: {epoch}, Loss: {running_loss/len(self.loader_train)}")
             if epoch > self.config['test_interval'] and epoch % self.config['test_interval'] == 0:
                 self.train_loss.append(loss.item())
                 self.run_validation(self.loader_val, epoch)
@@ -148,11 +150,14 @@ class Trainer:
         plt.plot(self.train_loss, label='train loss')
         plt.plot(self.val_loss, label='val loss')
         plt.xlabel('Epoch')
+        plt.ylim(0, 50)
         plt.ylabel('Loss')
         plt.legend()
         plt.savefig(os.path.join(model_path, f'loss_{epoch}.png'))
 
     def run_validation(self, loader_val, epoch):
+        total_loss = 0
+        self.model.eval()
         for step, data in enumerate(loader_val):
             ##Prepare data
             inputs, targets, input_percentages, target_sizes, _ = data
@@ -167,15 +172,16 @@ class Trainer:
             # clustering loss
             if self.config["use_clustering_loss"]:
                 clustering_loss = self._compute_clustering_loss(latent_representation, self.config['n_clusters'])
-                loss = 100 * reconstruction_loss + clustering_loss
+                loss = (100*reconstruction_loss) + clustering_loss
             else:
                 loss = 100 * reconstruction_loss
-            if loss < self.best_score:
-                self.best_score = loss
-                self.best_model = copy.deepcopy(self.model)
-                print("best model updated, best score: %f" % self.best_score)
-                model_output_path = self.save_model_checkpoint() 
-                self.plot_loss(model_output_path, epoch)
+            total_loss += loss.item()
+        if (total_loss/len(loader_val)) < self.best_score:
+            self.best_score = loss
+            self.best_model = copy.deepcopy(self.model)
+            print("best model updated, best score: %f" % self.best_score)
+            model_output_path = self.save_model_checkpoint() 
+            self.plot_loss(model_output_path, epoch)
         print("Validation loss: %f" % loss.item())
         self.val_loss.append(loss.item())
         self.model.train()
@@ -193,8 +199,3 @@ class Trainer:
                 json.dump(self.config, f, indent=4)
         return folder_path
 
-
-
-if __name__ == "__main__":
-    trainer = Trainer()
-    trainer.run()

@@ -77,11 +77,8 @@ class EventParser(object):
         config = self.config
         augment = config['augment']
         rms_noise_levels = np.arange(*config["augment_noise"])
-
-        inpt_dir = ['x', 'y']
-
-        gaze_x = np.copy(sample[inpt_dir[0]])
-        gaze_y = np.copy(sample[inpt_dir[1]])
+        gaze_x = [s[1] for s in sample][:config['seq_len']]
+        gaze_y = [s[2] for s in sample][:config['seq_len']]
 
         if augment:
             u1, u2 = np.random.uniform(0,1, (2, len(sample)))
@@ -93,10 +90,7 @@ class EventParser(object):
             gaze_x+=noise_x
             gaze_y+=noise_y
 
-        inpt_x, inpt_y = [np.diff(gaze_x),
-                          np.diff(gaze_y)]
-
-        X = [(_coords) for _coords in zip(inpt_x, inpt_y)]
+        X = [(s_1, s_2) for (s_1, s_2) in zip(gaze_x, gaze_y)]
         X = np.array(X, dtype=np.float32)
 
         return X
@@ -154,10 +148,16 @@ class   EMDataset(Dataset, EventParser):
     def __len__(self):
         return self.size
 
+    def _normalize_tensor(self, A):
+        eps = 1e-10
+        min_A, max_A = A.min(), A.max()
+        A = (A - min_A) / (max_A - min_A+eps)
+        return A
+
     def data_preprocess(self, sample, normalize=True):  
         if normalize:
-            sample['x'] = sample['x'] - sample['x'].mean()
-            sample['y'] = sample['y'] - sample['y'].mean()
+            sample['x'] = self._normalize_tensor(sample['x'])
+            sample['y'] = self._normalize_tensor(sample['y'])
         return sample
 
 def _collate_fn(batch):
