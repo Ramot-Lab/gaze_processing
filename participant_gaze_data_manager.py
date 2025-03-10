@@ -220,7 +220,7 @@ class ParticipantGazeDataManager:
     def nan_helper(self, x):
         return np.isnan(x), lambda z: z.nonzero()[0]
     
-    def interpulate_nan_values(self, eye):
+    def interpolate_nan_values(self, eye):
         nans, eye_temp = self.nan_helper(eye)
         if sum(nans) == len(nans):
             raise Exception("only nan values detected")
@@ -250,7 +250,7 @@ class ParticipantGazeDataManager:
         eye[outlier_values] = None
         if interpolate == False:
             return eye
-        return self.interpulate_nan_values(eye)
+        return self.interpolate_nan_values(eye)
 
     def annotate_gaze_events(self, annotation_method, panel):
         if annotation_method == "threshold_based":
