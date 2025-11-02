@@ -1,3 +1,4 @@
+from curses import KEY_MESSAGE
 import scipy.io as scio
 import numpy as np
 import pandas as pd
@@ -51,6 +52,25 @@ class ParticipantGazeDataManager:
         recording_files = glob(os.path.join(task_files_path, "**","*.wav"), recursive=True)
         return [scio.loadmat(mat, struct_as_record=False, squeeze_me=True) for mat in mat_files], task_png_files, recording_files
     
+    # def get_panel_image(self, panel_name: str):
+    #     """        
+    #     Parameters:
+    #     - participant_manager: ParticipantGazeDataManager object
+    #     - panel_name: str, e.g., "0", "i1", "l4"
+        
+    #     Returns:
+    #     - read image (numpy.ndarray) if found, else None
+    #     """
+    #     if panel_name not in self.matched_data:
+    #         raise ValueError(f"Panel '{panel_name}' not found in matched_data")
+        
+    #     img_path = self.matched_data[panel_name].get(KEY_TASK_PANEL_IMG, None)
+        
+    #     if img_path is None or not os.path.exists(img_path):
+    #         print(f"No image found for panel '{panel_name}'. Path: {img_path}")
+    #         return None
+        
+    #     return plt.imread(img_path)
 
     def group_task_info(self, tobii_data_file, task_png, audio_recordings, task_data, mat_file, clean_gaze_data):
         matched_data_files = {}
@@ -64,15 +84,55 @@ class ParticipantGazeDataManager:
             audio_files = [audio for audio in audio_recordings if task_code_lower in os.path.split(audio)[1].split("_")[audio_idx].lower()]
             audio_file = None if len(audio_files) == 0 else audio_files[0]
             preprocess_gaze_method = self.clean_outliers if clean_gaze_data else self.clean_outliers_no_interpolation
+            messages = self.get_messages_for_panel(i+1)
             matched_data_files[task_code_lower] = {KEY_TOBII_DATA: preprocess_gaze_method(tobii_data_file[f"panel_{i+1}"]),
                                                    KEY_TASK_PANEL_IMG : png_img,
+                                                   KEY_PANEL_MESSAGES : messages,
                                                    KEY_AUDIO_DATA :  audio_file,
                                                    KEY_STRIKE_SCORE : 0 if list(task_data.keys())[0] == "dummy" else task_data[f"strikes_img_test_{task_code}"],
                                                    KEY_RECORDING_DATE : self.get_creation_time(mat_file)}
         return matched_data_files
 
+    def get_messages_for_panel(self, panel_idx: int ): #1, 2 or 3
+        all_messages = self.messages
+        if not isinstance(all_messages, np.ndarray):
+            all_messages = np.array(all_messages, dtype=object)
 
-        
+        # --- Find start of this panel ---
+        start_match_idx = next(
+            (i for i, (_, msg) in enumerate(all_messages) if f"panel number {panel_idx}" in msg),
+            None
+        )
+        if start_match_idx is None:
+            raise ValueError(f"No start message found for panel number {panel_idx}")
+
+        start_time = all_messages[start_match_idx, 0]
+
+        # --- Find end of this panel ---
+        end_match_idx = next(
+            (i for i, (_, msg) in enumerate(all_messages) if f"break panel number {panel_idx}" in msg),
+            None
+        )
+
+        if end_match_idx is not None:
+            end_time = all_messages[end_match_idx, 0]
+        else:
+            # if no break message, fall back to "finished"
+            finished_idx = next(
+                (i for i, (_, msg) in enumerate(all_messages) if "finished" in msg),
+                None
+            )
+            if finished_idx is None:
+                raise ValueError(f"No end or finished message found for panel number {panel_idx}")
+            end_time = all_messages[finished_idx, 0]
+
+        # --- Extract messages in time range ---
+        timestamps = all_messages[:, 0].astype(float)
+        mask = (timestamps >= float(start_time)) & (timestamps <= float(end_time))
+        panel_messages = all_messages[mask]
+        return panel_messages
+    
+
     def prepare_gaze_data_for_preprocessing(self, data):
         # Extract left and right gaze data
         left_gaze = data['data'].gaze.left.gazePoint.onDisplayArea

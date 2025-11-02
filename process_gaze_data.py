@@ -10,7 +10,7 @@ from visualize_data import *
 
 
 KEYS_LOCATION = [0,0.142]
-OUTPUT_PATH = "/Users/nitzankarby/Desktop/dev/Nitzan_K/data/processing_results"
+OUTPUT_PATH = "/Volumes/ramot/rotation_students/Noam_M/Results/Behavior/processing_results"
 MIN_VALID_SCORE = 20
 
 def get_score(subject_data, plot):
@@ -414,7 +414,7 @@ def plot_grades(data_path, task = "SDMT"):
             
 
 if __name__=="__main__":
-    data_path = "/Volumes/labs/ramot/rotation_students/Nitzan_K/MS/Results/Behavior"
+    data_path = "/Volumes/ramot/rotation_students/Noam_M/Results/Behavior"
     # plot_grades(data_path)
     calculate_dist_from_target(data_path, task='SDMT')
     # calculate_all_subjects_declaration_time(data_path, task='SDMT', minimal_declaration_count=30)

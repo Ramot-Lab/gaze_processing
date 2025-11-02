@@ -46,9 +46,9 @@ def convert_recordings_to_npy(data_path: str, task: str, output_path: str) -> No
 
 if __name__ == "__main__":
     import sys
-    task_to_run = "train"
+    task_to_run = "generate_data"
     if task_to_run == "generate_data":
-        data_path = "/Volumes/labs/ramot/rotation_students/Nitzan_K/MS/Results/Behavior"
+        data_path = "/Volumes/ramot/rotation_students/Noam_M/Results/Behavior"
         output_path = "data_for_training"
         convert_recordings_to_npy(data_path, "KD", output_path)
         convert_recordings_to_npy(data_path, "SDMT", output_path)

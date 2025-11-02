@@ -202,6 +202,53 @@ def compair_fixation_results(
     plt.tight_layout()
     plt.show()
 
+# def set_up_data_for_finder(raw_or_csv: str, p_name: str, data_path: str,  group: str, panel: str, base_path = '/Volumes/ramot/rotation_students/Noam_M/Results/Behavior/processing_results'):
+#     #setting up data - either from csv or from raw
+#     if raw_or_csv == "raw":
+#         subject_data = ParticipantGazeDataManager(p_name, data_path, "SDMT", group)
+#         res = subject_data.annotate_gaze_events('threshold_based', panel)
+#     elif raw_or_csv == "csv":
+#         csv_path = f'{base_path}/{p_name}/task_{panel}_fixation.csv'
+#         res = pd.read_csv(csv_path, index_col=0)
+#     else:
+#         raise ValueError("raw_or_csv must be either 'raw' or 'csv'")
+#     return res
+    
+def prepare_image_and_gaze(img, gaze_df):
+    """
+    Resize and pad image to fit screen_size, and adjust gaze coordinates accordingly.
+    
+    Args:
+        img (np.ndarray): Original image (H x W x C).
+        gaze_df (pd.DataFrame): DataFrame returned by annotate_gaze_events.
+                                Must contain 'x' and 'y' columns in [0,1] normalized coords.
+    
+    Returns:
+        resized_img (np.ndarray): Resized and padded image fitting screen_size.
+        eye_x (np.ndarray): Adjusted gaze x coordinates.
+        eye_y (np.ndarray): Adjusted gaze y coordinates.
+    """
+    screen_height, screen_width = SCREEN_SIZE
+    img_height, img_width = img.shape[:2]
+
+    # Compute scaling factor to fit height
+    scale = screen_height / img_height
+    new_height = screen_height
+    new_width = int(img_width * scale)
+
+    # Resize image
+    resized_img = cv2.resize(img, (new_width, new_height))
+
+    # Compute left offset to center the image
+    x_offset = (screen_width - new_width) / 2
+
+    # Extract gaze data (assuming 'x' and 'y' are normalized [0,1])
+    gaze_aligned = gaze_df.copy()
+    # Adjust gaze coordinates
+    gaze_aligned[FIXATION_CSV_KEY_EYE_H] = gaze_aligned[FIXATION_CSV_KEY_EYE_H] * SCREEN_SIZE[1] - x_offset
+    gaze_aligned[FIXATION_CSV_KEY_EYE_V] = gaze_aligned[FIXATION_CSV_KEY_EYE_V] * SCREEN_SIZE[0]
+    
+    return resized_img, gaze_aligned
 
 ####### Fixation threshold finder ##########
 def __fixation_finder(gaze_horizontal_deg, gaze_vertical_deg, sacc_parameters, tobii_fps=600):
