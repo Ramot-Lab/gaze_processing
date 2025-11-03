@@ -35,7 +35,6 @@ class SearchFinder:
         searches = []
         in_search = False
         current_search_fixations = []
-        last_fixation_before_search = None
         search_idx = 0
 
         for fixation in self.all_fixations:
@@ -78,41 +77,6 @@ class SearchFinder:
 
         self.searches = searches
         return searches
-
-
-        
-    # def get_roi_sequences(self, searches: list[Search]):
-    #     """
-    #     Convert fixation data in searches into sequences of ROI objects.
-    #     """
-
-    #     roi_sequences = {}
-    #     if not searches:
-    #         raise ValueError("No searches provided to extract ROI sequences. - first run SearchFinder.find(img_shape)")
-        
-    #     for search in searches:
-    #         roi_seq = []
-    #         for fixation in search.fixations:
-    #             roi = self._map_fixation_to_roi(fixation)
-    #             if roi is not None:
-    #                 roi_seq.append(roi)
-    #         roi_sequences[search.idx] = roi_seq
-
-    #     return roi_sequences
-    
-    # def _map_fixation_to_roi(self, fixation):
-    #     """
-    #     Assign a fixation to an ROI index (0..len(rois)-1).
-    #     Falls back to nearest ROI if not inside any.
-    #     """
-    #     if self.rois:
-    #          for roi in self.rois:
-    #             if roi.contains(fixation):
-    #                 return roi
-        # # fallback: nearest ROI
-        # nearest_roi = self.roi_finder.nearest_roi(fixation.position[0], fixation.position[1])
-        # return 'nearest', nearest_roi
-    
 
 
 class SearchVisualizer():

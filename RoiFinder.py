@@ -11,11 +11,23 @@ class ROI:
         self.idx = idx
         self.symbol = symbol if symbol is not None else None
 
-    def contains(self, point):
+    def contains(self, point, radius = None):
         """Check if a (x, y) point lies inside this ROI"""
         px, py = point
         cx, cy = self.center
-        return (px - cx) ** 2 + (py - cy) ** 2 <= self.radius ** 2
+        if not radius:
+            radius = self.radius
+        return (px - cx) ** 2 + (py - cy) ** 2 <= radius ** 2
+    
+    def dist_and_angle(self, point: tuple[float, float]):
+        """Calculate distance and angle from ROI center to a given point."""
+        px, py = point
+        cx, cy = self.center
+        dx = px - cx
+        dy = py - cy
+        distance = np.sqrt(dx ** 2 + dy ** 2)
+        angle = np.arctan2(dy, dx)
+        return distance, angle
 
 
 class RoiFinder:

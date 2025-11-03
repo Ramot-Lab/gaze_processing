@@ -18,13 +18,6 @@ mpy_config.change_settings({
     "FFMPEG_BINARY": "/opt/anaconda3/envs/gaze/bin/ffmpeg"
 })
 
-### DID NOT USE YET!!###
-def add_audio_to_video(video_path, audio_path, output_path):
-    video_clip = VideoFileClip(video_path)
-    audio_clip = AudioFileClip(audio_path).subclip(0, video_clip.duration)
-    final_clip = video_clip.set_audio(audio_clip)
-    final_clip.write_videofile(output_path, codec="libx264", audio_codec="aac")
-
 
 MARKER_SIZE = 10  # Set your marker size
 ANIMATION_INTERVAL = 20  # Set your animation interval
