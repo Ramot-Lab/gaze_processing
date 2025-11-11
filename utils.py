@@ -202,17 +202,6 @@ def compair_fixation_results(
     plt.tight_layout()
     plt.show()
 
-# def set_up_data_for_finder(raw_or_csv: str, p_name: str, data_path: str,  group: str, panel: str, base_path = '/Volumes/ramot/rotation_students/Noam_M/Results/Behavior/processing_results'):
-#     #setting up data - either from csv or from raw
-#     if raw_or_csv == "raw":
-#         subject_data = ParticipantGazeDataManager(p_name, data_path, "SDMT", group)
-#         res = subject_data.annotate_gaze_events('threshold_based', panel)
-#     elif raw_or_csv == "csv":
-#         csv_path = f'{base_path}/{p_name}/task_{panel}_fixation.csv'
-#         res = pd.read_csv(csv_path, index_col=0)
-#     else:
-#         raise ValueError("raw_or_csv must be either 'raw' or 'csv'")
-#     return res
     
 def prepare_image_and_gaze(img, gaze_df):
     """
@@ -306,13 +295,13 @@ def _calculate_fixation(participants_data, panel):
     screenDistance = 0.65       # Distance from screen to participant (meters)
 
     sacc_parameters = {
-        'saccade_min_amp': 0.08,          # Minimum amplitude of a saccade (degrees)
-        'saccade_max_amp': 2,           # Maximum amplitude of a saccade (degrees)
-        'saccade_min_velocity': 15,       # Minimum velocity of a saccade (degrees/sec)
-        'saccade_peak_velocity': 150,      # Peak velocity of a saccade (degrees/sec)
+        'saccade_min_amp': 0.08,             # Minimum amplitude of a saccade (degrees)
+        'saccade_max_amp': 2,                # Maximum amplitude of a saccade (degrees)
+        'saccade_min_velocity': 15,          # Minimum velocity of a saccade (degrees/sec)
+        'saccade_peak_velocity': 150,        # Peak velocity of a saccade (degrees/sec)
         'saccade_min_duration': 0.009,       # Minimum duration of a saccade (seconds)
-        'saccade_angle_threshold': 30.0, # Maximum angle within a saccade (degrees)
-        'min_fixation_time' : 0.01, # Minimum time for a non-saccade movement to be considered as fixation
+        'saccade_angle_threshold': 30.0,     # Maximum angle within a saccade (degrees)
+        'min_fixation_time' : 0.01,          # Minimum time for a non-saccade movement to be considered as fixation
         'merge_overshoot': True,
         'overshoot_min_amp': 0.5,
         'merge_intrusions': 0,
