@@ -48,7 +48,7 @@ if __name__ == "__main__":
     import sys
     task_to_run = "generate_data"
     if task_to_run == "generate_data":
-        data_path = "/Volumes/ramot/rotation_students/Noam_M/Results/Behavior"
+        data_path = "/Volumes/ramot/Noam_M/Results/Behavior"
         output_path = "data_for_training"
         convert_recordings_to_npy(data_path, "KD", output_path)
         convert_recordings_to_npy(data_path, "SDMT", output_path)

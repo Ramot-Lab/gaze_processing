@@ -13,6 +13,8 @@ import subprocess
 from SearchFinder import SearchFinder, SearchVisualizer
 from utils import prepare_image_and_gaze
 import moviepy.config as mpy_config
+from matplotlib import cm
+
 
 mpy_config.change_settings({
     "FFMPEG_BINARY": "/opt/anaconda3/envs/gaze/bin/ffmpeg"
@@ -511,6 +513,39 @@ def plot_gaze_over_img_original(subject_data:ParticipantGazeDataManager, img_pat
     plt.scatter(eye_x, eye_y, s=3)
     plt.show()
 
+def plot_gaze_over_img_by_time(annotated_data, img, times):
+    fig, ax = plt.subplots()
+    ax.imshow(img)
+
+    # Define colormaps for each time window
+    colormaps = [cm.Blues, cm.Greens, cm.Reds, cm.Purples, cm.Oranges]
+
+    for i, (start, end) in enumerate(times):
+        # Filter relevant time span
+        mask = (annotated_data[FIXATION_CSV_TIME] >= start) & (annotated_data[FIXATION_CSV_TIME] <= end)
+        data = annotated_data.loc[mask]
+
+        if data.empty:
+            print(f"No data between {start}–{end}")
+            continue
+
+        eye_x = data[FIXATION_CSV_KEY_EYE_H].values
+        eye_y = data[FIXATION_CSV_KEY_EYE_V].values
+        time_vals = data[FIXATION_CSV_TIME].values
+
+        # Normalize time within the window to get gradient colors
+        norm = plt.Normalize(vmin=time_vals.min(), vmax=time_vals.max())
+        colors = colormaps[i % len(colormaps)](norm(time_vals))
+
+        ax.scatter(eye_x, eye_y, s=3, c=colors, alpha=0.7, edgecolors="none")
+
+    ax.set_title("Gaze over image (time-colored)")
+    ax.axis("off")
+
+    plt.show()
+    plt.close(fig)
+
+
 def plot_gazeNet_fig(data, spath = None, save=False, show=True, title=None):
     '''Plots trial
     '''
@@ -654,17 +689,15 @@ if __name__=="__main__":
     p_name = "AG562"
     task = "SDMT"
     group = "pwMS"
-    panel = "0"
-    panel_path = f'/Volumes/ramot/rotation_students/Noam_M/Results/Behavior/panels_images/SDMT/combined_testable_{panel}.jpg'
-    data_path = "/Volumes/ramot/rotation_students/Noam_M/Results/Behavior"
-    output_path = '/Volumes/ramot/rotation_students/Noam_M/visualized_data/test_videos/miao.mp4'
+    panel = "a3"
+    panel_path = f'/Volumes/ramot/Noam_M/Results/Behavior/panels_images/SDMT/combined_testable_{panel}.jpg'
+    data_path = "/Volumes/ramot/Noam_M/Results/Behavior"
+    output_path = f'/Volumes/ramot/Noam_M/visualized_data/test_videos/'
 
     video_w_curser_path = '/Volumes/ramot/rotation_students/Noam_M/visualized_data/test_videos/AG562_curser_w_sound.mov'
 
     # slow_down_video(video_w_curser_path, output_path, slow_factor= 3 )
-    print('meow')
     subject_data= ParticipantGazeDataManager(p_name, data_path, task, group)
-    print(1111111)
     # # gaze over time in space - and time:
     # res = subject_data.annotate_gaze_events('threshold_based', panel)
     # plot_gazeNet_fig(res, save=True) 
@@ -672,11 +705,11 @@ if __name__=="__main__":
     # create_panel_video(subject_data, panel, output_path) # - WORKING
 
     # showing and saving a video = picture + gaze - ?
-    # show_running_video_60fps(subject_data, panel, output_path)
+    show_running_video_60fps(subject_data, panel, output_path)
 
 
     # # showing heatmap of the subject gaze - over the image - WORKING
-    create_gaze_heatmap_video(subject_data, panel, output_path)
+    # create_gaze_heatmap_video(subject_data, panel, output_path)
     
     
     # # showing the a video of gaze over the image - DID NOT WORK!!!!!!!!!

@@ -15,8 +15,8 @@ class Search:
         self.idx = idx
         self.start_time = start_time
         self.end_time = end_time
-        self.fixations = fixations  # list of fixation objects
-        # self.fixation_before_search : Fixation | None = None
+        self.fixations = fixations
+        self.sequence = {} # to be defined in TrialManager
 
     def duration(self):
         return self.end_time - self.start_time

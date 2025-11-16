@@ -11,13 +11,20 @@ class ROI:
         self.idx = idx
         self.symbol = symbol if symbol is not None else None
 
-    def contains(self, point, radius = None):
+    def contains(self, point, radius = None, shape = "circle"):
         """Check if a (x, y) point lies inside this ROI"""
-        px, py = point
-        cx, cy = self.center
         if not radius:
             radius = self.radius
-        return (px - cx) ** 2 + (py - cy) ** 2 <= radius ** 2
+        px, py = point
+        cx, cy = self.center
+        if shape == "circle":
+            return (px - cx) ** 2 + (py - cy) ** 2 <= radius ** 2
+        
+        elif shape == "square":
+            return (cx - radius <= px <= cx + radius) and (cy - radius <= py <= cy + radius)
+        
+        else:
+            raise ValueError(f"Unknown shape '{shape}' for ROI.contains()")
     
     def dist_and_angle(self, point: tuple[float, float]):
         """Calculate distance and angle from ROI center to a given point."""
@@ -26,7 +33,7 @@ class ROI:
         dx = px - cx
         dy = py - cy
         distance = np.sqrt(dx ** 2 + dy ** 2)
-        angle = np.arctan2(dy, dx)
+        angle = np.arctan2(dy, dx) # radians
         return distance, angle
 
 

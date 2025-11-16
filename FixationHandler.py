@@ -1,5 +1,5 @@
 import pandas as pd
-from constants import FIXATION_IDX, SACCADE_IDX
+from constants import FIXATION_IDX, SACCADE_IDX, MIN_FIXATION_POINTS
 from RoiFinder import *
 
 
@@ -13,6 +13,12 @@ class Fixation:
 
     def duration(self):
         return self.end_time - self.start_time
+    
+    def get_mircosaccades(self):
+        return self.microsaccades
+    
+    def __repr__(self):
+        return f"Fixation(start_time={self.start_time}, end_time={self.end_time}, position={self.position}, duration={self.duration()} ms)"
 
 
 class FixationHandler:
@@ -20,6 +26,8 @@ class FixationHandler:
         self.fixations : list[Fixation] = []
         self.process_fixations(data)
 
+    def __repr__(self):
+        return f"FixationHandler(num_fixations={len(self.fixations)})"
 
     def get_fixations(self):
         return self.fixations
@@ -33,6 +41,7 @@ class FixationHandler:
         """
         Convert a list of fixation events into a Fixation object.
         """
+        # if len(fixation_events) > MIN_FIXATION_POINTS:
         df = pd.DataFrame(fixation_events, columns=['t', 'x', 'y'])
         start_time = df['t'].iloc[0]
         end_time = df['t'].iloc[-1]
@@ -66,15 +75,10 @@ class FixationHandler:
                 self._add_fixation(current_fixation)
                 current_fixation = []
 
+
         # in case the last block is a fixation and no SACCADE follows
         if current_fixation:
             self._add_fixation(current_fixation)
 
         return self.fixations
 
-
-
-        
-class FixationSaccadeVisualization:
-    def __init__(self, fixations: list[Fixation]):
-        self.fixations = fixations

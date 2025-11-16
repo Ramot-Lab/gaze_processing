@@ -23,6 +23,9 @@ class Trial():
         self.end_time = end_time
         self.searches = searches
 
+    def get_trial_duration(self):
+        return (self.start_time, self.end_time)
+
 class TrialManager():
     def __init__(self, subject_data: ParticipantGazeDataManager, panel, img):
         # --- Setup ---
@@ -39,17 +42,20 @@ class TrialManager():
         #For external use
         self.trials = []  # list of Trial objects
         self._extract_trials()
+        self._add_search_sequance()
 
     
     def _extract_trials(self):
+        """
+        Extract trials based on presses and searches.
+        Each trial starts with a press indicating the symbol of last trial solved.
+        Returns a list of Trial objects.
+        """
 
-        start_idx = 2  
-        end_idx = len(self.presses) - 1  
+        start_idx = 2  #first 2 presses are a bit messy
+        end_idx = len(self.presses) - 2 # last 2 presses are the ending and the task stop in the middle.
         # first press means the subject solved the first symbol (0th symbol) and last press is finishing with the panel
         for i, press in enumerate(self.presses[start_idx:end_idx], start=start_idx):
-            if i >= len(self.presses) - 1 | press.idx < 1:
-                break
-        
             symbol_index = press.idx + 18  # press 1 -> start of 2nd trial solving 2nd symbol -> symbol 19 (1 - based idx)
             triggering_symbol = next((s for s in self.symbols if s.idx == symbol_index), None)
             roi = next((r for r in self.rois if r.idx == symbol_index), None)
@@ -101,17 +107,42 @@ class TrialManager():
             
         return self.trials
     
+    def get_trial_duration(self, trial_number: int) -> tuple:
+        """
+        Given a trial number (int),
+        returns the start and end time of that trial as a tuple (start_time, end_time).
+        """
+        for trial in self.trials:
+            if trial.idx == trial_number:
+                return trial.get_trial_duration()
+        raise ValueError(f"Trial number {trial_number} not found.")
+    
+    def get_inter_trial_times(self, trial_pairs: list[tuple[int, int]]) -> list[tuple]:
+        """
+        Given a list of trial number pairs [(t1, t2), ...],
+        returns a list of tuples containing the end time of t1 and start time of t2 for each pair.
+
+        for instance: if tiral_pairs = [(43, 46), ...] 
+        i will get back [(end_time_trial_43, start_time_trial_46), ...]
+        """
+        times = []
+        for t1, t2 in trial_pairs:
+            end_t1 = self.trials[t1].end_time
+            start_t2 = self.trials[t2].start_time
+            times.append((end_t1, start_t2))
+        return times
+    
 # #havent checked
-#     def trials_per_symbol(self, number: int) -> list[Trial]:
-#         """
-#         Given a number (1–9),
-#         returns the list of searches where the triggering symbol was the given symbol.
-#         """
-#         return [
-#             trial
-#             for trial in self.trials
-#             if trial.triggering_symbol and trial.triggering_symbol.value == number
-#         ]
+    def trials_per_symbol(self, number: int) -> list[Trial]:
+        """
+        Given a number of the wanted trrigering symbol (1–9),
+        returns the list of trials that where the triggered by the given symbol.
+        """
+        return [
+            trial
+            for trial in self.trials
+            if trial.triggering_symbol and trial.triggering_symbol.value == number
+        ]
 
     def compute_dists_and_angles(self):
         """
@@ -128,6 +159,46 @@ class TrialManager():
             else:
                 print(f"Trial {trial.idx}: Missing triggering fixation or symbol")
         return distances, angles
+
+
+    def _add_search_sequance(self):
+        """
+        For each fixation in search, associate fixation with the most likely symbol.
+        - First, try to match fixation center to an ROI.
+        - If not found, check microsaccade coordinates within the fixation. roi with most microsaccade points wins.
+        - If still not found, assign None.
+        """
+        rois_in_dict_area = [r for r in self.rois if r.idx < 18]
+
+        for search in self.searches:
+            fixation_symbol = {} # fixation:symbol
+
+            for fixation in search.fixations:
+                roi = next((r for r in rois_in_dict_area if r.contains(fixation.position, shape="square")), None)
+
+                # If fixation center not in ROI, check microsaccades
+                if roi is None:
+                    roi_counts = {r: 0 for r in rois_in_dict_area}
+
+                    for _, row in fixation.microsaccades.iterrows():
+                        point = (row['x'], row['y'])
+                        for r in rois_in_dict_area:
+                            if r.contains(point, shape="square"):
+                                roi_counts[r] += 1
+
+                    # Pick ROI with most microsaccades
+                    roi = max(roi_counts, key=roi_counts.get)  #FIXME: what to do if there are more then one with max count?
+                  
+                    if roi_counts[roi] == 0:
+                        roi = None  # no microsaccades in any ROI
+                
+                if roi:
+                    fixation_symbol[fixation] = next((s for s in self.symbols if s.idx == roi.idx), None)
+                else:
+                    fixation_symbol[fixation] = None
+
+            search.sequence = fixation_symbol
+
 
 # ---------------------------------------------------------------- #
 #                    TRIALS ANALYSIS PLOTTING                      #
@@ -173,6 +244,38 @@ class TrialManager():
         plt.legend(loc='upper right')
         plt.xticks(x_positions, x_labels, rotation=90, ha='right')
         plt.tight_layout()
+        plt.show()
+
+    def plot_search_sequences_on_image(self):
+        """
+        Plot all searches on the image with fixations.
+        Each fixation is plotted as a dot, and the symbol index is shown in green nearby.
+        """
+        img_copy = self.img_resized.copy()  # make a copy to draw on
+
+        for search in self.searches:
+            for fix in search.fixations:
+                fx, fy = map(int, fix.position)
+                # Draw fixation as a small red dot
+                cv2.circle(img_copy, (fx, fy), radius=5, color=(0, 0, 255), thickness=-1)  # Red in BGR
+                
+                text = str(search.idx)
+                cv2.putText(
+                    img_copy,
+                    text,
+                    (fx + 5, fy - 5),
+                    fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                    fontScale=0.5,
+                    color=(17, 255, 0),
+                    thickness=1,
+                    lineType=cv2.LINE_AA
+                )
+
+        # Show the image
+        plt.figure(figsize=(10, 10))
+        plt.imshow(img_copy)
+        plt.axis('off')
+        plt.title("Fixations and Symbol Sequence")
         plt.show()
 
     def duration_between_press_histogram(self):
@@ -498,14 +601,24 @@ class TrialManagerDebugger:
         cv2.imwrite(output_file, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
         print(f"✅ Final triggering fixation image saved: {output_file}")
 
+    def none_in_search_symbols(self):
+        """
+        For each search, count how many times symbol 'None' appears in its fixation-symbol sequence.
+        Return a list of counts per search.
+        """
+        counts = {}
+        for trial in self.trials:
+            for search in trial.searches:
+                count_nun = sum(1 for symbol in search.sequence.values() if symbol == None)
+                counts[search.idx] = count_nun
+        return counts
 
 
-participant_data = ParticipantGazeDataManager("AG562", "/Volumes/ramot/Noam_M/Results/Behavior", "SDMT", "pwMS")
-panel = '0'
-img = plt.imread('/Volumes/ramot/Noam_M/Results/Behavior/panels_images/SDMT/combined_testable_0.jpg')
+if __name__ == "__main__":
+    participant_data = ParticipantGazeDataManager("AG562", "/Volumes/ramot/Noam_M/Results/Behavior", "SDMT", "pwMS")
+    panel = '0'
+    img = plt.imread('/Volumes/ramot/Noam_M/Results/Behavior/panels_images/SDMT/combined_testable_0.jpg')
 
-trial_maneger = TrialManager(participant_data, panel, img)
+    trial_maneger = TrialManager(participant_data, panel, img)
 
-debugger = TrialManagerDebugger(trial_maneger)
-
-trial_maneger.plot_distance_histogram()
+    trial_maneger.plot_searches_and_presses()

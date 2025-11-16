@@ -18,7 +18,7 @@ OLD_MIC_REPLACEMENT_DATE = "2024-07-01"
 VIDEO_CODEC = 'mp4v'   # Codec for .mp4
 FPS = 600              # Frames per second for video output
 RADIUS = 6             # Radius for eye position marker
-FIXATION_COLOR = (255, 0, 0)  # Color for eye marker (red in BGR format)
+FIXATION_COLOR = (0, 0, 255)  # Color for eye marker (red in BGR format)
 SACCADE_COLOR  = (255, 0, 0)  # Blue in OpenCV (BGR)
 THICKNESS = 3          # Thickness of the circle around the eye position
 
@@ -74,7 +74,10 @@ FIXATION_VALID_STATUS = "status"
 FIXATION_CSV_TIME = "t"
 SACCADE_IDX = 2
 FIXATION_IDX = 1
-RADIUS_OF_ROI = 29.7 # or 35.55
+
+
+#fixatio saccade preprossesing constants
+MIN_FIXATION_POINTS = 90 #600*150/1000  for 150 ms at 600Hz
 
 class ModelPropertise(Enum):
     MODEL_PATH = "/Users/noammizrachi/Documents/Msc/Ramot lab/data analysis/gaze_processing/GazeModel/gazeNET_0004_00003750.pth.tar"

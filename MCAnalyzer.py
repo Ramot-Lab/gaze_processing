@@ -69,7 +69,7 @@ class MCAnalyzer():
         transition_probabilities = transition_counts.div(transition_counts.sum(axis=1), axis=0).fillna(0)
         return transition_probabilities
 
-    def stationary_distribution(self, tol=1e-12):
+    def stationary_distribution(self, nodes_to_drop = None, tol=1e-12):
         """
         Compute the stationary distribution of a Markov chain
 
@@ -80,8 +80,13 @@ class MCAnalyzer():
         """
 
         #FIXME: not sure what is the meaning of it.
-        
+
         P = self.get_transition_probabilities().to_numpy()
+        if nodes_to_drop:
+            indices_to_keep = [i for i, node in enumerate(self._get_transition_table().index) if node not in nodes_to_drop]
+            P = P[np.ix_(indices_to_keep, indices_to_keep)]
+            # Normalize rows again after dropping nodes - each state has to have an added up probability of 1
+            P = P / P.sum(axis=1, keepdims=True)
         eigvals, eigvecs = np.linalg.eig(P.T)
 
         # Find eigenvector corresponding to eigenvalue 1
