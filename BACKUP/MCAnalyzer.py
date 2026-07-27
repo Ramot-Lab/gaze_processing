@@ -1,30 +1,68 @@
 from collections import defaultdict
-
+import os
 import pandas as pd
-
-from Trial import Trial
-
+from SDMT_Search_Processor.SearchFinder import Search  
+from BACKUP.Trial import Trial
+import seaborn as sns
 import networkx as nx
 import matplotlib.pyplot as plt
 import numpy as np
 
+
 class MCAnalyzer():
 
-    def __init__(self, trials: list[Trial]):
-        self.trials = trials
-        self.transitions = self._analyze_transitions()
+    def __init__(self, trials: list[Trial], only_keys: bool = True):
 
-    def _analyze_transitions(self) -> dict[tuple[str, str], int]:
+        self.trials = trials
+        self.only_keys = only_keys
+        if only_keys:
+            self.transiotions = self._analyze_only_states_transitions(clean = False)
+            self.cleaned_transition = self._analyze_only_states_transitions(clean = True)
+        else:
+            self.transitions = self._analyze_all_transitions(clean = False)
+            self.cleaned_transition = self._analyze_all_transitions(clean = True)
+
+    def _analyze_only_states_transitions(self, clean : bool) -> dict[tuple[str, str], int]:
         transitions = defaultdict(int)
 
         for trial in self.trials:
-            searches = [s for s in trial.searches if s.sequence]
-            if not searches:
+            if not clean:
+                searches :list[Search] = [s for s in trial.searches if s.sequence]
+            else:
+                searches :list[Search] = [s for s in trial.searches if s.cleaned_sequence]
+            if searches == []:
+                continue
+                
+            for search in searches:
+                if not clean:
+                    seq = [str(s.value) for s in search.sequence.values() if s]
+                else:
+                    seq = [str(s.value) for s in search.cleaned_sequence.values() if s]
+                if seq == []:
+                    continue
+                for a, b in zip(seq[:-1], seq[1:]):
+                    transitions[(a, b)] += 1
+        return dict(transitions)
+
+    def _analyze_all_transitions(self, clean : bool) -> dict[tuple[str, str], int]:
+        transitions = defaultdict(int)
+
+        for trial in self.trials:
+            if not clean:
+                searches :list[Search] = [s for s in trial.searches if s.sequence]
+            else:
+                searches :list[Search] = [s for s in trial.searches if s.cleaned_sequence]
+            if searches == []:
+                transitions[("ENTER", "EXIT")] += 1 # haven't even gone up to the dictionary area
                 continue
 
             for si, search in enumerate(searches):
-                seq = [str(s.value) for s in search.sequence.values() if s]
-                if not seq:
+                if not clean:
+                    seq = [str(s.value) for s in search.sequence.values() if s]
+                else:
+                    seq = [str(s.value) for s in search.cleaned_sequence.values() if s]
+                if seq == []: # all fixations are aoutside ROIs meaning [NONE, NONE, NONE...]
+                    transitions[("ENTER", "ENTER")] += 1
                     continue
 
                 # Enter transition
@@ -46,26 +84,26 @@ class MCAnalyzer():
 
         return dict(transitions)
 
-
-    def _get_transition_table(self) -> pd.DataFrame:
+    def _get_transition_table(self, clean : bool) -> pd.DataFrame:
         """go from dict to dataframe -> rows = From, columns = To"""
-        states = ["ENTER", "1", "2", "3", "4", "5", "6", "7", "8", "9", "EXIT"]
+        if self.only_keys:
+            states = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+        else:
+            states = ["ENTER", "1", "2", "3", "4", "5", "6", "7", "8", "9", "EXIT"]
 
         transition_counts = pd.DataFrame(0, index=states, columns=states)
-
-        for (from_state, to_state), count in self.transitions.items():
+        transitions = self.cleaned_transition if clean else self.transitions
+        for (from_state, to_state), count in transitions.items():
             transition_counts.loc[from_state, to_state] += count
         return transition_counts
 
-    def get_transition_probabilities(self, nodes_to_drop = None) -> pd.DataFrame:
+    def get_transition_probabilities(self, clean : bool) -> pd.DataFrame:
         """
         Get transition probabilities as a DataFrame.
         Rows = FROM state, Columns = TO state.
         """
 
-        transition_counts = self._get_transition_table()
-        if nodes_to_drop:
-            transition_counts = transition_counts.drop(index=nodes_to_drop, columns=nodes_to_drop, errors='ignore')
+        transition_counts = self._get_transition_table(clean = clean)
         transition_probabilities = transition_counts.div(transition_counts.sum(axis=1), axis=0).fillna(0)
         return transition_probabilities
 
@@ -82,12 +120,14 @@ class MCAnalyzer():
 
         #FIXME: not sure what is the meaning of it.
 
-        P = self.get_transition_probabilities().to_numpy()
+        P = self.get_transition_probabilities()
         if nodes_to_drop:
-            indices_to_keep = [i for i, node in enumerate(P.index) if node not in nodes_to_drop]
-            P = P[np.ix_(indices_to_keep, indices_to_keep)]
+            indices_to_keep = [i for i, state in enumerate(P.index) if state not in nodes_to_drop]
+            P = P.iloc[(indices_to_keep, indices_to_keep)].to_numpy()
             # Normalize rows again after dropping nodes - each state has to have an added up probability of 1
             P = P / P.sum(axis=1, keepdims=True)
+        else:
+            P = P.to_numpy()
         eigvals, eigvecs = np.linalg.eig(P.T)
 
         # Find eigenvector corresponding to eigenvalue 1
@@ -102,6 +142,20 @@ class MCAnalyzer():
 
         return pi
 
+    def build_directed_graph(self, threshold = 0) -> nx.DiGraph:
+        """
+        Build a directed graph from the transition probabilities.
+        """
+
+        prob_matrix = self.get_transition_probabilities()
+        G = nx.DiGraph()
+
+        for from_node in prob_matrix.index:
+            for to_node in prob_matrix.columns:
+                prob = prob_matrix.loc[from_node, to_node]
+                if prob >= threshold:
+                    G.add_edge(from_node, to_node, weight=prob)
+        return G
 
     def plot_transition_graph(self, threshold: float = 1/9, margin: float = 0.15):
         """
@@ -113,17 +167,7 @@ class MCAnalyzer():
         """
 
 
-        prob_matrix = self.get_transition_probabilities()
-        G = nx.DiGraph()
-
-        for node in prob_matrix.index:
-            G.add_node(node)
-
-        for from_node in prob_matrix.index:
-            for to_node in prob_matrix.columns:
-                prob = prob_matrix.loc[from_node, to_node]
-                if prob >= threshold:
-                    G.add_edge(from_node, to_node, weight=prob)
+        G = self.build_directed_graph(threshold=threshold)
 
         pos = nx.spring_layout(G, seed=42)
 
@@ -165,7 +209,6 @@ class MCAnalyzer():
         plt.axis('off')
         plt.title("Gaze Transition Graph")
         plt.show()
-
 
     def plot_transition_graph_no_enter_exit(self, threshold: float = 1/9, margin: float = 0.15):
         """
@@ -247,34 +290,76 @@ class MCAnalyzer():
         plt.title("Gaze Transition Graph (No ENTER/EXIT, Connectivity Components)")
         plt.show()
 
-
-    def most_probable_paths(self, maximum_k: int = 5) -> list[tuple[list[str], float]]:
+    def _most_probable_l_len_paths(self, path_length: int, n: int = 5) -> list[tuple[list[str], float]]:
         """
-        Find the top-k most probable paths from start_node to end_node.
-        their summed probabilities are the highest.
+        Compute the top-n most probable simple paths of EXACT given length
+        (in number of nodes) from ENTER to EXIT.
+
+        path_length : int
+            Number of nodes in the path (ENTER,...,EXIT). 
+            So path_length = 5 → sequences like ENTER → 2 → 7 → 9 → EXIT (5 nodes).
+
+        n : int
+            Number of most probable paths to return.
+
+        Returns: list of (path, probability)
         """
 
-        prob_matrix = self.get_transition_probabilities()
-        G = nx.DiGraph()
-
-        for from_node in prob_matrix.index:
-            for to_node in prob_matrix.columns:
-                prob = prob_matrix.loc[from_node, to_node]
-                if prob > 0:
-                    G.add_edge(from_node, to_node, weight=prob)
+        G = self.build_directed_graph()
 
         start_node = "ENTER"
         end_node = "EXIT"
-        all_paths = list(nx.all_simple_paths(G, source=start_node, target=end_node, cutoff=maximum_k))
+
+        # Get all simple paths up to given length
+        all_paths = list(nx.all_simple_paths(G, source=start_node, target=end_node, cutoff=path_length))
+
+        # Keep only paths EXACTLY matching the requested length
+        exact_paths = [p for p in all_paths if len(p) == path_length]
 
         path_probs = []
-        for path in all_paths:
+        for path in exact_paths:
             prob = 1.0
             for i in range(len(path) - 1):
-                prob *= G[path[i]][path[i + 1]]['weight']
+                u = path[i]
+                v = path[i + 1]
+                w = G[u][v].get('weight', 0.0)
+                prob *= w
             path_probs.append((path, prob))
 
-        # Sort paths by probability in descending order
+        # Sort by probability (descending)
         path_probs.sort(key=lambda x: x[1], reverse=True)
 
-        return path_probs[:maximum_k]
+        # Return top-n
+        return [(p, round(prob, 5)) for p, prob in path_probs[:n]]
+
+    def most_probable_paths(self, n: int = 3, max_length: int = 5) -> list[tuple[list[str], float]]:
+        """
+        Public method to get the most probable paths.
+        """
+        most_probable_paths = {}
+        for l in range(3, max_length + 1):
+            most_probable_paths[l] = self._most_probable_l_len_paths(path_length=l, n=n)
+        return most_probable_paths
+
+    def create_transition_probabilities_heatmap(self, p_name: str, panel: str, output_path: str = None):
+        p = self.get_transition_probabilities()
+        if output_path is None:
+            plt.figure(figsize=(10, 8))
+            sns.heatmap(p, annot=True, fmt=".2f", cmap="YlGnBu")
+            plt.title(f"Transition Probabilities for Participant {p_name} on Panel {panel}")
+            plt.xlabel("To Symbol")
+            plt.ylabel("From Symbol")
+            plt.show()
+        else:
+            os.makedirs(output_path, exist_ok=True)
+            output_file = os.path.join(
+            output_path,
+            f"transition_probabilities_heatmap_{p_name}_panel{panel}.png"
+        )
+            plt.figure(figsize=(10, 8))
+            sns.heatmap(p, annot=True, fmt=".2f", cmap="YlGnBu")
+            plt.title(f"Transition Probabilities for Participant {p_name} on Panel {panel}")
+            plt.xlabel("To Symbol")
+            plt.ylabel("From Symbol")
+            plt.savefig(output_file)
+            plt.close()

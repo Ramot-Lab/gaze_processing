@@ -30,7 +30,11 @@ class ParticipantGazeDataManager:
             self.task_data, self.messages, self.gaze_data, self.presentation_info, self.dom_Eye = self.prepare_gaze_data_for_preprocessing(mat_file)
             self.matched_data = {**self.matched_data, **self.group_task_info(self.gaze_data, task_png, audio_recordings, self.task_data, mat_file, clean_gaze_data)}
         
-
+    def get_gaze_data_for_panel(self, panel: str):
+        if panel not in self.matched_data:
+            raise ValueError(f"Panel {panel} not found in matched data.")
+        return self.matched_data[panel][KEY_TOBII_DATA]
+    
     def get_creation_time(self, tobii_data):
         header = str(tobii_data["__header__"])
         # Extract the date part using regex
@@ -51,26 +55,7 @@ class ParticipantGazeDataManager:
         task_png_files = glob(os.path.join(main_data_path, "panels_images", task,"*.jpg"))
         recording_files = glob(os.path.join(task_files_path, "**","*.wav"), recursive=True)
         return [scio.loadmat(mat, struct_as_record=False, squeeze_me=True) for mat in mat_files], task_png_files, recording_files
-    
-    # def get_panel_image(self, panel_name: str):
-    #     """        
-    #     Parameters:
-    #     - participant_manager: ParticipantGazeDataManager object
-    #     - panel_name: str, e.g., "0", "i1", "l4"
-        
-    #     Returns:
-    #     - read image (numpy.ndarray) if found, else None
-    #     """
-    #     if panel_name not in self.matched_data:
-    #         raise ValueError(f"Panel '{panel_name}' not found in matched_data")
-        
-    #     img_path = self.matched_data[panel_name].get(KEY_TASK_PANEL_IMG, None)
-        
-    #     if img_path is None or not os.path.exists(img_path):
-    #         print(f"No image found for panel '{panel_name}'. Path: {img_path}")
-    #         return None
-        
-    #     return plt.imread(img_path)
+
 
     def group_task_info(self, tobii_data_file, task_png, audio_recordings, task_data, mat_file, clean_gaze_data):
         matched_data_files = {}
@@ -84,7 +69,7 @@ class ParticipantGazeDataManager:
             audio_files = [audio for audio in audio_recordings if task_code_lower in os.path.split(audio)[1].split("_")[audio_idx].lower()]
             audio_file = None if len(audio_files) == 0 else audio_files[0]
             preprocess_gaze_method = self.clean_outliers if clean_gaze_data else self.clean_outliers_no_interpolation
-            messages = self.get_messages_for_panel(i+1)
+            messages = self.messages_for_panel(i+1)
             matched_data_files[task_code_lower] = {KEY_TOBII_DATA: preprocess_gaze_method(tobii_data_file[f"panel_{i+1}"]),
                                                    KEY_TASK_PANEL_IMG : png_img,
                                                    KEY_PANEL_MESSAGES : messages,
@@ -93,7 +78,7 @@ class ParticipantGazeDataManager:
                                                    KEY_RECORDING_DATE : self.get_creation_time(mat_file)}
         return matched_data_files
 
-    def get_messages_for_panel(self, panel_idx: int ): #1, 2 or 3
+    def messages_for_panel(self, panel_idx: int ): #1, 2 or 3
         all_messages = self.messages
         if not isinstance(all_messages, np.ndarray):
             all_messages = np.array(all_messages, dtype=object)
@@ -132,6 +117,12 @@ class ParticipantGazeDataManager:
         panel_messages = all_messages[mask]
         return panel_messages
     
+    def get_panel_img(self, panel: str):
+        img_path = self.matched_data[panel].get(KEY_TASK_PANEL_IMG, None)
+        try:
+            return plt.imread(img_path)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"No image found at path: {img_path}")
 
     def prepare_gaze_data_for_preprocessing(self, data):
         # Extract left and right gaze data
@@ -169,11 +160,15 @@ class ParticipantGazeDataManager:
                 panel_data = np.concatenate((right_gaze[:, panel_presentation_indices[i]].T, np.reshape(tobi_ts[panel_presentation_indices[i]], (-1,1))), axis=1)
                 if (np.count_nonzero(np.isnan(panel_data))//2) / len(panel_data) < MAX_VALID_NAN_VALUES:
                     gaze_data[f'panel_{i+1}'] = panel_data
+                else:
+                    raise Exception(f"Too many NaN values in panel {i+1} for dominant eye 'r'")
 
             else:
                 panel_data = np.concatenate((left_gaze[:, panel_presentation_indices[i]].T, np.reshape(tobi_ts[panel_presentation_indices[i]], (-1,1))), axis=1)
                 if (np.count_nonzero(np.isnan(panel_data))//2) / len(panel_data) < MAX_VALID_NAN_VALUES:
                     gaze_data[f'panel_{i+1}'] = panel_data
+                else:
+                    raise Exception(f"Too many NaN values in panel {i+1} for dominant eye 'l'")
 
 
         # Calculate presentation durations
@@ -312,15 +307,17 @@ class ParticipantGazeDataManager:
             return eye
         return self.interpulate_nan_values(eye)
 
-    def annotate_gaze_events(self, annotation_method, panel):
+    def annotate_gaze_events(self, panel : str,  annotation_method = 'threshold_based'):
         if annotation_method == "threshold_based":
             return generate_fixations_threshold_based(self, panel)
         elif annotation_method == "model_based":
             if self.model is None:
                 self.load_model()
             return generate_fixation_model_based(self.matched_data[panel][KEY_TOBII_DATA], model = self.model)
+        elif annotation_method == "pymovments_based":
+            return generate_fixations_pymovements_based(self, panel)
         else:
-            raise Exception(f"unknown annotation method: {annotation_method} choose from ['threshold_based', 'model_based']")
+            raise Exception(f"unknown annotation method: {annotation_method} choose from ['threshold_based', 'model_based', 'pymovments_based']")
 
     def load_model(self):
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -349,7 +346,6 @@ if __name__=="__main__":
     task = "SDMT"
     group = "pwMS"
     panel = "3"
-    panel_path = "/Users/nitzankarby/Desktop/dev/Nitzan_K/data/panels_images/panel_a5.jpg"
     data_path = "/Volumes/labs/ramot/rotation_students/Nitzan_K/MS/Results/Behavior"
     subject_data= ParticipantGazeDataManager(p_name, data_path, "KD", group)
 

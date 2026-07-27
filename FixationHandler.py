@@ -1,5 +1,5 @@
 import pandas as pd
-from constants import FIXATION_IDX, SACCADE_IDX, MIN_FIXATION_POINTS
+from constants import FIXATION_IDX, SACCADE_IDX
 from RoiFinder import *
 
 
@@ -16,6 +16,9 @@ class Fixation:
     
     def get_mircosaccades(self):
         return self.microsaccades
+    
+    def get_position(self):
+        return self.position
     
     def __repr__(self):
         return f"Fixation(start_time={self.start_time}, end_time={self.end_time}, position={self.position}, duration={self.duration()} ms)"

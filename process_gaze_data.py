@@ -1,4 +1,4 @@
-from participant_gaze_data_manager import ParticipantGazeDataManager
+from .participant_gaze_data_manager import ParticipantGazeDataManager
 import os
 from glob import glob
 import numpy as np
@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from constants import *
 import cv2
 from reliability_measurement import calculate_reliability_distribution
-from visualize_data import *
+from .visualize_data import *
 
 
 KEYS_LOCATION = [0,0.142]

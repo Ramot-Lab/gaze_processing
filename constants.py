@@ -53,7 +53,7 @@ KEY_AMPLITUDE = "amplitude"  # Key for saccade amplitude data
 KEY_DURATION = "duration"  # Key for saccade duration data
 KEY_PEAK_VELOCITY = "peak_velocity"  # Key for saccade peak velocity data
 
-KEY_ANNOTATION_MODEL_BASE = 'threshold_based' # or ״model_based״
+KEY_ANNOTATION_MODEL_BASE = 'threshold_based' # or ״model_based״, or "pymovements_based"
 # String constants for messages and logs
 VIDEO_SAVED_MESSAGE = "Video saved without audio at: {video_output_path}"
 GAZE_MOVIE_PROGRESS = 'Processing data point {i} of {total} ({progress:.1f}%)'
@@ -76,8 +76,9 @@ SACCADE_IDX = 2
 FIXATION_IDX = 1
 
 
-#fixatio saccade preprossesing constants
-MIN_FIXATION_POINTS = 90 #600*150/1000  for 150 ms at 600Hz
+# #fixatio saccade preprossesing constants
+# MIN_FIXATION_POINTS = 90 #600*150/1000  for 150 ms at 600Hz
+THRESHOLD_FOR_MARKOV_DIAGRAM = 1/11  # Minimum transition probability to include an edge in the Markov diagram
 
 class ModelPropertise(Enum):
     MODEL_PATH = "/Users/noammizrachi/Documents/Msc/Ramot lab/data analysis/gaze_processing/GazeModel/gazeNET_0004_00003750.pth.tar"

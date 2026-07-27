@@ -17,9 +17,21 @@ class Search:
         self.end_time = end_time
         self.fixations = fixations
         self.sequence = {} # to be defined in TrialManager
+        self.cleaned_sequence = {} # list of symbols in search - no repeats if on the same symbol
 
     def duration(self):
         return self.end_time - self.start_time
+
+    def clean_sequence(self):
+        """ Removes repeated symbols in search sequences. """
+        cleaned_sequence = {}
+        previous_symbol = Symbol(value= None, symbol_type= "None")
+        for fixation, symbol in self.sequence.items():
+            if symbol is not None and symbol.value != previous_symbol.value:
+                cleaned_sequence[fixation] = symbol
+                previous_symbol = symbol
+        self.cleaned_sequence = cleaned_sequence
+
 
 class SearchFinder:
     def __init__(self, all_fixations: list[Fixation]):

@@ -10,7 +10,6 @@ from matplotlib.animation import FFMpegWriter
 from constants import *
 from moviepy.editor import VideoFileClip, AudioFileClip, vfx
 import subprocess
-from SearchFinder import SearchFinder, SearchVisualizer
 from utils import prepare_image_and_gaze
 import moviepy.config as mpy_config
 from matplotlib import cm
@@ -73,9 +72,9 @@ def show_running_video_live(eye_data, img_path):
 def nan_helper(x):
     return np.isnan(x), lambda z: z.nonzero()[0]
 
-def _get_image_and_gaze_data_and_rescale(subject, panel_code):
+def _get_image_and_gaze_data_and_rescale(subject : ParticipantGazeDataManager, panel_code: str):
     # Get the data
-    annotated_data = subject.annotate_gaze_events(KEY_ANNOTATION_MODEL_BASE, panel)
+    annotated_data = subject.annotate_gaze_events(panel_code, KEY_ANNOTATION_MODEL_BASE)
     matching_dictionary = subject.matched_data
     task_data = matching_dictionary[panel_code]
     img = cv2.imread(task_data[KEY_TASK_PANEL_IMG])
@@ -219,7 +218,7 @@ def show_running_video_60fps(subject, panel_code, output_path, target_fps=60):
         out.write(cv2.cvtColor(cur_img, cv2.COLOR_RGB2BGR))
 
     out.release()
-    print(f"✅ Video saved at {target_fps} FPS: {video_output_path}")
+    print(f"✅ Video saved at {target_fps} FPS: {output_path}")
 
 def show_heatmap(subject_data: ParticipantGazeDataManager, task_code, output_path = "", show_plot = True):
     """
@@ -686,26 +685,60 @@ def slow_down_video(input_path, output_folder, slow_factor= 2 ):
 
 
 if __name__=="__main__":
-    p_name = "AG562"
     task = "SDMT"
-    group = "pwMS"
-    panel = "a3"
-    panel_path = f'/Volumes/ramot/Noam_M/Results/Behavior/panels_images/SDMT/combined_testable_{panel}.jpg'
     data_path = "/Volumes/ramot/Noam_M/Results/Behavior"
     output_path = f'/Volumes/ramot/Noam_M/visualized_data/test_videos/'
+    panels = ['0', 'i1', 'l4', 'a3', 'a5', 'l3']
 
-    video_w_curser_path = '/Volumes/ramot/rotation_students/Noam_M/visualized_data/test_videos/AG562_curser_w_sound.mov'
+    # Videos already produced (in the main output folder, already triaged
+    # into the "good"/"bad" FS-definition folders, or in a participant's own
+    # subfolder) should not be regenerated.
+    already_done_dirs = [
+        output_path,
+        os.path.join(output_path, "good FS definition"),
+        os.path.join(output_path, "bad FS definition"),
+    ]
+    existing_videos = set()
+    for d in already_done_dirs:
+        if not os.path.isdir(d):
+            continue
+        for fname in os.listdir(d):
+            existing_videos.add(fname)
 
-    # slow_down_video(video_w_curser_path, output_path, slow_factor= 3 )
-    subject_data= ParticipantGazeDataManager(p_name, data_path, task, group)
-    # # gaze over time in space - and time:
-    # res = subject_data.annotate_gaze_events('threshold_based', panel)
-    # plot_gazeNet_fig(res, save=True) 
-    # img_bgr = cv2.imread(panel_path)   
-    # create_panel_video(subject_data, panel, output_path) # - WORKING
+    for group in ["HC", "pwMS"]:
+        group_path = os.path.join(data_path, group)
+        if not os.path.isdir(group_path):
+            continue
 
-    # showing and saving a video = picture + gaze - ?
-    show_running_video_60fps(subject_data, panel, output_path)
+        for p_name in os.listdir(group_path):
+            if p_name == "NN111" or p_name.endswith("_DONTUSE"):
+                continue
+            if not os.path.isdir(os.path.join(group_path, p_name, task)):
+                continue
+
+            subject_output_path = os.path.join(output_path, p_name)
+            subject_existing = set(existing_videos)
+            if os.path.isdir(subject_output_path):
+                subject_existing.update(os.listdir(subject_output_path))
+
+            remaining_panels = [
+                panel for panel in panels
+                if VIDEO_FILENAME_TEMPLATE.format(task_code=panel, subject_name=p_name) not in subject_existing
+            ]
+            if not remaining_panels:
+                continue
+
+            try:
+                subject_data = ParticipantGazeDataManager(p_name, data_path, task, group)
+            except Exception as e:
+                print(f"Could not load data manager for {p_name}: {e}")
+                continue
+
+            for panel in remaining_panels:
+                try:
+                    show_running_video_60fps(subject_data, panel, subject_output_path)
+                except Exception as e:
+                    print(f"  Error creating video for {p_name} - {panel}: {e}")
 
 
     # # showing heatmap of the subject gaze - over the image - WORKING

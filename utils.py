@@ -5,6 +5,8 @@ import matplotlib.pyplot as plt
 from constants import *
 import numpy as np
 import os
+import pymovements as pm
+import polars as pl
 
 def get_panel_edges(image) -> list:
     """
@@ -275,7 +277,7 @@ def __fixation_finder(gaze_horizontal_deg, gaze_vertical_deg, sacc_parameters, t
 
     
 def generate_fixations_threshold_based(participants_data ,panel):
-    fixation_array = _calculate_fixation(participants_data,panel)
+    fixation_array = _calculate_fixation_by_annotation(participants_data,panel)
     eyes_data = participants_data.matched_data[panel][KEY_TOBII_DATA]
     eyes_data[:,2] -= eyes_data[:,2][0]
     matched_data = np.concatenate((np.expand_dims(eyes_data[:,2], 1), np.expand_dims(eyes_data[:,0],1), np.expand_dims(eyes_data[:,1],1),
@@ -284,7 +286,70 @@ def generate_fixations_threshold_based(participants_data ,panel):
     df_data.to_csv(os.path.join(participants_data.output_path, f"task_{panel}_fixation.csv"))
     return df_data
 
-def _calculate_fixation(participants_data, panel):
+def generate_fixations_pymovements_based(participants_data, panel):
+    fixation_array = _calculate_fixation_with_pymovements(participants_data,panel)
+    eyes_data = participants_data.matched_data[panel][KEY_TOBII_DATA]
+    eyes_data[:,2] -= eyes_data[:,2][0]
+    matched_data = np.concatenate((np.expand_dims(eyes_data[:,2], 1), np.expand_dims(eyes_data[:,0],1), np.expand_dims(eyes_data[:,1],1),
+                                   np.expand_dims(np.ones_like(fixation_array),1),np.expand_dims(fixation_array,1)), axis=1)
+    df_data = pd.DataFrame(matched_data, columns= [TIME_STAMP, FIXATION_CSV_KEY_EYE_H, FIXATION_CSV_KEY_EYE_V, FIXATION_VALID_STATUS,FIXATION_CSV_KEY_FIXATION])
+    df_data.to_csv(os.path.join(participants_data.output_path, f"task_{panel}_fixation.csv"))
+    return df_data
+
+
+def _calculate_fixation_with_pymovements(participants_data, panel):
+    eyes_data = participants_data.matched_data[panel][KEY_TOBII_DATA]
+    if len(eyes_data) == 0:
+        return np.array([])
+        
+    # 1. Temporarily scale normalized (0-1) coordinates to physical pixels
+    x_px = np.array(eyes_data[:, 0], dtype=float) * 1920.0
+    y_px = np.array(eyes_data[:, 1], dtype=float) * 1080.0
+    t = np.array(eyes_data[:, 2], dtype=float)
+    
+    pos_array = np.column_stack((x_px, y_px))
+    
+    # 2. Calculate Velocity (Pixels/sec) using strict 600Hz interval
+    dt = 1.0 / 600.0 
+    vx = np.insert(np.diff(x_px) / dt, 0, 0)
+    vy = np.insert(np.diff(y_px) / dt, 0, 0)
+    
+    # Smooth velocity noise (5-sample window)
+    kernel = np.ones(5) / 5.0
+    vx_smooth = np.convolve(vx, kernel, mode='same')
+    vy_smooth = np.convolve(vy, kernel, mode='same')
+    vel_array = np.column_stack((vx_smooth, vy_smooth))
+    
+    # 3. Run Detectors
+    fixations = pm.events.idt(
+        positions=pos_array,
+        dispersion_threshold=42.2,  
+        minimum_duration=30         # 30 samples = 50ms
+    )
+    
+    saccades = pm.events.ivt(
+        velocities=vel_array,
+        velocity_threshold=1477.0,  
+        minimum_duration=6          # 6 samples = 10ms
+    )
+    
+    # 4. Map events to the timeline
+    fixation_array = np.zeros(len(t), dtype=int)
+    
+    if saccades is not None and len(saccades.frame) > 0:
+        for _, sac in saccades.frame.to_pandas().iterrows():
+            fixation_array[int(sac['onset']):int(sac['offset'])] = SACCADE_IDX 
+
+    if fixations is not None and len(fixations.frame) > 0:
+        for _, fix in fixations.frame.to_pandas().iterrows():
+            fixation_array[int(fix['onset']):int(fix['offset'])] = FIXATION_IDX  
+            
+ 
+            
+    return fixation_array
+
+
+def _calculate_fixation_by_annotation(participants_data, panel):
     """
     returns a fixation points calculated from a given eye_data
     """

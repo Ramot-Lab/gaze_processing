@@ -11,17 +11,19 @@ class ROI:
         self.idx = idx
         self.symbol = symbol if symbol is not None else None
 
-    def contains(self, point, radius = None, shape = "circle"):
-        """Check if a (x, y) point lies inside this ROI"""
-        if not radius:
-            radius = self.radius
+    def contains(self, point, factor = None, shape = "circle"):
+        """Check if a (x, y) point lies inside this ROI, 
+        if there is a factor the radius of the roi will be multiplied by iy for the check"""
+        if factor is None:
+            factor = 1
+        factored_radius = self.radius * factor
         px, py = point
         cx, cy = self.center
         if shape == "circle":
-            return (px - cx) ** 2 + (py - cy) ** 2 <= radius ** 2
+            return (px - cx) ** 2 + (py - cy) ** 2 <= factored_radius ** 2
         
         elif shape == "square":
-            return (cx - radius <= px <= cx + radius) and (cy - radius <= py <= cy + radius)
+            return (cx - self.radius <= px <= cx + self.radius) and (cy - factored_radius <= py <= cy + factored_radius)
         
         else:
             raise ValueError(f"Unknown shape '{shape}' for ROI.contains()")

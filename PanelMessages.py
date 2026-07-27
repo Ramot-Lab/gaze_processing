@@ -33,35 +33,35 @@ class PanelMessages:
         self.subject_data = subject_data
         self.message_info :MessageInfo = None  # list messageInfo objects
         messages = subject_data.matched_data[panel][KEY_PANEL_MESSAGES]
-        if messages.size == 0:
-            raise ValueError(f"No messages found for panel '{panel}'")
+        if messages is None or messages.size < 4:
+            raise ValueError(f"No messages found for subject {subject_data.name} for panel '{panel}'")
+        else:
+            start_time = messages[0, 0]
+            end_time = messages[-1, 0]
 
-        start_time = messages[0, 0]
-        end_time = messages[-1, 0]
+            presses = []
+            for ts, text in messages:
+                if isinstance(text, str) and text.startswith("press "):
+                    match = re.search(r"press (\d+)", text)
+                    if match:
+                        presses.append((int(match.group(1)), ts - start_time))
 
-        presses = []
-        for ts, text in messages:
-            if isinstance(text, str) and text.startswith("press "):
-                match = re.search(r"press (\d+)", text)
-                if match:
-                    presses.append((int(match.group(1)), ts - start_time))
+            # Convert to Press objects
+            press_objs = [Press(idx=p[0], time=p[1]) for p in presses]
 
-        # Convert to Press objects
-        press_objs = [Press(idx=p[0], time=p[1]) for p in presses]
+            # --- Add synthetic first and last press ---
+            # First press: start of panel (time = 0)
+            press_objs.insert(0, Press(idx=0, time=0))
+            # Last press: end of panel (time = end_time - start_time)
+            press_objs.append(Press(idx=len(press_objs), time=end_time - start_time))
 
-        # --- Add synthetic first and last press ---
-        # First press: start of panel (time = 0)
-        press_objs.insert(0, Press(idx=0, time=0))
-        # Last press: end of panel (time = end_time - start_time)
-        press_objs.append(Press(idx=len(press_objs), time=end_time - start_time))
-
-        # Create and store MessageInfo
-        self.message_info = MessageInfo(
-            panel_name=panel,
-            start_time=0,
-            end_time=end_time - start_time,
-            presses=press_objs
-        )
+            # Create and store MessageInfo
+            self.message_info = MessageInfo(
+                panel_name=panel,
+                start_time=0,
+                end_time=end_time - start_time,
+                presses=press_objs
+            )
 
     def __repr__(self):
         return f"<PanelMessages: {len(self.message_info)} panels>"
