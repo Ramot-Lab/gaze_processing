@@ -72,7 +72,8 @@ class MCAnalyzer():
     def stationary_distribution(self, nodes_to_drop = None, tol=1e-12):
         """
         Compute the stationary distribution of a Markov chain
-
+        nodes_to_drop : list[str] ; List of nodes to exclude from the computation - 
+                                    probabilities will be normalized before stationary dist. is calculated.
         tol : float ; Numerical tolerance for eigenvalue comparison.
 
         Returns:
@@ -83,7 +84,7 @@ class MCAnalyzer():
 
         P = self.get_transition_probabilities().to_numpy()
         if nodes_to_drop:
-            indices_to_keep = [i for i, node in enumerate(self._get_transition_table().index) if node not in nodes_to_drop]
+            indices_to_keep = [i for i, node in enumerate(P.index) if node not in nodes_to_drop]
             P = P[np.ix_(indices_to_keep, indices_to_keep)]
             # Normalize rows again after dropping nodes - each state has to have an added up probability of 1
             P = P / P.sum(axis=1, keepdims=True)
@@ -245,3 +246,35 @@ class MCAnalyzer():
         plt.axis('off')
         plt.title("Gaze Transition Graph (No ENTER/EXIT, Connectivity Components)")
         plt.show()
+
+
+    def most_probable_paths(self, maximum_k: int = 5) -> list[tuple[list[str], float]]:
+        """
+        Find the top-k most probable paths from start_node to end_node.
+        their summed probabilities are the highest.
+        """
+
+        prob_matrix = self.get_transition_probabilities()
+        G = nx.DiGraph()
+
+        for from_node in prob_matrix.index:
+            for to_node in prob_matrix.columns:
+                prob = prob_matrix.loc[from_node, to_node]
+                if prob > 0:
+                    G.add_edge(from_node, to_node, weight=prob)
+
+        start_node = "ENTER"
+        end_node = "EXIT"
+        all_paths = list(nx.all_simple_paths(G, source=start_node, target=end_node, cutoff=maximum_k))
+
+        path_probs = []
+        for path in all_paths:
+            prob = 1.0
+            for i in range(len(path) - 1):
+                prob *= G[path[i]][path[i + 1]]['weight']
+            path_probs.append((path, prob))
+
+        # Sort paths by probability in descending order
+        path_probs.sort(key=lambda x: x[1], reverse=True)
+
+        return path_probs[:maximum_k]
