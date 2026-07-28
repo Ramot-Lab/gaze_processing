@@ -343,33 +343,48 @@ def build_drift_qa_table(main_data_path, task="SDMT", groups=("HC", "pwMS")):
 # ---------------------------------------------------------------------------------------
 # Item 5: video of the drift-corrected gaze, without rebuilding a ParticipantGazeDataManager
 # ---------------------------------------------------------------------------------------
-def _load_saved_annotated_gaze(main_data_path, participant, panel):
+def _load_saved_annotated_gaze(main_data_path, participant, panel, eye=None):
     """
     Reads the per-panel gaze CSV the pipeline already saves at
-    processing_results/{participant}/task_{panel}_fixation.csv (written as a side effect
-    of ParticipantGazeDataManager.annotate_gaze_events -> utils.generate_fixations_threshold_based).
+    processing_results/{participant}/task_{panel}_fixation_{eye}.csv (written as a side
+    effect of ParticipantGazeDataManager.annotate_gaze_events ->
+    utils.generate_fixations_threshold_based - the eye suffix matches
+    ParticipantGazeDataManager.analysis_eye). Falls back to the pre-eye-suffix legacy
+    filename (task_{panel}_fixation.csv), and if no eye was requested, to whichever single
+    eye-suffixed cache exists, so already-generated caches keep working.
     Columns: t, eye_horizontal, eye_vertical (normalized [0,1]), status, evt. Reusing this
     avoids re-loading the participant's raw .mat data just to render a QA video.
     """
-    csv_path = os.path.join(main_data_path, "processing_results", participant, f"task_{panel}_fixation.csv")
-    if not os.path.exists(csv_path):
+    base_dir = os.path.join(main_data_path, "processing_results", participant)
+    candidates = []
+    if eye is not None:
+        candidates.append(os.path.join(base_dir, f"task_{panel}_fixation_{eye.lower()}.csv"))
+    candidates.append(os.path.join(base_dir, f"task_{panel}_fixation.csv"))
+    csv_path = next((p for p in candidates if os.path.exists(p)), None)
+
+    if csv_path is None and eye is None:
+        matches = sorted(glob.glob(os.path.join(base_dir, f"task_{panel}_fixation_*.csv")))
+        csv_path = matches[0] if matches else None
+
+    if csv_path is None:
         raise FileNotFoundError(
-            f"No saved annotated gaze CSV at {csv_path}. Run the normal pipeline (e.g. "
-            f"TrialManager) at least once for this participant/panel first."
+            f"No saved annotated gaze CSV found for participant={participant!r} panel={panel!r} "
+            f"eye={eye!r} under {base_dir}. Run the normal pipeline (e.g. TrialManager) at "
+            f"least once for this participant/panel/eye first."
         )
     columns = [TIME_STAMP, FIXATION_CSV_KEY_EYE_H, FIXATION_CSV_KEY_EYE_V, FIXATION_VALID_STATUS, FIXATION_CSV_KEY_FIXATION]
     return pd.read_csv(csv_path)[columns]
 
 
 def render_drift_corrected_gaze_video(main_data_path, participant, panel, dx, dy, boundary_y,
-                                       task="SDMT", output_dir=None, target_fps=60):
+                                       task="SDMT", output_dir=None, target_fps=60, eye=None):
     """
     Renders the drift-corrected gaze path over the panel image. Only x/y in the dictionary
     (upper) region are shifted - by build_drift_correction_fn, the exact same closure the
     real pipeline uses - everything else (t, evt) is untouched, matching how the fix is
     meant to apply to the saved CSV.
     """
-    annotated = _load_saved_annotated_gaze(main_data_path, participant, panel)
+    annotated = _load_saved_annotated_gaze(main_data_path, participant, panel, eye=eye)
     img = cv2.imread(_panel_image_path(main_data_path, task, panel))
     img_resized, gaze_scaled = prepare_image_and_gaze(img, annotated)
     gaze_corrected = build_drift_correction_fn(dx, dy, boundary_y)(gaze_scaled)
@@ -381,7 +396,8 @@ def render_drift_corrected_gaze_video(main_data_path, participant, panel, dx, dy
 
     output_dir = output_dir or os.path.join(DEFAULT_CALIBRATION_QC_DIR, "videos")
     os.makedirs(output_dir, exist_ok=True)
-    video_path = os.path.join(output_dir, f"{participant}_{panel}_drift_corrected.mp4")
+    eye_suffix = f"_{eye.lower()}" if eye else ""
+    video_path = os.path.join(output_dir, f"{participant}_{panel}{eye_suffix}_drift_corrected.mp4")
 
     img_height, img_width = img_resized.shape[:2]
     writer = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*VIDEO_CODEC), target_fps, (img_width, img_height))
@@ -451,7 +467,7 @@ if __name__ == "__main__":
 
     # Set a participant (and optionally a panel) here to render its drift-corrected gaze
     # video(s) instead of rebuilding the QA tables below.
-    VIDEO_PARTICIPANT = "LT157"  # e.g. "AG562"; leave None to run the QA sweep instead
+    VIDEO_PARTICIPANT = "PG184"  # e.g. "AG562"; leave None to run the QA sweep instead
     VIDEO_PANEL = "i1"  # e.g. "l3"; None renders every panel available for the participant
 
     if VIDEO_PARTICIPANT is not None:
@@ -459,20 +475,20 @@ if __name__ == "__main__":
                                       main_data_path=MAIN_DATA_PATH, calibration_qc_dir=OUTPUT_DIR)
         sys.exit(0)
 
-    # glossary_path = write_glossary(OUTPUT_DIR)
-    # print(f"Glossary written to {glossary_path}")
+    glossary_path = write_glossary(OUTPUT_DIR)
+    print(f"Glossary written to {glossary_path}")
 
-    # calibration_df = build_calibration_table(MAIN_DATA_PATH)
-    # calibration_df.to_csv(os.path.join(OUTPUT_DIR, "calibration_quality.csv"), index=False)
-    # print(f"Calibration quality table: {len(calibration_df)} rows")
+    calibration_df = build_calibration_table(MAIN_DATA_PATH)
+    calibration_df.to_csv(os.path.join(OUTPUT_DIR, "calibration_quality.csv"), index=False)
+    print(f"Calibration quality table: {len(calibration_df)} rows")
 
-    # dominant_eye_df = build_dominant_eye_table(calibration_df)
-    # dominant_eye_df.to_csv(os.path.join(OUTPUT_DIR, "dominant_eye_check.csv"), index=False)
-    # if len(dominant_eye_df):
-    #     pct_match = 100.0 * dominant_eye_df["dominant_matches_best"].mean()
-    #     print(f"Dominant eye matches best-calibrated eye in {pct_match:.1f}% of "
-    #           f"{len(dominant_eye_df)} participant-panels")
+    dominant_eye_df = build_dominant_eye_table(calibration_df)
+    dominant_eye_df.to_csv(os.path.join(OUTPUT_DIR, "dominant_eye_check.csv"), index=False)
+    if len(dominant_eye_df):
+        pct_match = 100.0 * dominant_eye_df["dominant_matches_best"].mean()
+        print(f"Dominant eye matches best-calibrated eye in {pct_match:.1f}% of "
+              f"{len(dominant_eye_df)} participant-panels")
 
-    # drift_qa_df = build_drift_qa_table(MAIN_DATA_PATH)
-    # drift_qa_df.to_csv(os.path.join(OUTPUT_DIR, "drift_correction_qa.csv"), index=False)
-    # print(f"Drift correction QA table: {len(drift_qa_df)} rows")
+    drift_qa_df = build_drift_qa_table(MAIN_DATA_PATH)
+    drift_qa_df.to_csv(os.path.join(OUTPUT_DIR, "drift_correction_qa.csv"), index=False)
+    print(f"Drift correction QA table: {len(drift_qa_df)} rows")

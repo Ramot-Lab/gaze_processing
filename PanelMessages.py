@@ -1,6 +1,8 @@
 import re
 
-from constants import KEY_PANEL_MESSAGES
+import numpy as np
+
+from constants import KEY_PANEL_MESSAGES, KEY_REACTION_TIMES, SECONDS_TO_MICROSECOND_FACTOR
 from participant_gaze_data_manager import ParticipantGazeDataManager
 
 class Press:
@@ -45,6 +47,18 @@ class PanelMessages:
                     match = re.search(r"press (\d+)", text)
                     if match:
                         presses.append((int(match.group(1)), ts - start_time))
+
+            # Older recordings never logged "press N" messages at all for some panels.
+            # Fall back to task_data.reaction_times_img_test_{PANEL}: one value per press,
+            # each the number of seconds since the *previous* press (first value is since
+            # the panel started, i.e. the 'panel number N' message). Reconstructing
+            # absolute press times from their cumulative sum lets these recordings be
+            # included instead of dropped.
+            if not presses:
+                reaction_times = subject_data.matched_data[panel].get(KEY_REACTION_TIMES)
+                if reaction_times is not None and len(reaction_times) > 0:
+                    cumulative_seconds = np.cumsum(reaction_times)
+                    presses = [(i + 1, t * SECONDS_TO_MICROSECOND_FACTOR) for i, t in enumerate(cumulative_seconds)]
 
             # Convert to Press objects
             press_objs = [Press(idx=p[0], time=p[1]) for p in presses]

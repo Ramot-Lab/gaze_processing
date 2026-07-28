@@ -94,7 +94,14 @@ def extract_last_calibration_message(messages):
 
 
 class ParticipantGazeDataManager:
-    def __init__(self, participant_name, main_data_path, task = "SDMT", participant_group = "pwMS", clean_gaze_data = True) -> None:
+    def __init__(self, participant_name, main_data_path, task = "SDMT", participant_group = "pwMS", clean_gaze_data = True, analysis_eye = None) -> None:
+        """
+        analysis_eye: "l" or "r" to force which eye's gaze stream is used for analysis,
+        overriding Dom_Eye. Defaults to None, meaning the recording's own Dom_Eye is used
+        (existing/original behavior). self.dom_Eye always reflects the true dominant eye
+        from the recording; self.analysis_eye reflects the eye actually used to build
+        gaze_data/matched_data - the two differ only when analysis_eye is passed explicitly.
+        """
         group_path, self.name = os.path.split(participant_name)
         _,  self.group = os.path.split(group_path)
         self.task = task
@@ -106,7 +113,8 @@ class ParticipantGazeDataManager:
         self.model = None
         os.makedirs(self.output_path, exist_ok=True)
         for mat_file in tobii_data:
-            self.task_data, self.messages, self.gaze_data, self.presentation_info, self.dom_Eye = self.prepare_gaze_data_for_preprocessing(mat_file)
+            (self.task_data, self.messages, self.gaze_data, self.presentation_info,
+             self.dom_Eye, self.analysis_eye) = self.prepare_gaze_data_for_preprocessing(mat_file, analysis_eye)
             self.matched_data = {**self.matched_data, **self.group_task_info(self.gaze_data, task_png, audio_recordings, self.task_data, mat_file, clean_gaze_data)}
         
     def get_gaze_data_for_panel(self, panel: str):
@@ -156,6 +164,7 @@ class ParticipantGazeDataManager:
                                                    KEY_CALIBRATION_INFO : calibration_info,
                                                    KEY_AUDIO_DATA :  audio_file,
                                                    KEY_STRIKE_SCORE : 0 if list(task_data.keys())[0] == "dummy" else task_data[f"strikes_img_test_{task_code}"],
+                                                   KEY_REACTION_TIMES : None if list(task_data.keys())[0] == "dummy" else task_data.get(f"reaction_times_img_test_{task_code}"),
                                                    KEY_RECORDING_DATE : self.get_creation_time(mat_file)}
         return matched_data_files
 
@@ -224,7 +233,7 @@ class ParticipantGazeDataManager:
         except FileNotFoundError:
             raise FileNotFoundError(f"No image found at path: {img_path}")
 
-    def prepare_gaze_data_for_preprocessing(self, data):
+    def prepare_gaze_data_for_preprocessing(self, data, analysis_eye=None):
         # Extract left and right gaze data
         left_gaze = data['data'].gaze.left.gazePoint.onDisplayArea
         right_gaze = data['data'].gaze.right.gazePoint.onDisplayArea
@@ -253,22 +262,27 @@ class ParticipantGazeDataManager:
         Dom_Eye = data['Dom_Eye']
         assert Dom_Eye.lower() in ['r', 'l'], 'Dom_Eye must be either "r" or "l"'
 
-        # Select gaze data for each panel based on the dominant eye
+        # eye_for_analysis is the eye whose gaze stream actually gets used below - Dom_Eye
+        # unless analysis_eye explicitly overrides it (see ParticipantGazeDataManager.__init__).
+        eye_for_analysis = (analysis_eye or Dom_Eye).lower()
+        assert eye_for_analysis in ['r', 'l'], f'analysis_eye must be "r" or "l", got {analysis_eye!r}'
+
+        # Select gaze data for each panel based on eye_for_analysis
         gaze_data = {}
         for i in range(3):
-            if Dom_Eye == 'r':
+            if eye_for_analysis == 'r':
                 panel_data = np.concatenate((right_gaze[:, panel_presentation_indices[i]].T, np.reshape(tobi_ts[panel_presentation_indices[i]], (-1,1))), axis=1)
                 if (np.count_nonzero(np.isnan(panel_data))//2) / len(panel_data) < MAX_VALID_NAN_VALUES:
                     gaze_data[f'panel_{i+1}'] = panel_data
                 else:
-                    raise Exception(f"Too many NaN values in panel {i+1} for dominant eye 'r'")
+                    raise Exception(f"Too many NaN values in panel {i+1} for analysis eye 'r'")
 
             else:
                 panel_data = np.concatenate((left_gaze[:, panel_presentation_indices[i]].T, np.reshape(tobi_ts[panel_presentation_indices[i]], (-1,1))), axis=1)
                 if (np.count_nonzero(np.isnan(panel_data))//2) / len(panel_data) < MAX_VALID_NAN_VALUES:
                     gaze_data[f'panel_{i+1}'] = panel_data
                 else:
-                    raise Exception(f"Too many NaN values in panel {i+1} for dominant eye 'l'")
+                    raise Exception(f"Too many NaN values in panel {i+1} for analysis eye 'l'")
 
 
         # Calculate presentation durations
@@ -285,7 +299,7 @@ class ParticipantGazeDataManager:
             task_data = {"dummy": None, "1":None, "0":None,"2": None, "00":None, "3":None, "000":None} # TODO: how to get the real task results.
         elif self.task == "SDMT":
             task_data = data["task_data"].__dict__
-        return task_data, messages, gaze_data, presentation_info, Dom_Eye
+        return task_data, messages, gaze_data, presentation_info, Dom_Eye, eye_for_analysis
     
     def break_mat_into_pannels(self, mat_file_messages):
         panel_indices = []

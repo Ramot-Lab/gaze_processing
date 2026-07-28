@@ -7,6 +7,7 @@ KEY_PANEL_MESSAGES = "messages"  # Key for messages related to the task
 KEY_CALIBRATION_INFO = "calibration_info"  # Key for the parsed calibration/validation quality report
 KEY_AUDIO_DATA = "audio_data"  # Key for the audio data file path
 KEY_STRIKE_SCORE = "strike_score"
+KEY_REACTION_TIMES = "reaction_times"  # Key for the raw per-press reaction-time deltas (seconds), fallback for panels with no "press N" messages
 KEY_RECORDING_DATE = "recording_date"
 TIME_STAMP = "t"
 SIGNAL_IDX = "signal_index"
