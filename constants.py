@@ -4,6 +4,7 @@ from enum import Enum
 KEY_TOBII_DATA = "tobii_data"  # Key for Tobii eye movement data
 KEY_TASK_PANEL_IMG = "task_panel_img"  # Key for the image of the task panel
 KEY_PANEL_MESSAGES = "messages"  # Key for messages related to the task
+KEY_CALIBRATION_INFO = "calibration_info"  # Key for the parsed calibration/validation quality report
 KEY_AUDIO_DATA = "audio_data"  # Key for the audio data file path
 KEY_STRIKE_SCORE = "strike_score"
 KEY_RECORDING_DATE = "recording_date"

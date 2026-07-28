@@ -11,15 +11,17 @@ from trial_features import TrialFeatures
 
 
 class TrialManager:
-    def __init__(self, subject_data: ParticipantGazeDataManager, panel: str):
+    def __init__(self, subject_data: ParticipantGazeDataManager, panel: str, gaze_correction=None):
         # --- Data Loading ---
         panel_messages = PanelMessages(panel, subject_data)
         message_info: MessageInfo = panel_messages.message_info
         annotated_data = subject_data.annotate_gaze_events(panel, "threshold_based")
         img = subject_data.get_panel_img(panel)
-        
+
         # --- Attributes ---
         self.img_resized, annotated_data = prepare_image_and_gaze(img, annotated_data)
+        if gaze_correction is not None:
+            annotated_data = gaze_correction(annotated_data)
         self.subject_name = subject_data.name
         self.panel = panel
         self.presses: list[Press] = message_info.presses

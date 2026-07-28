@@ -14,6 +14,85 @@ import GazeModel.model as gazeNET_model
 from GazeModel.recording_data_runner import RecordingDataRunner, generate_fixation_model_based
 import re
 
+# --- Calibration/validation quality report parsing -------------------------------------
+# Tobii writes one "CALIBRATION N Data Quality (computed from validation M):" message per
+# calibration, right before the first task-start message. It contains a tab-separated
+# table per eye with a row per validation point plus an "average" row. See
+# CALIBRATION_MEASUREMENT_GLOSSARY (in calibration_drift_qa.py) for what each metric means.
+CALIBRATION_HEADER_RE = re.compile(r"CALIBRATION (\d+) Data Quality \(computed from validation (\d+)\):")
+CALIBRATION_POINT_LABEL_RE = re.compile(r"^(\d+)\s*@\s*\(([-\d.]+),\s*([-\d.]+)\)$")
+CALIBRATION_METRIC_KEYS = ["acc", "accX", "accY", "std", "rms", "data_loss"]
+
+
+def _parse_calibration_eye_block(block_text):
+    """Parse the per-point + average rows for one eye out of a Data Quality message."""
+    points = []
+    average = None
+    for raw_line in block_text.strip("\n").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split("\t")
+        label = parts[0].strip()
+        try:
+            values = [float(v) for v in parts[1:]]
+        except ValueError:
+            continue
+        if len(values) != len(CALIBRATION_METRIC_KEYS):
+            continue
+        metrics = dict(zip(CALIBRATION_METRIC_KEYS, values))
+        point_match = CALIBRATION_POINT_LABEL_RE.match(label)
+        if point_match:
+            metrics.update({
+                "point_idx": int(point_match.group(1)),
+                "screen_x": float(point_match.group(2)),
+                "screen_y": float(point_match.group(3)),
+            })
+            points.append(metrics)
+        elif label.lower() == "average":
+            average = metrics
+    return {"points": points, "average": average}
+
+
+def parse_calibration_quality_message(text):
+    """
+    Parse a raw "CALIBRATION N Data Quality (computed from validation M): ..." message
+    into {calibration_no, validation_no, left: {points, average}, right: {points, average}}.
+    Returns None if the text doesn't match the expected format.
+    """
+    header_match = CALIBRATION_HEADER_RE.search(text)
+    if header_match is None or "left eye:" not in text or "right eye:" not in text:
+        return None
+    left_text = text.split("left eye:", 1)[1].split("right eye:", 1)[0]
+    right_text = text.split("right eye:", 1)[1]
+    return {
+        "calibration_no": int(header_match.group(1)),
+        "validation_no": int(header_match.group(2)),
+        "left": _parse_calibration_eye_block(left_text),
+        "right": _parse_calibration_eye_block(right_text),
+    }
+
+
+def extract_last_calibration_message(messages):
+    """
+    Return (timestamp, raw_text) of the last message containing "Data Quality" that occurs
+    before the first task-start message ("panel number ..." for SDMT, "slide ..." for KD),
+    or None if no such message exists.
+    """
+    first_task_idx = None
+    for i in range(len(messages)):
+        text = str(messages[i][1])
+        if text.startswith("panel number") or text.startswith("slide "):
+            first_task_idx = i
+            break
+    candidates = messages[:first_task_idx] if first_task_idx is not None else messages
+    last = None
+    for ts, txt in candidates:
+        if "Data Quality" in str(txt):
+            last = (ts, str(txt))
+    return last
+
+
 class ParticipantGazeDataManager:
     def __init__(self, participant_name, main_data_path, task = "SDMT", participant_group = "pwMS", clean_gaze_data = True) -> None:
         group_path, self.name = os.path.split(participant_name)
@@ -60,6 +139,7 @@ class ParticipantGazeDataManager:
     def group_task_info(self, tobii_data_file, task_png, audio_recordings, task_data, mat_file, clean_gaze_data):
         matched_data_files = {}
         audio_idx = 2 if self.task == "SDMT" else 1
+        calibration_info = self.build_calibration_info(self.messages)
         for i, task_name in enumerate(list(task_data.keys())[1::2]):
             if f"panel_{i+1}" not in tobii_data_file.keys(): continue
             task_code = (task_name[-2:]).replace("_", "")
@@ -73,10 +153,30 @@ class ParticipantGazeDataManager:
             matched_data_files[task_code_lower] = {KEY_TOBII_DATA: preprocess_gaze_method(tobii_data_file[f"panel_{i+1}"]),
                                                    KEY_TASK_PANEL_IMG : png_img,
                                                    KEY_PANEL_MESSAGES : messages,
+                                                   KEY_CALIBRATION_INFO : calibration_info,
                                                    KEY_AUDIO_DATA :  audio_file,
                                                    KEY_STRIKE_SCORE : 0 if list(task_data.keys())[0] == "dummy" else task_data[f"strikes_img_test_{task_code}"],
                                                    KEY_RECORDING_DATE : self.get_creation_time(mat_file)}
         return matched_data_files
+
+    def build_calibration_info(self, messages):
+        """
+        Parse the calibration/validation quality report that applies to this run's panels
+        (the last "Data Quality" message before the first panel starts). Returns None if no
+        calibration message is found or it doesn't match the expected format, so a subject
+        with a malformed/missing calibration message doesn't crash loading - callers should
+        treat None as "calibration info unavailable" rather than skip the subject.
+        """
+        found = extract_last_calibration_message(messages)
+        if found is None:
+            return None
+        timestamp, text = found
+        parsed = parse_calibration_quality_message(text)
+        if parsed is None:
+            return None
+        parsed["timestamp"] = timestamp
+        parsed["dominant_eye"] = self.dom_Eye
+        return parsed
 
     def messages_for_panel(self, panel_idx: int ): #1, 2 or 3
         all_messages = self.messages
