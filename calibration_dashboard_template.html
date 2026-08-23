@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Calibration Threshold Explorer</title>
+<style>
+  :root {
+    --bg: #ffffff; --panel: #f7f8fa; --border: #dde1e6; --text: #1a1d21; --text-muted: #5b6470;
+    --hc: #6fb3e0; --ms: #e08a80; --hard: #9aa0a8; --accent: #2563eb;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: 14px; line-height: 1.5;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .subtitle { color: var(--text-muted); margin: 0 0 20px; font-size: 13px; }
+  .layout { display: grid; grid-template-columns: 380px 1fr; gap: 20px; align-items: start; }
+  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px; margin-bottom: 16px;
+  }
+  .panel h2 { font-size: 14px; margin: 0 0 12px; }
+  .metric-row { margin-bottom: 18px; padding-bottom: 14px; border-bottom: 1px solid var(--border); }
+  .metric-row:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
+  .metric-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+  .metric-head label { display: flex; align-items: center; gap: 6px; font-weight: 600; cursor: pointer; }
+  .metric-value { font-variant-numeric: tabular-nums; color: var(--accent); font-weight: 600; }
+  input[type="range"] { width: 100%; margin: 6px 0; }
+  .hist-svg { width: 100%; height: 48px; display: block; }
+  .hist-bar { fill: #b7cee0; }
+  .hist-bar:hover { fill: var(--accent); }
+  .hist-marker { stroke: #d9480f; stroke-width: 2; }
+  .disabled-metric { opacity: 0.4; }
+  .summary-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+  .stat-card {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+  }
+  .stat-card .label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.03em; }
+  .stat-card .value { font-size: 22px; font-weight: 700; margin-top: 2px; }
+  .stat-card .sub { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+  .legend-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  th { position: sticky; top: 0; background: var(--panel); font-size: 11px; text-transform: uppercase; color: var(--text-muted); }
+  tr.hard-excluded { background: rgba(154, 160, 168, 0.12); }
+  tr.threshold-excluded { background: rgba(224, 138, 128, 0.12); }
+  tr.pending-row { background: rgba(37, 99, 235, 0.08); }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .badge-hard { background: var(--hard); color: white; }
+  .badge-threshold { background: var(--ms); color: white; }
+  .badge-pending { background: var(--accent); color: white; }
+  .table-wrap { max-height: 340px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; }
+  .note-text { font-size: 12px; color: var(--text-muted); margin: 6px 0 10px; }
+  .metric-stats { font-size: 11px; color: var(--text-muted); display: flex; gap: 12px; flex-wrap: wrap; margin-top: 6px; }
+  .metric-stats .stat-hc { color: var(--hc); font-weight: 600; }
+  .metric-stats .stat-ms { color: var(--ms); font-weight: 600; }
+  .metric-stats .stat-all { color: var(--text); font-weight: 600; }
+  .quick-set-row { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+  .quick-set-btn {
+    background: white; color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+    padding: 3px 8px; font-size: 11px; font-weight: 600; cursor: pointer;
+  }
+  .quick-set-btn:hover:not(:disabled) { background: var(--panel); border-color: var(--accent); }
+  .quick-set-btn.active { background: var(--accent); color: white; border-color: var(--accent); }
+  .quick-set-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  button {
+    background: var(--accent); color: white; border: none; border-radius: 6px;
+    padding: 8px 14px; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  button:hover { opacity: 0.9; }
+  .muted { color: var(--text-muted); }
+  .row-flex { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+
+<h1>Calibration Threshold Explorer</h1>
+<p class="subtitle">SDMT calibration events, deduplicated to one row per participant-day. Duplicate/backup file copies are informational only (the real data is captured by their sibling event) and are never counted as exclusions. Adjust thresholds to see the marginal effect on top of already hard-excluded events (corrupted files, no gaze data, both-eyes NaN failure).</p>
+
+<div class="layout">
+  <div>
+    <div class="panel">
+      <h2>Thresholds</h2>
+      <div id="controls"></div>
+    </div>
+    <div class="panel">
+      <div class="row-flex">
+        <span class="legend-dot" style="background:var(--hard)"></span> hard-excluded (unrecoverable)
+        <span class="legend-dot" style="background:var(--ms)"></span> newly excluded by threshold
+        <span class="legend-dot" style="background:var(--accent)"></span> pending eye-fallback decision
+      </div>
+      <button id="downloadBtn">Download current exclusion list (CSV)</button>
+    </div>
+  </div>
+
+  <div>
+    <div class="panel">
+      <h2>Summary</h2>
+      <div class="summary-grid" id="summaryGrid"></div>
+    </div>
+    <div class="panel">
+      <h2>Excluded calibration events (<span id="tableCount">0</span>)</h2>
+      <p class="note-text">Genuinely unrecoverable (hard) or failing an active threshold. Does NOT include pending or duplicate events - see below.</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Status</th><th>Group</th><th>Participant</th><th>Day / file</th><th>Reason</th></tr>
+          </thead>
+          <tbody id="exclusionTableBody"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Pending eye-fallback decision (<span id="pendingCount">0</span>)</h2>
+      <p class="note-text">The selected eye failed the NaN check, but the OTHER eye would pass. Not automatically used (no accuracy threshold has been agreed on) and NOT counted as excluded above - these would become usable if/when that decision is made.</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Group</th><th>Participant</th><th>Day / file</th><th>Reason</th></tr>
+          </thead>
+          <tbody id="pendingTableBody"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Duplicate/backup files (informational, <span id="duplicateCount">0</span>)</h2>
+      <p class="note-text">Not real distinct calibration events - the actual data is captured by another row for the same participant. Never counted anywhere above.</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Group</th><th>Participant</th><th>Skipped file</th><th>Note</th></tr>
+          </thead>
+          <tbody id="duplicateTableBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const ALL_EVENTS = __EVENTS_JSON__;
+
+// Duplicate/backup file copies aren't real distinct calibration events - the actual data
+// is captured by another row for the same participant (see calibration_quality_analysis.py
+// _load_and_dedupe_run_files). Pull them out entirely: never counted, shown only as notes.
+const DUPLICATE_NOTES = ALL_EVENTS.filter(e => e.eye_selection_reason === "excluded_duplicate_file");
+const EVENTS = ALL_EVENTS.filter(e => e.eye_selection_reason !== "excluded_duplicate_file");
+
+const METRICS = [
+  { key: "used_acc", label: "Accuracy (deg)", min: 0.2, max: 6.0, step: 0.05, default: 2.0 },
+  { key: "used_std", label: "Precision - SD (deg)", min: 0.05, max: 2.7, step: 0.02, default: 0.5 },
+  { key: "used_rms", label: "Precision - RMS (deg)", min: 0.05, max: 1.0, step: 0.02, default: 0.3 },
+  { key: "used_data_loss", label: "Data loss (%)", min: 0, max: 45, step: 0.5, default: 10 },
+];
+
+const state = {};
+METRICS.forEach(m => { state[m.key] = { active: true, value: m.default }; });
+
+function computeStats(values) {
+  const clean = values.filter(v => v != null);
+  const n = clean.length;
+  if (n === 0) return { mean: null, std: null, n: 0 };
+  const mean = clean.reduce((a, b) => a + b, 0) / n;
+  const variance = n > 1 ? clean.reduce((a, b) => a + (b - mean) ** 2, 0) / (n - 1) : 0;
+  return { mean, std: Math.sqrt(variance), n };
+}
+
+function metricStatsFor(key) {
+  const validEvents = EVENTS.filter(e => !e.calibration_missing);
+  const hcVals = validEvents.filter(e => e.group === "HC").map(e => e[key]);
+  const msVals = validEvents.filter(e => e.group === "pwMS").map(e => e[key]);
+  const allVals = validEvents.map(e => e[key]);
+  return { HC: computeStats(hcVals), pwMS: computeStats(msVals), ALL: computeStats(allVals) };
+}
+
+function computeHistogram(values, min, max, nBins = 20) {
+  const bins = new Array(nBins).fill(0);
+  const width = (max - min) / nBins;
+  values.forEach(v => {
+    if (v == null) return;
+    let idx = Math.floor((v - min) / width);
+    if (idx < 0) idx = 0;
+    if (idx >= nBins) idx = nBins - 1;
+    bins[idx]++;
+  });
+  return bins;
+}
+
+function renderControls() {
+  const container = document.getElementById("controls");
+  container.innerHTML = "";
+  METRICS.forEach(m => {
+    const row = document.createElement("div");
+    row.className = "metric-row";
+    row.id = `row-${m.key}`;
+
+    const head = document.createElement("div");
+    head.className = "metric-head";
+    head.innerHTML = `
+      <label><input type="checkbox" data-metric="${m.key}" class="metric-toggle" ${state[m.key].active ? "checked" : ""}> ${m.label}</label>
+      <span class="metric-value" id="value-${m.key}">${state[m.key].value}</span>
+    `;
+    row.appendChild(head);
+
+    const slider = document.createElement("input");
+    slider.type = "range";
+    slider.min = m.min; slider.max = m.max; slider.step = m.step;
+    slider.value = state[m.key].value;
+    slider.dataset.metric = m.key;
+    slider.className = "metric-slider";
+    row.appendChild(slider);
+
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("class", "hist-svg");
+    svg.setAttribute("id", `hist-${m.key}`);
+    svg.setAttribute("viewBox", "0 0 200 48");
+    svg.setAttribute("preserveAspectRatio", "none");
+    row.appendChild(svg);
+
+    const mStats = metricStatsFor(m.key);
+    const fmtStat = (s) => s.mean != null ? `&mu;=${s.mean.toFixed(2)} &sigma;=${s.std.toFixed(2)} (n=${s.n})` : "n=0";
+    const statsDiv = document.createElement("div");
+    statsDiv.className = "metric-stats";
+    statsDiv.innerHTML = `
+      <span class="stat-hc">HC: ${fmtStat(mStats.HC)}</span>
+      <span class="stat-ms">pwMS: ${fmtStat(mStats.pwMS)}</span>
+      <span class="stat-all">All: ${fmtStat(mStats.ALL)}</span>
+    `;
+    row.appendChild(statsDiv);
+
+    // Quick-set: jump this metric's slider straight to mean+2SD, computed from HC-only,
+    // pwMS-only, or all-participants-pooled stats (per Noam - "the correct std for each
+    // version"). Clicking re-renders the histogram/marker and re-runs the exclusion logic
+    // exactly like a manual slider drag would.
+    const quickSetDiv = document.createElement("div");
+    quickSetDiv.className = "quick-set-row";
+    [["HC", "HC +2σ", mStats.HC], ["pwMS", "pwMS +2σ", mStats.pwMS], ["ALL", "All +2σ", mStats.ALL]].forEach(([key, label, s]) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "quick-set-btn";
+      btn.dataset.quickset = key;
+      btn.textContent = `✓ ${label}`;
+      const target = s.mean != null && s.std != null ? s.mean + 2 * s.std : null;
+      btn.disabled = target == null;
+      btn.title = target != null ? `Set threshold to ${target.toFixed(3)}` : "not enough data";
+      btn.addEventListener("click", () => {
+        const clamped = Math.min(Math.max(target, m.min), m.max);
+        state[m.key].value = clamped;
+        row.querySelector(".metric-slider").value = clamped;
+        document.getElementById(`value-${m.key}`).textContent = clamped.toFixed(3);
+        quickSetDiv.querySelectorAll(".quick-set-btn").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        renderHistograms();
+        update();
+      });
+      quickSetDiv.appendChild(btn);
+    });
+    row.appendChild(quickSetDiv);
+
+    container.appendChild(row);
+  });
+
+  container.querySelectorAll(".metric-toggle").forEach(el => {
+    el.addEventListener("change", e => {
+      state[e.target.dataset.metric].active = e.target.checked;
+      document.getElementById(`row-${e.target.dataset.metric}`).classList.toggle("disabled-metric", !e.target.checked);
+      renderHistograms();
+      update();
+    });
+  });
+  container.querySelectorAll(".metric-slider").forEach(el => {
+    el.addEventListener("input", e => {
+      state[e.target.dataset.metric].value = parseFloat(e.target.value);
+      document.getElementById(`value-${e.target.dataset.metric}`).textContent = state[e.target.dataset.metric].value;
+      // manual drag supersedes any quick-set highlight
+      document.querySelectorAll(`#row-${e.target.dataset.metric} .quick-set-btn`).forEach(b => b.classList.remove("active"));
+      renderHistograms();
+      update();
+    });
+  });
+
+  renderHistograms();
+}
+
+function renderHistograms() {
+  METRICS.forEach(m => {
+    const svg = document.getElementById(`hist-${m.key}`);
+    svg.innerHTML = "";
+    const values = EVENTS.filter(e => !e.calibration_missing).map(e => e[m.key]).filter(v => v != null);
+    const bins = computeHistogram(values, m.min, m.max, 20);
+    const maxCount = Math.max(...bins, 1);
+    const barWidth = 200 / bins.length;
+    bins.forEach((count, i) => {
+      const barHeight = (count / maxCount) * 44;
+      const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      rect.setAttribute("x", i * barWidth);
+      rect.setAttribute("y", 44 - barHeight);
+      rect.setAttribute("width", Math.max(barWidth - 1, 0.5));
+      rect.setAttribute("height", barHeight);
+      rect.setAttribute("class", "hist-bar");
+      const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
+      title.textContent = `${count} event(s)`;
+      rect.appendChild(title);
+      svg.appendChild(rect);
+    });
+    const markerX = ((state[m.key].value - m.min) / (m.max - m.min)) * 200;
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", markerX); line.setAttribute("x2", markerX);
+    line.setAttribute("y1", 0); line.setAttribute("y2", 44);
+    line.setAttribute("class", "hist-marker");
+    svg.appendChild(line);
+  });
+}
+
+function classifyEvent(ev) {
+  // "Rescuable" NaN failures are a distinct, real calibration event (unlike duplicates) -
+  // but not automatically usable (no accuracy threshold decided yet), so they're neither
+  // "included" nor "excluded": a third "pending" state, per Noam's review of this dashboard.
+  if (ev.eye_selection_reason === "excluded_nan_threshold_rescuable") {
+    return { status: "pending", reason: ev.missing_reason || "other eye would pass NaN check - pending eye-fallback decision" };
+  }
+  if (ev.calibration_missing) {
+    return { status: "hard", reason: ev.missing_reason || "calibration missing" };
+  }
+  const failedMetrics = [];
+  METRICS.forEach(m => {
+    if (!state[m.key].active) return;
+    const val = ev[m.key];
+    if (val != null && val > state[m.key].value) failedMetrics.push(m.label);
+  });
+  if (failedMetrics.length > 0) {
+    return { status: "threshold", reason: `exceeds: ${failedMetrics.join(", ")}` };
+  }
+  return { status: "included", reason: null };
+}
+
+function shortDate(d) {
+  if (d == null) return "-";
+  if (typeof d === "string" && d.includes("/")) {
+    const parts = d.split("/");
+    return parts[parts.length - 1];
+  }
+  return d;
+}
+
+function update() {
+  const classified = EVENTS.map(ev => ({ ev, cls: classifyEvent(ev) }));
+  const groups = ["HC", "pwMS"];
+
+  const excludedRows = classified.filter(c => c.cls.status === "hard" || c.cls.status === "threshold")
+    .sort((a, b) => (a.cls.status === b.cls.status ? 0 : a.cls.status === "hard" ? -1 : 1));
+  const pendingRows = classified.filter(c => c.cls.status === "pending");
+
+  const totalEvents = classified.length;
+  const totalExcludedEvents = excludedRows.length;
+
+  // Participant-level status: "included" if >=1 truly-included event, else "pending" if
+  // >=1 pending (rescuable) event and no included one, else "excluded" (every real event
+  // for this participant is hard/threshold-excluded).
+  const participantStatus = {}; // participant -> "included" | "pending" | "excluded"
+  const participantGroup = {};
+  EVENTS.forEach(ev => { participantGroup[ev.participant] = ev.group; });
+  const byParticipant = {};
+  classified.forEach(c => { (byParticipant[c.ev.participant] ??= []).push(c.cls.status); });
+  Object.entries(byParticipant).forEach(([participant, statuses]) => {
+    if (statuses.includes("included")) participantStatus[participant] = "included";
+    else if (statuses.includes("pending")) participantStatus[participant] = "pending";
+    else participantStatus[participant] = "excluded";
+  });
+
+  const totalParticipants = Object.keys(participantStatus).length;
+  const countByGroupAndStatus = (status) => groups.reduce((acc, g) => {
+    acc[g] = Object.keys(participantStatus).filter(p => participantGroup[p] === g && participantStatus[p] === status).length;
+    return acc;
+  }, {});
+  const excludedP = countByGroupAndStatus("excluded");
+  const pendingP = countByGroupAndStatus("pending");
+  const includedP = countByGroupAndStatus("included");
+  const totalExcludedParticipants = excludedP.HC + excludedP.pwMS;
+  const totalPendingParticipants = pendingP.HC + pendingP.pwMS;
+
+  const eventsExcludedByGroup = {};
+  groups.forEach(g => { eventsExcludedByGroup[g] = excludedRows.filter(c => c.ev.group === g).length; });
+
+  document.getElementById("summaryGrid").innerHTML = `
+    <div class="stat-card">
+      <div class="label">Events excluded</div>
+      <div class="value">${totalExcludedEvents} / ${totalEvents}</div>
+      <div class="sub">HC: ${eventsExcludedByGroup.HC} &middot; pwMS: ${eventsExcludedByGroup.pwMS}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Participants excluded</div>
+      <div class="value">${totalExcludedParticipants} / ${totalParticipants}</div>
+      <div class="sub">HC: ${excludedP.HC} &middot; pwMS: ${excludedP.pwMS}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Participants pending decision</div>
+      <div class="value">${totalPendingParticipants}</div>
+      <div class="sub">HC: ${pendingP.HC} &middot; pwMS: ${pendingP.pwMS} - not counted as excluded above</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Retention rate</div>
+      <div class="value">${((includedP.HC + includedP.pwMS) / totalParticipants * 100).toFixed(1)}%</div>
+      <div class="sub">of ${totalParticipants} participants have &ge;1 truly usable event</div>
+    </div>
+  `;
+
+  document.getElementById("tableCount").textContent = excludedRows.length;
+  document.getElementById("exclusionTableBody").innerHTML = excludedRows.map(({ ev, cls }) => `
+    <tr class="${cls.status === "hard" ? "hard-excluded" : "threshold-excluded"}">
+      <td><span class="badge ${cls.status === "hard" ? "badge-hard" : "badge-threshold"}">${cls.status}</span></td>
+      <td>${ev.group}</td>
+      <td>${ev.participant}</td>
+      <td class="muted">${shortDate(ev.recording_date)}</td>
+      <td class="muted">${cls.reason}</td>
+    </tr>
+  `).join("");
+
+  document.getElementById("pendingCount").textContent = pendingRows.length;
+  document.getElementById("pendingTableBody").innerHTML = pendingRows.map(({ ev, cls }) => `
+    <tr class="pending-row">
+      <td>${ev.group}</td>
+      <td>${ev.participant}</td>
+      <td class="muted">${shortDate(ev.recording_date)}</td>
+      <td class="muted">${cls.reason}</td>
+    </tr>
+  `).join("");
+
+  window._currentExcludedRows = excludedRows;
+  window._currentPendingRows = pendingRows;
+}
+
+function renderDuplicateNotes() {
+  document.getElementById("duplicateCount").textContent = DUPLICATE_NOTES.length;
+  document.getElementById("duplicateTableBody").innerHTML = DUPLICATE_NOTES.map(ev => `
+    <tr>
+      <td>${ev.group}</td>
+      <td>${ev.participant}</td>
+      <td class="muted">${shortDate(ev.recording_date)}</td>
+      <td class="muted">${ev.missing_reason || ""}</td>
+    </tr>
+  `).join("");
+}
+
+function downloadCsv() {
+  const rows = window._currentExcludedRows || [];
+  const header = "status,group,participant,recording_date,reason\n";
+  const body = rows.map(({ ev, cls }) => {
+    const reason = (cls.reason || "").replace(/"/g, '""');
+    return `${cls.status},${ev.group},${ev.participant},"${ev.recording_date || ""}","${reason}"`;
+  }).join("\n");
+  const blob = new Blob([header + body], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "calibration_exclusions.csv";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+document.getElementById("downloadBtn").addEventListener("click", downloadCsv);
+
+renderControls();
+renderDuplicateNotes();
+update();
+</script>
+
+</body>
+</html>

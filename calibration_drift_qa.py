@@ -94,8 +94,13 @@ CALIBRATION_TABLE_COLUMN_NOTES = (
 def _iter_subject_dirs(main_data_path, groups):
     for group in groups:
         for subject_dir in sorted(glob.glob(os.path.join(main_data_path, group, "*"))):
-            if os.path.isdir(subject_dir):
-                yield group, subject_dir
+            if not os.path.isdir(subject_dir):
+                continue
+            # DONTUSE is a manual "exclude this person" flag unrelated to data quality -
+            # skip entirely rather than let it show up as a calibration/load error.
+            if "DONTUSE" in os.path.basename(subject_dir).upper():
+                continue
+            yield group, subject_dir
 
 
 def _panel_image_path(main_data_path, task, panel):
@@ -133,6 +138,14 @@ def build_calibration_table(main_data_path, task="SDMT", groups=("HC", "pwMS")):
             rows.append({"group": group, "participant": participant, "panel": None,
                          "calibration_missing": True, "error": str(e)})
             continue
+
+        # Each entry is one calibration event (mat file) that failed to load/process -
+        # logged independently so a bad day doesn't hide whether the participant's OTHER
+        # day was fine (see ParticipantGazeDataManager.load_errors).
+        for load_error in subject_data.load_errors:
+            rows.append({"group": group, "participant": subject_data.name, "panel": None,
+                         "calibration_missing": True, "error": load_error["error"],
+                         "recording_date": load_error.get("recording_date") or load_error.get("file")})
 
         for panel in subject_data.matched_data:
             row = {

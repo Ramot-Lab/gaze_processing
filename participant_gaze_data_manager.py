@@ -1,4 +1,5 @@
 from curses import KEY_MESSAGE
+import hashlib
 import scipy.io as scio
 import numpy as np
 import pandas as pd
@@ -73,6 +74,23 @@ def parse_calibration_quality_message(text):
     }
 
 
+def _better_calibrated_eye(calib_parsed):
+    """
+    'l'/'r' for whichever eye has the lower (better) calibration accuracy in a parsed
+    calibration message, or None if calib_parsed is None or neither eye has an accuracy
+    value to compare. Used to pick an analysis eye when Dom_Eye is missing/invalid.
+    """
+    if calib_parsed is None:
+        return None
+    l_acc = (calib_parsed["left"]["average"] or {}).get("acc")
+    r_acc = (calib_parsed["right"]["average"] or {}).get("acc")
+    if l_acc is None and r_acc is None:
+        return None
+    if r_acc is None or (l_acc is not None and l_acc <= r_acc):
+        return "l"
+    return "r"
+
+
 def extract_last_calibration_message(messages):
     """
     Return (timestamp, raw_text) of the last message containing "Data Quality" that occurs
@@ -104,19 +122,36 @@ class ParticipantGazeDataManager:
         """
         group_path, self.name = os.path.split(participant_name)
         _,  self.group = os.path.split(group_path)
+        if "DONTUSE" in self.name.upper():
+            raise ValueError(f"Participant {self.name!r} is flagged DONTUSE - excluded at data load.")
         self.task = task
         self.task_validation_filter_param = "run" if task == "SDMT" else "kd"
-        tobii_data, task_png, audio_recordings = self.load_data(participant_name , main_data_path, task, participant_group)
+        tobii_data, task_png, audio_recordings, file_load_errors = self.load_data(participant_name , main_data_path, task, participant_group)
         self.matched_data = {}
         self.main_data_path = main_data_path
         self.output_path = os.path.join(main_data_path, "processing_results", self.name)
         self.model = None
         os.makedirs(self.output_path, exist_ok=True)
+        # Each mat_file is one calibration event (one day's recording). A failure on one
+        # must not prevent the others from being processed - previously an exception here
+        # propagated out of __init__ and silently dropped every other calibration event for
+        # this participant. file_load_errors carries failures from load_data() itself (a
+        # mat file that didn't even parse); this loop appends per-event processing failures
+        # to the same list so every calibration event's outcome (success or specific error)
+        # is recorded independently.
+        self.load_errors = list(file_load_errors)
         for mat_file in tobii_data:
-            (self.task_data, self.messages, self.gaze_data, self.presentation_info,
-             self.dom_Eye, self.analysis_eye) = self.prepare_gaze_data_for_preprocessing(mat_file, analysis_eye)
-            self.matched_data = {**self.matched_data, **self.group_task_info(self.gaze_data, task_png, audio_recordings, self.task_data, mat_file, clean_gaze_data)}
-        
+            try:
+                (self.task_data, self.messages, self.gaze_data, self.presentation_info,
+                 self.dom_Eye, self.analysis_eye, self.eye_selection_reason) = self.prepare_gaze_data_for_preprocessing(mat_file, analysis_eye)
+                self.matched_data = {**self.matched_data, **self.group_task_info(self.gaze_data, task_png, audio_recordings, self.task_data, mat_file, clean_gaze_data)}
+            except Exception as e:
+                try:
+                    recording_date = self.get_creation_time(mat_file)
+                except Exception:
+                    recording_date = None
+                self.load_errors.append({"recording_date": recording_date, "error": str(e)})
+
     def get_gaze_data_for_panel(self, panel: str):
         if panel not in self.matched_data:
             raise ValueError(f"Panel {panel} not found in matched data.")
@@ -136,12 +171,130 @@ class ParticipantGazeDataManager:
     def load_data(self, participant_code_name, main_data_path, task, participant_group):
         task_files_path = os.path.join(main_data_path, participant_group, participant_code_name, task)
         if not os.path.exists(task_files_path):
-            raise f"no such path {task_files_path}"
+            raise FileNotFoundError(f"no such path {task_files_path}")
         mat_files = glob(os.path.join(task_files_path, "*.mat"))
         mat_files = [file_path for file_path in mat_files if self.task_validation_filter_param in os.path.split(file_path)[1].lower()]
         task_png_files = glob(os.path.join(main_data_path, "panels_images", task,"*.jpg"))
         recording_files = glob(os.path.join(task_files_path, "**","*.wav"), recursive=True)
-        return [scio.loadmat(mat, struct_as_record=False, squeeze_me=True) for mat in mat_files], task_png_files, recording_files
+
+        loaded_mats, load_errors = self._load_and_dedupe_run_files(mat_files)
+        return loaded_mats, task_png_files, recording_files, load_errors
+
+    _RUN_GROUP_RE = re.compile(r'run[_]?(\d+)', re.IGNORECASE)
+
+    def _run_group_key(self, file_path):
+        """
+        Best-effort grouping key for candidate run files that likely represent the same
+        calibration event: the run number parsed out of the filename (case/underscore
+        insensitive), if one is present. Files with no recognizable run number are treated
+        as singletons (nothing to dedupe them against by name alone).
+        """
+        match = self._RUN_GROUP_RE.search(os.path.split(file_path)[1])
+        return f"run{match.group(1)}" if match else os.path.split(file_path)[1]
+
+    @staticmethod
+    def _file_md5(file_path):
+        hasher = hashlib.md5()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    @staticmethod
+    def _mat_completeness_score(mat_dict):
+        """
+        Higher = more complete/usable recording. Some participant folders contain exact or
+        partial duplicate copies of the same session (identical content saved under a
+        different filename, or a partial/truncated/empty re-save under a different date) -
+        this is used to pick the genuine one by what's actually inside the file rather than
+        by filename.
+        """
+        score = 0
+        try:
+            score += 1000 if np.size(mat_dict["data"].gaze.systemTimeStamp) > 0 else 0
+        except Exception:
+            pass
+        try:
+            score += 500 if extract_last_calibration_message(mat_dict["messages"]) is not None else 0
+        except Exception:
+            pass
+        try:
+            score += len(mat_dict["messages"])
+        except Exception:
+            pass
+        try:
+            score += 10 * len([k for k in mat_dict["task_data"].__dict__.keys() if not k.startswith("_")])
+        except Exception:
+            pass
+        return score
+
+    def _load_and_dedupe_run_files(self, mat_files):
+        """
+        Loads every candidate run file, but resolves duplicates by CONTENT rather than
+        filename: identical files (byte-for-byte, even under different names/dates) collapse
+        to one automatically; files that share a filename-derived run number but differ in
+        content are resolved by keeping whichever has the higher completeness score (the
+        others are typically partial/empty/truncated re-saves). One bad/corrupted file never
+        prevents the participant's other calibration events from loading - each outcome
+        (kept, or excluded as a duplicate/corrupt/etc, with the specific reason) is recorded
+        in load_errors for anything not kept, so nothing is silently dropped.
+        """
+        # Stage 1: collapse exact byte-identical duplicates regardless of filename.
+        by_hash = {}
+        load_errors = []
+        for file_path in mat_files:
+            try:
+                file_hash = self._file_md5(file_path)
+            except Exception as e:
+                load_errors.append({"file": file_path, "error": f"could not read file: {e}"})
+                continue
+            by_hash.setdefault(file_hash, []).append(file_path)
+
+        unique_files = []
+        for file_hash, paths in by_hash.items():
+            paths_sorted = sorted(paths)
+            unique_files.append(paths_sorted[0])
+            for duplicate_path in paths_sorted[1:]:
+                load_errors.append({
+                    "file": duplicate_path,
+                    "error": f"exact duplicate of {os.path.basename(paths_sorted[0])} (identical content) - excluded",
+                })
+
+        # Stage 2: group the remaining (content-distinct) files by filename-derived run
+        # number, and resolve any group with >1 candidate by completeness score.
+        groups = {}
+        for file_path in unique_files:
+            groups.setdefault(self._run_group_key(file_path), []).append(file_path)
+
+        loaded_mats = []
+        for group_key, candidates in groups.items():
+            loaded = []
+            for file_path in candidates:
+                try:
+                    loaded.append((file_path, scio.loadmat(file_path, struct_as_record=False, squeeze_me=True)))
+                except Exception as e:
+                    load_errors.append({"file": file_path, "error": str(e)})
+
+            if not loaded:
+                continue
+            if len(loaded) == 1:
+                loaded_mats.append(loaded[0][1])
+                continue
+
+            scored = sorted(
+                ((self._mat_completeness_score(m), f, m) for f, m in loaded),
+                key=lambda t: t[0], reverse=True,
+            )
+            best_score, best_file, best_mat = scored[0]
+            loaded_mats.append(best_mat)
+            for score, file_path, _ in scored[1:]:
+                load_errors.append({
+                    "file": file_path,
+                    "error": f"duplicate/partial save of {os.path.basename(best_file)} (matched as "
+                             f"{group_key}) - lower completeness score ({score} vs {best_score}), excluded",
+                })
+
+        return loaded_mats, load_errors
 
 
     def group_task_info(self, tobii_data_file, task_png, audio_recordings, task_data, mat_file, clean_gaze_data):
@@ -154,7 +307,16 @@ class ParticipantGazeDataManager:
             task_code_lower = task_code.lower()
             png_imgs = [img for img in task_png if img.endswith(f"_{task_code_lower}.jpg")]
             png_img = None if len(png_imgs) == 0 else png_imgs[0]
-            audio_files = [audio for audio in audio_recordings if task_code_lower in os.path.split(audio)[1].split("_")[audio_idx].lower()]
+            # Stray non-conforming filenames (e.g. a leftover "SDMT_Sample.wav" template
+            # that doesn't follow the "img_test_<PANEL>_strikes_<N>.wav" pattern) must not
+            # crash panel matching - they just don't match any panel, same as a genuinely
+            # missing recording (audio_file stays None -> no SDMT score for that panel,
+            # gaze/calibration processing is unaffected).
+            audio_files = [
+                audio for audio in audio_recordings
+                if len(os.path.split(audio)[1].split("_")) > audio_idx
+                and task_code_lower in os.path.split(audio)[1].split("_")[audio_idx].lower()
+            ]
             audio_file = None if len(audio_files) == 0 else audio_files[0]
             preprocess_gaze_method = self.clean_outliers if clean_gaze_data else self.clean_outliers_no_interpolation
             messages = self.messages_for_panel(i+1)
@@ -162,6 +324,8 @@ class ParticipantGazeDataManager:
                                                    KEY_TASK_PANEL_IMG : png_img,
                                                    KEY_PANEL_MESSAGES : messages,
                                                    KEY_CALIBRATION_INFO : calibration_info,
+                                                   KEY_EYE_SELECTION_REASON : self.eye_selection_reason,
+                                                   KEY_ANALYSIS_EYE : self.analysis_eye,
                                                    KEY_AUDIO_DATA :  audio_file,
                                                    KEY_STRIKE_SCORE : 0 if list(task_data.keys())[0] == "dummy" else task_data[f"strikes_img_test_{task_code}"],
                                                    KEY_REACTION_TIMES : None if list(task_data.keys())[0] == "dummy" else task_data.get(f"reaction_times_img_test_{task_code}"),
@@ -239,6 +403,14 @@ class ParticipantGazeDataManager:
         right_gaze = data['data'].gaze.right.gazePoint.onDisplayArea
         tobi_ts = data["data"].gaze.systemTimeStamp
 
+        # A session where the task ran (messages/presses look normal) but the eye tracker
+        # streamed zero samples squeezes onDisplayArea/systemTimeStamp down to a 1-D empty
+        # array, which then fails deep inside indexing below with a cryptic
+        # "too many indices for array" - raise a clear, specific reason instead so it's
+        # identifiable as "no gaze data recorded" rather than looking like a code bug.
+        if np.size(tobi_ts) == 0:
+            raise ValueError("No gaze samples recorded for this session (eye tracker produced 0 samples)")
+
         # Extract messages
         messages = data['messages']
         # Find indices for presentation times of each panel and break
@@ -260,29 +432,67 @@ class ParticipantGazeDataManager:
 
         # Validate Dom_Eye
         Dom_Eye = data['Dom_Eye']
-        assert Dom_Eye.lower() in ['r', 'l'], 'Dom_Eye must be either "r" or "l"'
+        dom_eye_valid = isinstance(Dom_Eye, str) and Dom_Eye.lower() in ('r', 'l')
 
         # eye_for_analysis is the eye whose gaze stream actually gets used below - Dom_Eye
         # unless analysis_eye explicitly overrides it (see ParticipantGazeDataManager.__init__).
-        eye_for_analysis = (analysis_eye or Dom_Eye).lower()
+        # eye_selection_reason records WHY, for provenance (see KEY_EYE_SELECTION_REASON).
+        if analysis_eye is not None:
+            eye_for_analysis = analysis_eye.lower()
+            eye_selection_reason = "explicit_override"
+        elif dom_eye_valid:
+            eye_for_analysis = Dom_Eye.lower()
+            eye_selection_reason = "dominant"
+        else:
+            # Dom_Eye missing/invalid (e.g. "Dom_Eye must be either r or l") - rather than
+            # discarding this event, fall back to whichever eye has the better-calibrated
+            # accuracy for THIS calibration event's own Data Quality message.
+            found = extract_last_calibration_message(messages)
+            calib_parsed = parse_calibration_quality_message(found[1]) if found is not None else None
+            fallback_eye = _better_calibrated_eye(calib_parsed)
+            if fallback_eye is None:
+                raise ValueError(
+                    'Dom_Eye missing/invalid ("Dom_Eye must be either \"r\" or \"l\"") and no '
+                    "calibration message available to fall back on - cannot pick an analysis eye"
+                )
+            eye_for_analysis = fallback_eye
+            eye_selection_reason = "fallback_missing_dom_label"
         assert eye_for_analysis in ['r', 'l'], f'analysis_eye must be "r" or "l", got {analysis_eye!r}'
 
         # Select gaze data for each panel based on eye_for_analysis
+        selected_gaze = right_gaze if eye_for_analysis == 'r' else left_gaze
+        other_eye = 'l' if eye_for_analysis == 'r' else 'r'
+        other_gaze = left_gaze if eye_for_analysis == 'r' else right_gaze
+
+        def _nan_ratio(gaze_2d, indices):
+            panel_data = np.concatenate((gaze_2d[:, indices].T, np.reshape(tobi_ts[indices], (-1, 1))), axis=1)
+            return panel_data, (np.count_nonzero(np.isnan(panel_data)) // 2) / len(panel_data)
+
         gaze_data = {}
         for i in range(3):
-            if eye_for_analysis == 'r':
-                panel_data = np.concatenate((right_gaze[:, panel_presentation_indices[i]].T, np.reshape(tobi_ts[panel_presentation_indices[i]], (-1,1))), axis=1)
-                if (np.count_nonzero(np.isnan(panel_data))//2) / len(panel_data) < MAX_VALID_NAN_VALUES:
-                    gaze_data[f'panel_{i+1}'] = panel_data
-                else:
-                    raise Exception(f"Too many NaN values in panel {i+1} for analysis eye 'r'")
+            indices = panel_presentation_indices[i]
+            panel_data, nan_ratio = _nan_ratio(selected_gaze, indices)
+            if nan_ratio < MAX_VALID_NAN_VALUES:
+                gaze_data[f'panel_{i+1}'] = panel_data
+                continue
 
+            # The selected eye failed - also check the OTHER eye for this same panel so the
+            # error message says whether a rescue would even have been possible, rather than
+            # only ever reporting the one eye that happened to be selected (see eye-fallback
+            # discussion). This does NOT automatically switch eyes - no accuracy threshold
+            # has been agreed on for that (see calibration_quality_analysis.py README).
+            _, other_nan_ratio = _nan_ratio(other_gaze, indices)
+            if other_nan_ratio < MAX_VALID_NAN_VALUES:
+                raise Exception(
+                    f"Too many NaN values in panel {i+1} for analysis eye '{eye_for_analysis}' "
+                    f"(NaN ratio={nan_ratio:.1%}); other eye '{other_eye}' would pass "
+                    f"(NaN ratio={other_nan_ratio:.1%})"
+                )
             else:
-                panel_data = np.concatenate((left_gaze[:, panel_presentation_indices[i]].T, np.reshape(tobi_ts[panel_presentation_indices[i]], (-1,1))), axis=1)
-                if (np.count_nonzero(np.isnan(panel_data))//2) / len(panel_data) < MAX_VALID_NAN_VALUES:
-                    gaze_data[f'panel_{i+1}'] = panel_data
-                else:
-                    raise Exception(f"Too many NaN values in panel {i+1} for analysis eye 'l'")
+                raise Exception(
+                    f"Too many NaN values in panel {i+1} for BOTH eyes "
+                    f"('{eye_for_analysis}': {nan_ratio:.1%}, '{other_eye}': {other_nan_ratio:.1%})"
+                )
 
 
         # Calculate presentation durations
@@ -299,7 +509,7 @@ class ParticipantGazeDataManager:
             task_data = {"dummy": None, "1":None, "0":None,"2": None, "00":None, "3":None, "000":None} # TODO: how to get the real task results.
         elif self.task == "SDMT":
             task_data = data["task_data"].__dict__
-        return task_data, messages, gaze_data, presentation_info, Dom_Eye, eye_for_analysis
+        return task_data, messages, gaze_data, presentation_info, Dom_Eye, eye_for_analysis, eye_selection_reason
     
     def break_mat_into_pannels(self, mat_file_messages):
         panel_indices = []
