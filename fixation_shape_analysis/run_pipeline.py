@@ -1,6 +1,6 @@
 """
 Orchestrates the full fixation-shape pipeline: Step 0 (load/filter) -> Step 1 (moments) ->
-Step 2 (modality) -> Step 3 (GMM) -> Step 4 (PCA/clustering/MDS, x/y/both) -> summary.md.
+Step 2 (modality) -> Step 3 (GMM) -> Step 4 (PCA/clustering/MDS, x and y independently) -> summary.md.
 
 Usage:
     python -m fixation_shape_analysis.run_pipeline                       # full run

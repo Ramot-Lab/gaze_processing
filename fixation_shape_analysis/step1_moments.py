@@ -1,6 +1,6 @@
 """
-Step 1 - basic moments (mean, median, sd, skewness, excess kurtosis) per participant-panel
-unit, computed separately for the x and y fixation coordinate.
+Step 1 - shape moments (skewness, excess kurtosis) per participant-panel unit, computed
+separately for the x and y fixation coordinate.
 """
 
 import matplotlib
@@ -22,9 +22,6 @@ def compute_moments_for_axis(fixation_df, axis):
             "unit_id": unit_id,
             "axis": axis,
             "n_fixations": len(values),
-            "mean": values.mean(),
-            "median": pd.Series(values).median(),
-            "sd": values.std(ddof=1),
             "skewness": stats.skew(values),
             "kurtosis": stats.kurtosis(values, fisher=True),
         })

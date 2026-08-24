@@ -1,9 +1,7 @@
 """
 Step 4 - between-participant(-panel) comparison of fixation-distribution shape: PCA,
 k-means + hierarchical clustering, and a nonparametric KDE/Jensen-Shannon/classical-MDS
-cross-check. Runs three times: x-axis only, y-axis only, and a third "both" pass that
-concatenates the x- and y-axis feature vectors (see run_pipeline.py) - steps 1-3 stay
-strictly per-axis, this is the one step where x and y are looked at jointly.
+cross-check. Runs independently for x and y - no combined x+y pass.
 """
 
 import matplotlib
@@ -21,38 +19,40 @@ from sklearn.preprocessing import StandardScaler
 
 from . import config
 
-GMM_FEATURE_COLS = [
-    "selected_k", "ashmans_d",
-    "component_1_weight", "component_1_mean", "component_1_sd",
-    "component_2_weight", "component_2_mean", "component_2_sd",
-    "component_3_weight", "component_3_mean", "component_3_sd",
-]
+def _gmm_feature_cols(axis):
+    """Component_1..max_components weight/mean/sd column names for this axis's own k range
+    (x: up to 9, y: up to 3 - see config.GMM_MAX_COMPONENTS_BY_AXIS)."""
+    cols = ["selected_k", "ashmans_d"]
+    for i in range(1, config.GMM_MAX_COMPONENTS_BY_AXIS[axis] + 1):
+        cols += [f"component_{i}_weight", f"component_{i}_mean", f"component_{i}_sd"]
+    return cols
 
 
 def build_feature_table(moments_df, modality_df, gmm_df, axis):
     """
-    One row per unit_id: mean/sd/skewness/kurtosis (step1) + dip/BC (step2) +
+    One row per unit_id: skewness/kurtosis (step1) + dip/BC (step2) +
     selected_k/ashmans_d/component params (step3) + shape_label, for a single axis.
-    Missing component_2/3 values (when selected_k < 3) are imputed: weight -> 0 (component
-    doesn't exist), mean/sd -> that unit's overall mean/sd (a neutral, non-informative filler
-    so standardized values center near zero rather than injecting a spurious signal).
+    Missing component_i values (when selected_k < i) are imputed: weight -> 0 (component
+    doesn't exist), mean/sd -> component_1's mean/sd (always present, a neutral filler so
+    standardized values center near zero rather than injecting a spurious signal).
     """
-    m = moments_df[moments_df["axis"] == axis][["participant_id", "trial_id", "unit_id", "mean", "sd", "skewness", "kurtosis"]]
+    gmm_cols = _gmm_feature_cols(axis)
+    m = moments_df[moments_df["axis"] == axis][["participant_id", "trial_id", "unit_id", "skewness", "kurtosis"]]
     d = modality_df[modality_df["axis"] == axis][["unit_id", "dip_statistic", "dip_pvalue", "bimodality_coefficient", "modality_label"]]
-    g = gmm_df[gmm_df["axis"] == axis][["unit_id", "shape_label"] + GMM_FEATURE_COLS]
+    g = gmm_df[gmm_df["axis"] == axis][["unit_id", "shape_label", "k_stability"] + gmm_cols]
 
     feature_df = m.merge(d, on="unit_id").merge(g, on="unit_id")
 
-    for i in (2, 3):
+    for i in range(2, config.GMM_MAX_COMPONENTS_BY_AXIS[axis] + 1):
         feature_df[f"component_{i}_weight"] = feature_df[f"component_{i}_weight"].fillna(0.0)
-        feature_df[f"component_{i}_mean"] = feature_df[f"component_{i}_mean"].fillna(feature_df["mean"])
-        feature_df[f"component_{i}_sd"] = feature_df[f"component_{i}_sd"].fillna(feature_df["sd"])
+        feature_df[f"component_{i}_mean"] = feature_df[f"component_{i}_mean"].fillna(feature_df["component_1_mean"])
+        feature_df[f"component_{i}_sd"] = feature_df[f"component_{i}_sd"].fillna(feature_df["component_1_sd"])
 
     return feature_df.reset_index(drop=True)
 
 
-NUMERIC_FEATURE_COLS = ["mean", "sd", "skewness", "kurtosis", "dip_statistic", "bimodality_coefficient",
-                         "selected_k", "ashmans_d"] + GMM_FEATURE_COLS
+def _numeric_feature_cols(axis):
+    return ["skewness", "kurtosis", "dip_statistic", "bimodality_coefficient"] + _gmm_feature_cols(axis)
 
 
 def _standardize(feature_df, numeric_cols):
@@ -156,23 +156,6 @@ def kde_js_distance_matrix_1d(fixation_df, unit_ids, axis, grid_points=config.KD
     return _pairwise_js(pdfs)
 
 
-def kde_js_distance_matrix_2d(fixation_df, unit_ids, grid_size=30):
-    all_x = fixation_df[fixation_df["unit_id"].isin(unit_ids)]["x"].to_numpy()
-    all_y = fixation_df[fixation_df["unit_id"].isin(unit_ids)]["y"].to_numpy()
-    gx = np.linspace(all_x.min(), all_x.max(), grid_size)
-    gy = np.linspace(all_y.min(), all_y.max(), grid_size)
-    gxx, gyy = np.meshgrid(gx, gy)
-    grid_points = np.vstack([gxx.ravel(), gyy.ravel()])
-
-    pdfs = np.zeros((len(unit_ids), grid_size * grid_size))
-    for i, unit_id in enumerate(unit_ids):
-        unit_rows = fixation_df[fixation_df["unit_id"] == unit_id]
-        pdf = gaussian_kde(np.vstack([unit_rows["x"], unit_rows["y"]]))(grid_points)
-        pdfs[i] = _normalize_pdf(pdf)
-
-    return _pairwise_js(pdfs)
-
-
 def _pairwise_js(pdfs):
     n = pdfs.shape[0]
     dist = np.zeros((n, n))
@@ -201,10 +184,11 @@ def run_step4_for_axis(fixation_df, moments_df, modality_df, gmm_df, axis):
     """Full Step 4 (PCA, clustering, KDE/JS/MDS) for a single univariate axis ('x' or 'y')."""
     config.ensure_output_dirs()
 
+    numeric_cols = _numeric_feature_cols(axis)
     feature_df = build_feature_table(moments_df, modality_df, gmm_df, axis)
-    X = _standardize(feature_df, NUMERIC_FEATURE_COLS)
+    X = _standardize(feature_df, numeric_cols)
 
-    pca, scores, loadings_df = run_pca(X, NUMERIC_FEATURE_COLS)
+    pca, scores, loadings_df = run_pca(X, numeric_cols)
     loadings_df.insert(0, "axis", axis)
     plot_pca_scatter(scores, feature_df["shape_label"].to_numpy(),
                       config.group_plot_path(f"step4_pca_scatter_{axis}.png"),
@@ -244,81 +228,18 @@ def run_step4_for_axis(fixation_df, moments_df, modality_df, gmm_df, axis):
     }
 
 
-def run_step4_both(fixation_df, results_x, results_y):
-    """
-    Third analysis: concatenates the x- and y-axis feature vectors (prefixed x_/y_) per
-    unit into one joint feature matrix for PCA/clustering, and a bivariate (x,y) KDE +
-    Jensen-Shannon + classical MDS cross-check. Steps 1-3 are NOT re-run jointly - only
-    this comparison step looks at x and y together.
-    """
-    config.ensure_output_dirs()
-    axis = "both"
-
-    fx = results_x["feature_df"].add_prefix("x_").rename(columns={"x_participant_id": "participant_id",
-                                                                    "x_trial_id": "trial_id", "x_unit_id": "unit_id"})
-    fy = results_y["feature_df"].add_prefix("y_").rename(columns={"y_participant_id": "participant_id",
-                                                                    "y_trial_id": "trial_id", "y_unit_id": "unit_id"})
-    feature_df = fx.merge(fy, on=["participant_id", "trial_id", "unit_id"])
-    feature_df["shape_label"] = feature_df["x_shape_label"] + " | " + feature_df["y_shape_label"]
-
-    numeric_cols = [f"x_{c}" for c in NUMERIC_FEATURE_COLS] + [f"y_{c}" for c in NUMERIC_FEATURE_COLS]
-    X = _standardize(feature_df, numeric_cols)
-
-    pca, scores, loadings_df = run_pca(X, numeric_cols)
-    loadings_df.insert(0, "axis", axis)
-    plot_pca_scatter(scores, feature_df["shape_label"].to_numpy(),
-                      config.group_plot_path(f"step4_pca_scatter_{axis}.png"),
-                      "PCA of combined x+y fixation-shape features, colored by combined shape label")
-
-    best_k, silhouette, kmeans_labels, hier_labels = run_clustering(X)
-    plot_dendrogram(X, config.group_plot_path(f"step4_dendrogram_{axis}.png"),
-                     "Hierarchical clustering (Ward) of combined x+y fixation-shape features")
-
-    cluster_df = feature_df[["participant_id", "trial_id", "unit_id", "shape_label"]].copy()
-    cluster_df.insert(0, "axis", axis)
-    cluster_df["kmeans_cluster"] = kmeans_labels
-    cluster_df["hierarchical_cluster"] = hier_labels
-    cluster_df["kmeans_k"] = best_k
-    cluster_df["kmeans_silhouette"] = silhouette
-    cluster_df["pc1"] = scores[:, 0]
-    cluster_df["pc2"] = scores[:, 1]
-
-    unit_ids = feature_df["unit_id"].tolist()
-    js_dist = kde_js_distance_matrix_2d(fixation_df, unit_ids)
-    js_dist_df = pd.DataFrame(js_dist, index=unit_ids, columns=unit_ids)
-
-    mds_coords = _classical_mds(js_dist)
-    plot_mds_scatter(mds_coords, feature_df["shape_label"].to_numpy(),
-                      config.group_plot_path(f"step4_mds_scatter_{axis}.png"),
-                      "Classical MDS on bivariate (x,y) KDE Jensen-Shannon distances, colored by combined shape label")
-
-    print(f"Step 4 (both): PCA explained variance (PC1,PC2) = "
-          f"{pca.explained_variance_ratio_[:2].round(3)}, kmeans best_k={best_k} (silhouette={silhouette:.3f})")
-
-    return {
-        "feature_df": feature_df,
-        "loadings_df": loadings_df,
-        "cluster_df": cluster_df,
-        "js_dist_df": js_dist_df,
-        "mds_coords": mds_coords,
-    }
-
-
 def run_step4(fixation_df, moments_df, modality_df, gmm_df):
     results_x = run_step4_for_axis(fixation_df, moments_df, modality_df, gmm_df, "x")
     results_y = run_step4_for_axis(fixation_df, moments_df, modality_df, gmm_df, "y")
-    results_both = run_step4_both(fixation_df, results_x, results_y)
 
-    loadings_df = pd.concat([results_x["loadings_df"], results_y["loadings_df"], results_both["loadings_df"]],
-                             ignore_index=True)
+    loadings_df = pd.concat([results_x["loadings_df"], results_y["loadings_df"]], ignore_index=True)
     loadings_df.to_csv(config.table_path("step4_pca_loadings.csv"), index=False)
 
-    cluster_df = pd.concat([results_x["cluster_df"], results_y["cluster_df"], results_both["cluster_df"]],
-                            ignore_index=True)
+    cluster_df = pd.concat([results_x["cluster_df"], results_y["cluster_df"]], ignore_index=True)
     cluster_df.to_csv(config.table_path("step4_cluster_assignments.csv"), index=False)
 
     long_rows = []
-    for axis, results in (("x", results_x), ("y", results_y), ("both", results_both)):
+    for axis, results in (("x", results_x), ("y", results_y)):
         js_dist_df = results["js_dist_df"]
         stacked = js_dist_df.where(np.triu(np.ones(js_dist_df.shape, dtype=bool), k=1)).stack()
         stacked = stacked.rename("js_distance").reset_index()
@@ -327,7 +248,7 @@ def run_step4(fixation_df, moments_df, modality_df, gmm_df):
         long_rows.append(stacked)
     pd.concat(long_rows, ignore_index=True).to_csv(config.table_path("step4_js_distance_matrix.csv"), index=False)
 
-    return {"x": results_x, "y": results_y, "both": results_both}
+    return {"x": results_x, "y": results_y}
 
 
 if __name__ == "__main__":

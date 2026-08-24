@@ -101,10 +101,66 @@ def build_summary_markdown(min_fixations=config.MIN_FIXATIONS_PER_UNIT):
     )
 
     lines.append("## 1-3. Shape label distribution per axis\n")
+    lines.append(
+        "GMM component search range differs by axis: x is searched over k=1..9 (9 dictionary "
+        "columns to potentially resolve), y over k=1..3 (only 2 rows) - see "
+        "`config.GMM_MAX_COMPONENTS_BY_AXIS`.\n"
+    )
     for axis in ("x", "y"):
         sub = label_dist[label_dist["axis"] == axis].sort_values("count", ascending=False)
         lines.append(f"**{axis}-axis** (from `step3_gmm_characterization.csv`):\n")
         lines.append(_markdown_table(sub[["shape_label", "count", "pct"]], float_cols=["pct"]) + "\n")
+
+    lines.append("## How reliable is the selected k? (k_stability)\n")
+    lines.append(
+        "Each unit's `k_stability` (in `step3_gmm_characterization.csv`) is the fraction of "
+        f"{config.GMM_BOOTSTRAP_N_RESAMPLES} bootstrap resamples of that unit's own fixations "
+        "that picked the same k (via BIC) as the main fit. It's a plain check on whether the "
+        "reported number of modes is trustworthy or just a quirk of which fixations happened "
+        "to land where: k_stability near 1 means the mode count is reliable, while values below "
+        "roughly 0.5 mean that unit's k is genuinely uncertain and shouldn't be over-interpreted "
+        "(most likely for x's higher-k fits on smaller units, since a wider k=1..9 search gives "
+        "BIC more ways to flip between neighboring k on resampled data).\n"
+    )
+    lines.append(
+        f"B={config.GMM_BOOTSTRAP_N_RESAMPLES} resamples and a lower n_init "
+        f"({config.GMM_BOOTSTRAP_N_INIT}, vs. {config.GMM_N_INIT} for the main fit) on each "
+        "bootstrap refit follow standard bootstrap practice: Efron & Tibshirani "
+        "(*An Introduction to the Bootstrap*, 1993) cite roughly 50-200 replicates as enough "
+        "for a bootstrap standard-error estimate; Monti et al. (\"Consensus Clustering\", "
+        "2003) use a comparable ~100-500 resamples for resampling-based model-order/cluster "
+        "stability; McLachlan's (1987) bootstrap test for the number of mixture components "
+        "likewise uses cheaper per-replicate fits than the one definitive fit being tested, "
+        "since B replicates already average out per-fit initialization noise.\n"
+    )
+    gmm_df = tables["gmm"]
+    k_stability_rows = []
+    for axis in ("x", "y"):
+        sub = gmm_df[gmm_df["axis"] == axis]["k_stability"]
+        k_stability_rows.append({
+            "axis": axis,
+            "median_k_stability": sub.median(),
+            "pct_units_below_0.5": 100 * (sub < 0.5).mean(),
+        })
+    lines.append(_markdown_table(pd.DataFrame(k_stability_rows),
+                                  float_cols=["median_k_stability", "pct_units_below_0.5"]) + "\n")
+
+    # Monte Carlo noise ON k_stability ITSELF: it's a proportion estimated from B bootstrap
+    # draws, so it carries its own sampling error, SE = sqrt(p*(1-p)/B), maximized at p=0.5.
+    b = config.GMM_BOOTSTRAP_N_RESAMPLES
+    worst_case_se = np.sqrt(0.5 * 0.5 / b)
+    lines.append(
+        f"**A caveat on k_stability's own precision**: it is itself a proportion estimated "
+        f"from only B={b} bootstrap draws, so it carries Monte Carlo sampling noise of "
+        f"SE = sqrt(p(1-p)/B), worst-case (p=0.5) SE ≈ {worst_case_se:.3f} "
+        f"(±{100 * worst_case_se:.1f} percentage points, or roughly ±{200 * worst_case_se:.0f} "
+        "points for a ~95% band). In practice this means a reported k_stability of, say, 0.50 "
+        f"could plausibly be anywhere from about {0.5 - 1.96 * worst_case_se:.2f} to "
+        f"{0.5 + 1.96 * worst_case_se:.2f} just from which {b} resamples happened to be drawn - "
+        "it should be read as a coarse reliability band (roughly: high/mid/low), not a precise "
+        "score, and only differences larger than this noise band across units should be treated "
+        "as meaningfully different.\n"
+    )
 
     lines.append("## Shape outliers\n")
     for axis in ("x", "y"):
@@ -125,7 +181,7 @@ def build_summary_markdown(min_fixations=config.MIN_FIXATIONS_PER_UNIT):
         "0 = no better than chance agreement, 1 = perfect agreement:\n"
     )
     ari_rows = []
-    for axis in ("x", "y", "both"):
+    for axis in ("x", "y"):
         ari_rows.append({"axis": axis, "adjusted_rand_index": _cluster_label_agreement(tables["clusters"], axis)})
     ari_df = pd.DataFrame(ari_rows)
     lines.append(_markdown_table(ari_df, float_cols=["adjusted_rand_index"]) + "\n")
@@ -157,10 +213,10 @@ def build_summary_markdown(min_fixations=config.MIN_FIXATIONS_PER_UNIT):
     lines.append("## Key plots\n")
     lines.append(
         "- `plots/group/step1_skew_kurtosis_scatter.png` - skewness vs. kurtosis, all units, colored by axis.\n"
-        "- `plots/group/step4_pca_scatter_x.png`, `..._y.png`, `..._both.png` - PCA of the shape-feature "
+        "- `plots/group/step4_pca_scatter_x.png`, `..._y.png` - PCA of the shape-feature "
         "vectors, colored by (Step 3) shape label.\n"
-        "- `plots/group/step4_dendrogram_x.png`, `..._y.png`, `..._both.png` - hierarchical clustering.\n"
-        "- `plots/group/step4_mds_scatter_x.png`, `..._y.png`, `..._both.png` - classical MDS on pairwise "
+        "- `plots/group/step4_dendrogram_x.png`, `..._y.png` - hierarchical clustering.\n"
+        "- `plots/group/step4_mds_scatter_x.png`, `..._y.png` - classical MDS on pairwise "
         "KDE Jensen-Shannon distances (nonparametric cross-check, no GMM/moment assumptions).\n"
         "- `plots/per_participant/{participant_id}_{trial_id}_{axis}_gmm_fit.png` - per-unit diagnostic "
         "(histogram + KDE + fitted GMM components).\n"
