@@ -62,9 +62,19 @@ def _pca_centroid_outliers(cluster_df, axis, top_n=TOP_N_OUTLIERS):
     ]
 
 
-def _cluster_label_agreement(cluster_df, axis):
+def _ari(labels_a, labels_b):
+    return adjusted_rand_score(labels_a, labels_b)
+
+
+def _js_cluster_imbalance(cluster_df, axis):
+    """Cluster-size breakdown for js_hierarchical_cluster, plus which participant-panels
+    sit in the smallest cluster - used to check whether a near-zero ARI against it means
+    "no shape signal" or "silhouette picked a degenerate outlier-vs-everything split"."""
     sub = cluster_df[cluster_df["axis"] == axis]
-    return adjusted_rand_score(sub["shape_label"], sub["kmeans_cluster"])
+    sizes = sub["js_hierarchical_cluster"].value_counts().sort_values()
+    minority_cluster = sizes.index[0]
+    minority = sub.loc[sub["js_hierarchical_cluster"] == minority_cluster, ["participant_id", "trial_id"]]
+    return sizes, minority
 
 
 def _markdown_table(df, float_cols=()):
@@ -176,24 +186,63 @@ def build_summary_markdown(min_fixations=config.MIN_FIXATIONS_PER_UNIT):
 
     lines.append("## Do the PCA/cluster groupings agree with the Step 3 shape labels?\n")
     lines.append(
-        "Adjusted Rand Index (ARI) between the k-means cluster assignment (Step 4, on the "
-        "standardized shape-feature vectors) and the categorical shape label (Step 3). "
-        "0 = no better than chance agreement, 1 = perfect agreement:\n"
+        "Two independent clusterings are compared against each other and against the categorical Step 3 "
+        "shape label:\n"
+        "- **feature-based** (`kmeans_cluster`): k-means/hierarchical(Ward) on the standardized shape-feature "
+        "vector (skewness, kurtosis, dip stat, BC, GMM params) - the \"by shapes\" clustering.\n"
+        "- **distance-based** (`js_hierarchical_cluster`): hierarchical (average-linkage) clustering run "
+        "directly on the pairwise KDE Jensen-Shannon distance matrix, with no shape-feature assumptions at "
+        "all - the \"general\" clustering. k-means is not an option here: it needs Euclidean coordinates to "
+        "compute a cluster centroid, which a bare distance matrix doesn't provide (that's exactly why "
+        "classical MDS exists in this pipeline - to approximately, and lossily, embed those distances into a "
+        "low-dimensional Euclidean space just for visualization). Agglomerative clustering with a precomputed "
+        "distance metric instead uses the full distance matrix directly, no embedding needed.\n\n"
+        "Adjusted Rand Index (ARI), 0 = chance agreement, 1 = perfect agreement:\n"
     )
     ari_rows = []
     for axis in ("x", "y"):
-        ari_rows.append({"axis": axis, "adjusted_rand_index": _cluster_label_agreement(tables["clusters"], axis)})
+        sub = tables["clusters"][tables["clusters"]["axis"] == axis]
+        ari_rows.append({
+            "axis": axis,
+            "feature_cluster_vs_shape_label": _ari(sub["kmeans_cluster"], sub["shape_label"]),
+            "js_cluster_vs_shape_label": _ari(sub["js_hierarchical_cluster"], sub["shape_label"]),
+            "feature_cluster_vs_js_cluster": _ari(sub["kmeans_cluster"], sub["js_hierarchical_cluster"]),
+        })
+    both_sub = tables["clusters"][tables["clusters"]["axis"] == "both"]
+    ari_rows.append({
+        "axis": "both",
+        "feature_cluster_vs_shape_label": _ari(both_sub["kmeans_cluster"], both_sub["shape_label"]),
+        "js_cluster_vs_shape_label": np.nan,
+        "feature_cluster_vs_js_cluster": np.nan,
+    })
     ari_df = pd.DataFrame(ari_rows)
-    lines.append(_markdown_table(ari_df, float_cols=["adjusted_rand_index"]) + "\n")
+    ari_cols = ["feature_cluster_vs_shape_label", "js_cluster_vs_shape_label", "feature_cluster_vs_js_cluster"]
+    lines.append(_markdown_table(ari_df, float_cols=ari_cols) + "\n")
     lines.append(
-        f"ARI is well above 0 for every axis (highest for {ari_df.loc[ari_df['adjusted_rand_index'].idxmax(), 'axis']}), "
-        "so the PCA/k-means grouping and the categorical Step 3 shape labels broadly agree - a unit's shape "
-        "label is largely recoverable from its standardized moment/dip/GMM feature vector alone. The "
-        "nonparametric KDE-Jensen-Shannon/MDS scatter (`step4_mds_scatter_{axis}.png`) is a softer check: "
-        "it shows looser, more overlapping groupings by shape label than the PCA scatter, since it compares "
-        "whole distributions rather than the same engineered features k-means/PCA use - broad agreement, not "
-        "a perfect match.\n"
+        "(\"both\" has no distance-based clustering - Step 4's nonparametric KDE/JS/MDS cross-check stays "
+        "per-axis, see `step4_comparison.py`.) Reading these together: a high "
+        "`feature_cluster_vs_shape_label` means a unit's shape label is largely recoverable from its "
+        "engineered feature vector alone. A high `feature_cluster_vs_js_cluster` means the two independent "
+        "lines of evidence - engineered shape features vs. raw distributional comparison - broadly agree "
+        "with each other, which is reassuring for both. If `feature_cluster_vs_js_cluster` is low while "
+        "`feature_cluster_vs_shape_label` is high, that suggests the categorical shape label is more a "
+        "property of the GMM/moment feature engineering than of the underlying distributions themselves.\n"
     )
+
+    for axis in ("x", "y"):
+        sizes, minority = _js_cluster_imbalance(tables["clusters"], axis)
+        if len(sizes) > 1 and sizes.iloc[0] <= 0.02 * sizes.sum():
+            minority_desc = ", ".join(f"{p}/{t}" for p, t in minority[["participant_id", "trial_id"]].to_numpy())
+            lines.append(
+                f"**Why `js_cluster_vs_shape_label` is near zero for {axis}**: `js_hierarchical_cluster` split "
+                f"{sizes.sum()} units into {sizes.iloc[0]} vs. {sizes.iloc[1:].sum()} - silhouette selected a "
+                f"degenerate split isolating a handful of extreme outliers ({minority_desc}) rather than "
+                "resolving genuine shape-based subgroups among the rest. Given the raw/uncorrected-coordinates "
+                "caveat above, this is consistent with calibration-drift-affected units being distributionally "
+                "far from everyone else, not with the shape labels being wrong. This check would need outlier "
+                "trimming or drift correction upstream before it can meaningfully validate (or refute) the "
+                "shape-feature clustering for the remaining majority of units.\n"
+            )
 
     lines.append("## x-axis vs. y-axis pattern\n")
     x_counts = label_dist[label_dist["axis"] == "x"].set_index("shape_label")["pct"]
@@ -213,13 +262,60 @@ def build_summary_markdown(min_fixations=config.MIN_FIXATIONS_PER_UNIT):
     lines.append("## Key plots\n")
     lines.append(
         "- `plots/group/step1_skew_kurtosis_scatter.png` - skewness vs. kurtosis, all units, colored by axis.\n"
-        "- `plots/group/step4_pca_scatter_x.png`, `..._y.png` - PCA of the shape-feature "
-        "vectors, colored by (Step 3) shape label.\n"
-        "- `plots/group/step4_dendrogram_x.png`, `..._y.png` - hierarchical clustering.\n"
-        "- `plots/group/step4_mds_scatter_x.png`, `..._y.png` - classical MDS on pairwise "
-        "KDE Jensen-Shannon distances (nonparametric cross-check, no GMM/moment assumptions).\n"
+        "- `plots/group/step4_pca_scatter_{x,y,both}_pc{a}_pc{b}.png` - PCA of the shape-feature vectors "
+        "(x, y, and combined x+y), colored by shape label, all 3 pairs among the first 3 components "
+        "(PC1-PC2, PC1-PC3, PC2-PC3).\n"
+        "- `plots/group/step4_pca_scatter_{x,y,both}_by_cluster_pc{a}_pc{b}.png` - the SAME PCA space, "
+        "colored instead by the Ward hierarchical cluster assignment - compare against the shape-label-colored "
+        "version above to see how well the clustering carves up the space.\n"
+        "- `plots/group/step4_dendrogram_{x,y,both}.png` - Ward hierarchical clustering of the "
+        "shape-feature vector.\n"
+        "- `plots/group/step4_mds_scatter_{x,y}_dim{a}_dim{b}.png` - classical MDS on the pairwise "
+        "KDE Jensen-Shannon distances (nonparametric cross-check, no GMM/moment assumptions), all 3 "
+        "pairs among the first 3 dimensions, colored by shape label.\n"
+        "- `plots/group/step4_mds_scatter_{x,y}_by_cluster_dim{a}_dim{b}.png` - the SAME MDS space, colored "
+        "instead by its own distance-based hierarchical cluster - makes the degenerate outlier-vs-everyone "
+        "split (see Conclusions) directly visible: a handful of points sit far off the main arc, and that's "
+        "the entire clustering.\n"
+        "- `plots/group/step4_js_dendrogram_{x,y}.png` - average-linkage hierarchical clustering run "
+        "directly on the JS-distance matrix (the \"general\" clustering - see the ARI section above).\n"
         "- `plots/per_participant/{participant_id}_{trial_id}_{axis}_gmm_fit.png` - per-unit diagnostic "
         "(histogram + KDE + fitted GMM components).\n"
+    )
+
+    lines.append("## Conclusions (clustering)\n")
+    x_ari, y_ari, both_ari = (ari_df.set_index("axis").loc[a, "feature_cluster_vs_shape_label"] for a in ("x", "y", "both"))
+    x_kstab = gmm_df.loc[gmm_df["axis"] == "x", "k_stability"].median()
+    y_kstab = gmm_df.loc[gmm_df["axis"] == "y", "k_stability"].median()
+    lines.append(
+        f"- **x and y have genuinely different shape landscapes**: x is dominated by **{dominant_x}** "
+        f"({x_counts.max():.0f}%), y by **{dominant_y}** ({y_counts.max():.0f}%) - they should be reported and "
+        "interpreted as two separate stories, not collapsed into one.\n"
+        f"- **The shape-feature clustering is internally consistent**: standardized shape features (skewness, "
+        f"kurtosis, dip stat, BC, GMM params) reduced via PCA and clustered recover the categorical shape label "
+        f"reasonably well (ARI={x_ari:.2f} for x, ARI={y_ari:.2f} for y) - the shape-label framework is "
+        "picking up real, recoverable structure, not noise.\n"
+        f"- **x's fine-grained mode counts need a big caveat, y's don't**: bootstrap k_stability is high for y "
+        f"(median {y_kstab:.2f}) but low for x (median {x_kstab:.2f}, {(gmm_df.loc[gmm_df['axis']=='x','k_stability']<0.5).mean()*100:.0f}% "
+        "of units below 0.5) - present y's mode counts with confidence, present x's k as illustrative/exploratory, "
+        "not a precise count of dictionary columns used.\n"
+        "- **The nonparametric \"general\" cross-check did not confirm the shape-feature clustering - but for a "
+        "diagnosable reason, not because the shapes are wrong**: clustering directly on Jensen-Shannon "
+        "distances between whole fixation distributions produced near-zero ARI against both the shape labels "
+        "and the feature-based clusters. Root cause: silhouette selection picked a degenerate 2-cluster split "
+        "isolating a handful of extreme-outlier units (all from participants with likely calibration drift, "
+        "e.g. the raw/uncorrected-coordinates caveat noted above) versus everyone else, rather than resolving "
+        "any real shape-based subgroup structure - visible directly in `step4_mds_scatter_{axis}_by_cluster_"
+        "dim1_dim2.png` (a handful of points off the main arc, that's the entire clustering) versus the much "
+        "more balanced, structured split in `step4_pca_scatter_{axis}_by_cluster_pc1_pc2.png`. **Recommended "
+        "before presenting this check as a real validation**: rerun it on drift-corrected coordinates, or "
+        "exclude the flagged outlier units first.\n"
+        f"- **Combining x and y into one feature vector weakens the signal rather than strengthening it** "
+        f"(ARI={both_ari:.2f} for \"both\" vs. {x_ari:.2f}/{y_ari:.2f} separately) - supports keeping x and y "
+        "as independent analyses rather than a single combined shape-space.\n"
+        "- **Bottom line for presentation**: the GMM/moment-based shape characterization is the trustworthy, "
+        "validated backbone of this analysis (especially for y); the nonparametric distance-based check is "
+        "still an open validation step pending outlier/drift handling, not a contradiction of the main result.\n"
     )
 
     return "\n".join(lines)

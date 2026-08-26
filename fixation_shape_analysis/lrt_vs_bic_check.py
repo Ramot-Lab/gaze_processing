@@ -100,6 +100,20 @@ def bootstrap_k_distribution(values, max_components, n_resamples=config.GMM_BOOT
     return {k: c / n_resamples for k, c in counts.items()}
 
 
+def _sample_from_gmm(model, n, rng):
+    """
+    Draws n samples from a fitted 1D GaussianMixture using our own rng - NOT model.sample(),
+    which reseeds from model.random_state on every call (a fixed int gives byte-identical
+    "random" draws every time it's called), which would make every bootstrap resample here
+    identical and silently collapse the whole test.
+    """
+    weights = model.weights_.flatten()
+    means = model.means_.flatten()
+    sds = np.sqrt(model.covariances_.flatten())
+    component_choices = rng.choice(len(weights), size=n, p=weights)
+    return rng.normal(loc=means[component_choices], scale=sds[component_choices])
+
+
 def bootstrap_lrt_transition_test(values, k, n_resamples=config.LRT_N_RESAMPLES, n_init=config.LRT_N_INIT,
                                    fit_n_init=config.GMM_N_INIT, random_state=config.GMM_RANDOM_STATE):
     """
@@ -116,8 +130,7 @@ def bootstrap_lrt_transition_test(values, k, n_resamples=config.LRT_N_RESAMPLES,
     n = len(values)
     count_ge = 0
     for _ in range(n_resamples):
-        simulated, _ = model_k.sample(n)
-        simulated = simulated.flatten()
+        simulated = _sample_from_gmm(model_k, n, rng)
         sim_k = _fit_gmm(simulated, k, n_init, random_state)
         sim_k1 = _fit_gmm(simulated, k + 1, n_init, random_state)
         sim_lrt = 2 * (_log_likelihood(sim_k1, simulated) - _log_likelihood(sim_k, simulated))

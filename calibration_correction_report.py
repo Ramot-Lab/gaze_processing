@@ -37,6 +37,21 @@ from participant_gaze_data_manager import ParticipantGazeDataManager
 # clinical cutoff - just a readable way to bucket the acc column from calibration_quality.csv.
 CALIBRATION_ACCURACY_BANDS = [(0.5, "excellent (<=0.5 deg)"), (1.0, "acceptable (<=1.0 deg)"), (float("inf"), "poor (>1.0 deg)")]
 
+# Short forms of the series labels used in plot titles (full names stay in the legend) -
+# titles built by joining every included series' label were overflowing the figure once a
+# 3rd/4th method got added.
+_SHORT_METHOD_LABEL = {
+    "Original (uncorrected)": "original",
+    "Corrected - midline reference": "midline",
+    "Corrected - second-row-center reference": "second-row",
+    "Corrected - per-trial method": "per-trial",
+}
+
+
+def _short_series_title(prefix, series):
+    labels = " vs ".join(_SHORT_METHOD_LABEL.get(label, label) for _, label, _ in series)
+    return f"{prefix}: {labels}"
+
 
 def _band_accuracy(acc):
     if pd.isna(acc):
@@ -359,25 +374,33 @@ def _merge_gap_zone_methods(midline_df, second_row_df, per_trial_df=None):
     return merged, series
 
 
+def _affected_only(series):
+    """Filters every (values, label, color) series down to just the affected panels
+    (value > 0) - so the y-axis genuinely IS n_affected, not a count that includes the
+    (usually large) share of panels with zero problem."""
+    return [(values[values > 0], label, color) for values, label, color in series]
+
+
 def plot_gap_zone_reference_comparison_histogram(midline_df, second_row_df, per_trial_df=None,
                                                    output_dir=DEFAULT_CALIBRATION_QC_DIR, bins=30):
     """
     One overlaid histogram (different colors per series) of dictionary/grid gap-zone
-    fixation counts per participant-panel: the original uncorrected data, after
-    midline-referenced correction, after second-row-center-referenced correction, and
-    (if per_trial_df is given) after the per-trial triggering-symbol-anchored correction.
+    fixation counts, AMONG AFFECTED PANELS ONLY (count > 0) per series: the original
+    uncorrected data, after midline-referenced correction, after second-row-center
+    correction, and (if per_trial_df is given) after the per-trial method.
     """
     os.makedirs(output_dir, exist_ok=True)
-    merged, series = _merge_gap_zone_methods(midline_df, second_row_df, per_trial_df)
-    shared_bins = np.histogram_bin_edges(pd.concat([v for v, _, _ in series]), bins=bins)
+    merged, raw_series = _merge_gap_zone_methods(midline_df, second_row_df, per_trial_df)
+    series = _affected_only(raw_series)
+    shared_bins = np.histogram_bin_edges(pd.concat([v for v, _, _ in series if len(v)]), bins=bins)
 
-    plt.figure(figsize=(9, 6))
+    plt.figure(figsize=(11, 6.5))
     for values, label, color in series:
         plt.hist(values, bins=shared_bins, color=color, edgecolor="k", alpha=0.5,
-                  label=f"{label} (mean={values.mean():.2f}, n={len(values)})")
-    plt.xlabel("# fixations in dictionary/grid gap zone")
-    plt.ylabel("Count (participant-panels)")
-    plt.title("Gap-zone fixation counts: original vs midline vs second-row vs per-trial")
+                  label=f"{label} (mean={values.mean():.2f}, n_affected={len(values)})")
+    plt.xlabel("# fixations in dictionary/grid gap zone (affected panels only)")
+    plt.ylabel("n_affected")
+    plt.title(_short_series_title("Gap-zone fixation counts (affected panels only)", raw_series))
     plt.legend()
     plt.tight_layout()
 
@@ -396,17 +419,19 @@ def plot_gap_zone_reference_comparison_histogram_side_by_side(midline_df, second
     subplots (one per series) sharing bins/y-axis, instead of one overlaid plot.
     """
     os.makedirs(output_dir, exist_ok=True)
-    merged, series = _merge_gap_zone_methods(midline_df, second_row_df, per_trial_df)
-    shared_bins = np.histogram_bin_edges(pd.concat([v for v, _, _ in series]), bins=bins)
+    merged, raw_series = _merge_gap_zone_methods(midline_df, second_row_df, per_trial_df)
+    series = _affected_only(raw_series)
+    shared_bins = np.histogram_bin_edges(pd.concat([v for v, _, _ in series if len(v)]), bins=bins)
 
     fig, axes = plt.subplots(1, len(series), figsize=(4 * len(series) + 2, 5), sharex=True, sharey=True)
     for ax, (values, label, color) in zip(axes, series):
         ax.hist(values, bins=shared_bins, color=color, edgecolor="k")
-        ax.axvline(values.mean(), color="black", linewidth=1, linestyle="--")
-        ax.set_title(f"{label}\nmean={values.mean():.2f}, median={values.median():.1f}, n={len(values)}")
-        ax.set_xlabel("# fixations in dictionary/grid gap zone")
-    axes[0].set_ylabel("Count (participant-panels)")
-    fig.suptitle("Gap-zone fixation counts: original vs midline vs second-row vs per-trial")
+        if len(values):
+            ax.axvline(values.mean(), color="black", linewidth=1, linestyle="--")
+        ax.set_title(f"{label}\nmean={values.mean():.2f}, median={values.median():.1f}, n_affected={len(values)}")
+        ax.set_xlabel("# fixations in dictionary/grid gap zone (affected only)")
+    axes[0].set_ylabel("n_affected")
+    fig.suptitle(_short_series_title("Gap-zone fixation counts (affected panels only)", raw_series))
     plt.tight_layout()
 
     save_path = os.path.join(output_dir, "hist_gap_zone_reference_comparison_side_by_side.png")
@@ -417,15 +442,54 @@ def plot_gap_zone_reference_comparison_histogram_side_by_side(midline_df, second
     return merged
 
 
-def plot_negative_y_reference_comparison_histogram(midline_df, second_row_df, per_trial_df=None,
-                                                      output_dir=DEFAULT_CALIBRATION_QC_DIR, bins=30):
+def _plot_method_boxplot(raw_series, ylabel, title_prefix, save_path):
     """
-    One overlaid histogram (different colors per series) of how many fixations per
-    participant-panel got pushed to y<0 after correction, comparing the midline reference,
-    the second-row-center reference, and (if per_trial_df is given) the per-trial method.
+    One boxplot per method (affected panels only, matching the histogram convention), on
+    a log y-axis since these counts are heavily right-skewed (values span 1 to 700+) - a
+    linear axis would flatten the boxes under the outlier whiskers.
     """
+    series = _affected_only(raw_series)
+    data = [values for values, _, _ in series]
+    labels = [f"{label}\n(n_affected={len(values)})" for values, label, _ in series]
+    colors = [color for _, _, color in series]
+
+    fig, ax = plt.subplots(figsize=(9, 6.5))
+    bp = ax.boxplot(data, tick_labels=labels, patch_artist=True, showmeans=True,
+                     meanprops=dict(marker="D", markerfacecolor="white", markeredgecolor="black", markersize=6))
+    for patch, color in zip(bp["boxes"], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.6)
+    ax.set_yscale("log")
+    ax.set_ylabel(ylabel + " (log scale)")
+    ax.set_title(_short_series_title(title_prefix + " (affected panels only)", raw_series))
+    plt.xticks(rotation=10, ha="right")
+    plt.tight_layout()
+
+    plt.savefig(save_path, dpi=200)
+    print(f"Saved boxplot to {save_path}")
+    plt.show()
+    plt.close()
+
+
+def plot_gap_zone_reference_comparison_boxplot(midline_df, second_row_df, per_trial_df=None,
+                                                 output_dir=DEFAULT_CALIBRATION_QC_DIR):
+    """One boxplot per method (Original, Midline, Second-row, [Per-trial]) of gap-zone
+    fixation counts, affected panels only - complements the histograms with a compact
+    view of the spread/median/outliers per method."""
     os.makedirs(output_dir, exist_ok=True)
-    merged = midline_df[["participant", "panel", "n_negative_y_fixations_after"]].rename(
+    _, raw_series = _merge_gap_zone_methods(midline_df, second_row_df, per_trial_df)
+    save_path = os.path.join(output_dir, "boxplot_gap_zone_reference_comparison.png")
+    _plot_method_boxplot(raw_series, "# fixations in dictionary/grid gap zone", "Gap-zone fixation counts", save_path)
+
+
+def _merge_negative_y_methods(midline_df, second_row_df, per_trial_df=None):
+    """
+    Merges the "before" (original, uncorrected) column plus one "after" column per method,
+    on participant+panel. Mirrors _merge_gap_zone_methods. Returns (merged_df, series) -
+    "Original" first, then one per method.
+    """
+    merged = midline_df[["participant", "panel", "n_negative_y_fixations_before",
+                          "n_negative_y_fixations_after"]].rename(
         columns={"n_negative_y_fixations_after": "midline_after"})
     merged = merged.merge(
         second_row_df[["participant", "panel", "n_negative_y_fixations_after"]].rename(
@@ -441,20 +505,35 @@ def plot_negative_y_reference_comparison_histogram(midline_df, second_row_df, pe
     merged = merged.dropna()
 
     series = [
+        (merged["n_negative_y_fixations_before"], "Original (uncorrected)", "gray"),
         (merged["midline_after"], "Corrected - midline reference", "skyblue"),
         (merged["second_row_after"], "Corrected - second-row-center reference", "salmon"),
     ]
     if per_trial_df is not None:
         series.append((merged["per_trial_after"], "Corrected - per-trial method", "mediumseagreen"))
-    shared_bins = np.histogram_bin_edges(pd.concat([v for v, _, _ in series]), bins=bins)
+    return merged, series
 
-    plt.figure(figsize=(9, 6))
+
+def plot_negative_y_reference_comparison_histogram(midline_df, second_row_df, per_trial_df=None,
+                                                      output_dir=DEFAULT_CALIBRATION_QC_DIR, bins=30):
+    """
+    One overlaid histogram (different colors per series) of how many fixations are y<0,
+    AMONG AFFECTED PANELS ONLY (count > 0) per series: the original uncorrected data,
+    after midline-referenced correction, after second-row-center correction, and (if
+    per_trial_df is given) after the per-trial method.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    merged, raw_series = _merge_negative_y_methods(midline_df, second_row_df, per_trial_df)
+    series = _affected_only(raw_series)
+    shared_bins = np.histogram_bin_edges(pd.concat([v for v, _, _ in series if len(v)]), bins=bins)
+
+    plt.figure(figsize=(11, 6.5))
     for values, label, color in series:
         plt.hist(values, bins=shared_bins, color=color, edgecolor="k", alpha=0.5,
-                  label=f"{label} (n panels affected={int((values > 0).sum())}, total={int(values.sum())})")
-    plt.xlabel("# fixations with corrected y < 0")
-    plt.ylabel("Count (participant-panels)")
-    plt.title("Fixations pushed off-screen (y<0) after correction: midline vs second-row vs per-trial")
+                  label=f"{label} (mean={values.mean():.2f}, n_affected={len(values)})")
+    plt.xlabel("# fixations with y < 0 (affected panels only)")
+    plt.ylabel("n_affected")
+    plt.title(_short_series_title("Fixations with y < 0 (affected panels only)", raw_series))
     plt.legend()
     plt.tight_layout()
 
@@ -464,6 +543,48 @@ def plot_negative_y_reference_comparison_histogram(midline_df, second_row_df, pe
     plt.show()
     plt.close()
     return merged
+
+
+def plot_negative_y_reference_comparison_histogram_side_by_side(midline_df, second_row_df, per_trial_df=None,
+                                                                    output_dir=DEFAULT_CALIBRATION_QC_DIR, bins=30):
+    """
+    Same comparison as plot_negative_y_reference_comparison_histogram(), but as
+    side-by-side subplots (one per series) sharing bins/y-axis - matches the gap-zone
+    side-by-side layout (original + one panel per correction method, in one image).
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    merged, raw_series = _merge_negative_y_methods(midline_df, second_row_df, per_trial_df)
+    series = _affected_only(raw_series)
+    shared_bins = np.histogram_bin_edges(pd.concat([v for v, _, _ in series if len(v)]), bins=bins)
+
+    fig, axes = plt.subplots(1, len(series), figsize=(4 * len(series) + 2, 5), sharex=True, sharey=True)
+    for ax, (values, label, color) in zip(axes, series):
+        ax.hist(values, bins=shared_bins, color=color, edgecolor="k")
+        if len(values):
+            ax.axvline(values.mean(), color="black", linewidth=1, linestyle="--")
+        ax.set_title(f"{label}\nmean={values.mean():.2f}, median={values.median():.1f}, n_affected={len(values)}")
+        ax.set_xlabel("# fixations with y < 0 (affected only)")
+    axes[0].set_ylabel("n_affected")
+    fig.suptitle(_short_series_title("Fixations with y < 0 (affected panels only)", raw_series))
+    plt.tight_layout()
+
+    save_path = os.path.join(output_dir, "hist_negative_y_reference_comparison_side_by_side.png")
+    plt.savefig(save_path, dpi=200)
+    print(f"Saved histogram to {save_path}")
+    plt.show()
+    plt.close()
+    return merged
+
+
+def plot_negative_y_reference_comparison_boxplot(midline_df, second_row_df, per_trial_df=None,
+                                                    output_dir=DEFAULT_CALIBRATION_QC_DIR):
+    """One boxplot per method (Original, Midline, Second-row, [Per-trial]) of y<0 fixation
+    counts, affected panels only - complements the histograms with a compact view of the
+    spread/median/outliers per method."""
+    os.makedirs(output_dir, exist_ok=True)
+    _, raw_series = _merge_negative_y_methods(midline_df, second_row_df, per_trial_df)
+    save_path = os.path.join(output_dir, "boxplot_negative_y_reference_comparison.png")
+    _plot_method_boxplot(raw_series, "# fixations with y < 0", "Fixations with y < 0", save_path)
 
 
 def summarize_whole_dictionary_drift(whole_dict_df):
