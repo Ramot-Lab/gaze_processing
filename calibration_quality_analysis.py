@@ -21,6 +21,7 @@ from constants import (
     KEY_CALIBRATION_INFO, KEY_EYE_SELECTION_REASON, KEY_ANALYSIS_EYE, KEY_AUDIO_DATA,
     KEY_RECORDING_DATE,
 )
+from exclusion_policy import load_tobii_sucks_excluded_participants
 from participant_gaze_data_manager import ParticipantGazeDataManager, CALIBRATION_METRIC_KEYS
 
 DEFAULT_MAIN_DATA_PATH = "/Volumes/Noam_M/Results/Behavior"
@@ -44,12 +45,18 @@ def _safe_savefig(path, dpi=200):
 
 
 def _iter_subject_dirs(main_data_path, groups=("HC", "pwMS")):
+    tobii_sucks_excluded = load_tobii_sucks_excluded_participants()
     for group in groups:
         for subject_dir in sorted(glob.glob(os.path.join(main_data_path, group, "*"))):
             if not os.path.isdir(subject_dir):
                 continue
+            name = os.path.basename(subject_dir)
             # DONTUSE is a manual "exclude this person" flag unrelated to data quality.
-            if "DONTUSE" in os.path.basename(subject_dir).upper():
+            if "DONTUSE" in name.upper():
+                continue
+            # Tobii_Sucks==YES in the behavioral summary table (decision 2026-08-26) -
+            # broader/authoritative superset of the DONTUSE folder-suffix flag.
+            if name in tobii_sucks_excluded:
                 continue
             yield group, subject_dir
 
@@ -60,11 +67,11 @@ def _missing_reason_bucket(error_text):
     if not error_text:
         return "excluded_preprocessing_error"
     text = error_text.lower()
+    if "calibration accuracy is under" in text:
+        return "excluded_accuracy_threshold"
+    if "no panel passed eye-selection" in text:
+        return "excluded_nan_threshold_all_panels"
     if "nan" in text:
-        if "would pass" in text:
-            return "excluded_nan_threshold_rescuable"
-        if "both eyes" in text:
-            return "excluded_nan_threshold_both_eyes"
         return "excluded_nan_threshold"
     if "no gaze samples" in text:
         return "excluded_no_gaze_data"
@@ -72,8 +79,6 @@ def _missing_reason_bucket(error_text):
         return "excluded_duplicate_file"
     if "expecting matrix" in text or "could not read file" in text:
         return "excluded_corrupted_file"
-    if "dom_eye" in text:
-        return "excluded_missing_dom_label_and_bad_data"
     return "excluded_preprocessing_error"
 
 
@@ -85,27 +90,33 @@ def build_calibration_events_table(main_data_path=DEFAULT_MAIN_DATA_PATH, task="
       dominant_eye_raw, calibration_no, validation_no,
       {left,right}_{acc,accX,accY,std,rms,data_loss}, used_acc
 
-    eye_selection_reason values:
-      dominant                            - Dom_Eye label valid, used as-is
-      fallback_missing_dom_label          - Dom_Eye missing/invalid, fell back to the
-                                             better-calibrated eye for this event
-      explicit_override                   - analysis_eye was explicitly forced (not used
-                                             by this sweep, but supported by the pipeline)
-      excluded_nan_threshold_rescuable      - selected eye failed the NaN-ratio check but the
-                                             OTHER eye would have passed (no automatic
-                                             rescue is performed - no accuracy threshold has
-                                             been agreed on for that, see README.md)
-      excluded_nan_threshold_both_eyes     - both eyes failed the NaN-ratio check - not
-                                             recoverable by an eye swap
-      excluded_nan_threshold               - NaN failure where the other eye's ratio isn't
-                                             available for comparison (rare)
+    eye_selection_reason values (decision 2026-09-07 - accuracy and NaN ratio are evaluated
+    jointly, per PANEL, so a value here can be "mixed" if the event's panels disagree):
+      best_calibrated                     - both eyes had accuracy < 2 deg; this panel used
+                                             whichever one (also) had the better NaN ratio -
+                                             see dominant_eye_raw to check whether it happens
+                                             to agree with the physiological dominant eye
+      only_qualifying_eye                 - only one eye had accuracy < 2 deg for this event;
+                                             it was used for this panel since its NaN ratio
+                                             passed (the other eye is never a candidate,
+                                             regardless of its own NaN ratio)
+      explicit_override                   - analysis_eye was explicitly forced (not used by
+                                             this sweep, but supported by the pipeline)
+      mixed                               - different panels of this event used different
+                                             eyes/reasons (only possible when both eyes had
+                                             accuracy < 2 deg and their NaN ratios per panel
+                                             disagreed on which one qualified)
+      excluded_accuracy_threshold          - neither eye's calibration accuracy was under
+                                             2 deg - the whole event is excluded (accuracy is
+                                             identical across all 3 panels of one event)
+      excluded_nan_threshold_all_panels    - at least one eye passed the accuracy check, but
+                                             no panel of this event had any qualifying eye
+                                             whose NaN ratio was under 10%
       excluded_no_gaze_data                - eye tracker recorded 0 samples this session
                                              (both eyes share one sample timeline, so this
                                              always affects both eyes equally)
       excluded_duplicate_file              - a duplicate/partial save of another event
       excluded_corrupted_file              - the .mat file itself failed to parse
-      excluded_missing_dom_label_and_bad_data - Dom_Eye invalid AND no calibration message
-                                             to fall back on
       excluded_participant_load_error      - participant-level failure (e.g. bad path)
     """
     rows = []
@@ -137,8 +148,12 @@ def build_calibration_events_table(main_data_path=DEFAULT_MAIN_DATA_PATH, task="
             })
 
         # Successful calibration events - the (up to 3) panels sharing a mat file carry
-        # identical calibration_info/eye_used/eye_selection_reason/recording_date; group by
-        # recording_date to collapse them to one row per event.
+        # identical calibration_info/recording_date, but NOT necessarily eye_used (decision
+        # 2026-09-07: eye selection is per-panel, since NaN ratio is per-panel while
+        # accuracy is per-event - different panels of the same event can use different
+        # eyes). Group by recording_date to collapse to one row per event, but report
+        # eye_used/eye_selection_reason as "mixed" when panels disagree rather than
+        # silently taking the first panel's value.
         by_date = {}
         for panel, info in subject_data.matched_data.items():
             by_date.setdefault(info.get(KEY_RECORDING_DATE), []).append((panel, info))
@@ -148,10 +163,12 @@ def build_calibration_events_table(main_data_path=DEFAULT_MAIN_DATA_PATH, task="
             calibration_info = first_info.get(KEY_CALIBRATION_INFO)
             n_missing_audio = sum(1 for _, info in panel_infos if info.get(KEY_AUDIO_DATA) is None)
 
+            eyes_used = {info.get(KEY_ANALYSIS_EYE) for _, info in panel_infos}
+            reasons_used = {info.get(KEY_EYE_SELECTION_REASON) for _, info in panel_infos}
             row = {
                 "group": group, "participant": subject_data.name, "recording_date": recording_date,
-                "eye_used": first_info.get(KEY_ANALYSIS_EYE),
-                "eye_selection_reason": first_info.get(KEY_EYE_SELECTION_REASON),
+                "eye_used": next(iter(eyes_used)) if len(eyes_used) == 1 else "mixed",
+                "eye_selection_reason": next(iter(reasons_used)) if len(reasons_used) == 1 else "mixed",
                 "n_panels": len(panel_infos),
                 "n_panels_missing_audio": n_missing_audio,
             }
@@ -172,8 +189,14 @@ def build_calibration_events_table(main_data_path=DEFAULT_MAIN_DATA_PATH, task="
 
     df = pd.DataFrame(rows)
     if "left_acc" in df.columns and "right_acc" in df.columns:
-        df["used_acc"] = np.where(df["eye_used"] == "l", df["left_acc"],
-                                   np.where(df["eye_used"] == "r", df["right_acc"], np.nan))
+        # "mixed" events (different panels used different eyes) only happen when BOTH eyes
+        # passed the <2 deg accuracy check (see prepare_gaze_data_for_preprocessing) - report
+        # the better of the two as a representative single value rather than NaN.
+        df["used_acc"] = np.select(
+            [df["eye_used"] == "l", df["eye_used"] == "r", df["eye_used"] == "mixed"],
+            [df["left_acc"], df["right_acc"], df[["left_acc", "right_acc"]].min(axis=1)],
+            default=np.nan,
+        )
     return df
 
 
@@ -325,13 +348,22 @@ LITERATURE_REFERENCE_BANDS = {"acc": (0.5, 1.0), "std": (0.1, 0.2)}
 
 def add_used_eye_metric_columns(events_df):
     """Adds used_{metric} columns (the value for whichever eye was actually used) for all
-    four quality metrics, generalizing the used_acc column built in build_calibration_events_table."""
+    four quality metrics, generalizing the used_acc column built in build_calibration_events_table.
+    For "mixed" events (different panels used different eyes - only possible when both eyes
+    passed the <2 deg accuracy check), the better-calibrated eye's value is used as a single
+    representative for the whole event."""
     df = events_df.copy()
+    has_both_acc = "left_acc" in df.columns and "right_acc" in df.columns
+    best_eye_for_mixed = np.where(df["left_acc"] <= df["right_acc"], "l", "r") if has_both_acc else None
     for metric in QUALITY_METRICS:
         left_col, right_col = f"left_{metric}", f"right_{metric}"
-        if left_col in df.columns and right_col in df.columns:
-            df[f"used_{metric}"] = np.where(df["eye_used"] == "l", df[left_col],
-                                             np.where(df["eye_used"] == "r", df[right_col], np.nan))
+        if left_col in df.columns and right_col in df.columns and has_both_acc:
+            mixed_value = np.where(best_eye_for_mixed == "l", df[left_col], df[right_col])
+            df[f"used_{metric}"] = np.select(
+                [df["eye_used"] == "l", df["eye_used"] == "r", df["eye_used"] == "mixed"],
+                [df[left_col], df[right_col], mixed_value],
+                default=np.nan,
+            )
     return df
 
 

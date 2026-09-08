@@ -51,6 +51,7 @@ from constants import (
     SECONDS_TO_MICROSECOND_FACTOR, FIXATION_IDX, SACCADE_IDX, VIDEO_CODEC, FIXATION_COLOR,
     SACCADE_COLOR, RADIUS, THICKNESS, SCREEN_SIZE,
 )
+from exclusion_policy import load_tobii_sucks_excluded_participants
 from participant_gaze_data_manager import ParticipantGazeDataManager, CALIBRATION_METRIC_KEYS
 from trial_manager import TrialManager
 from utils import prepare_image_and_gaze
@@ -92,13 +93,19 @@ CALIBRATION_TABLE_COLUMN_NOTES = (
 
 
 def _iter_subject_dirs(main_data_path, groups):
+    tobii_sucks_excluded = load_tobii_sucks_excluded_participants()
     for group in groups:
         for subject_dir in sorted(glob.glob(os.path.join(main_data_path, group, "*"))):
             if not os.path.isdir(subject_dir):
                 continue
+            name = os.path.basename(subject_dir)
             # DONTUSE is a manual "exclude this person" flag unrelated to data quality -
             # skip entirely rather than let it show up as a calibration/load error.
-            if "DONTUSE" in os.path.basename(subject_dir).upper():
+            if "DONTUSE" in name.upper():
+                continue
+            # Tobii_Sucks==YES in the behavioral summary table (decision 2026-08-26) -
+            # broader/authoritative superset of the DONTUSE folder-suffix flag.
+            if name in tobii_sucks_excluded:
                 continue
             yield group, subject_dir
 
@@ -543,6 +550,7 @@ _SAVED_FIXATION_CSV_RE = re.compile(r"^task_(.+?)_fixation(?:_[lr])?\.csv$")
 
 def _iter_saved_gaze_panels(main_data_path, groups=("HC", "pwMS")):
     """(group, participant, panel) for every participant+panel with a saved gaze CSV on disk."""
+    tobii_sucks_excluded = load_tobii_sucks_excluded_participants()
     participant_to_group = {}
     for group in groups:
         for subject_dir in glob.glob(os.path.join(main_data_path, group, "*")):
@@ -553,6 +561,11 @@ def _iter_saved_gaze_panels(main_data_path, groups=("HC", "pwMS")):
         participant = os.path.basename(participant_dir)
         group = participant_to_group.get(participant)
         if group is None:
+            continue
+        # Tobii_Sucks==YES participants may still have stale CSVs on disk from before this
+        # exclusion existed - skip them here too, not just in _iter_subject_dirs, so they
+        # don't leak into the lightweight from_csv tables.
+        if participant in tobii_sucks_excluded:
             continue
 
         panels = set()
@@ -896,8 +909,9 @@ def _load_saved_annotated_gaze(main_data_path, participant, panel, eye=None):
     processing_results/{participant}/task_{panel}_fixation_{eye}.csv (written as a side
     effect of ParticipantGazeDataManager.annotate_gaze_events ->
     utils.generate_fixations_threshold_based - the eye suffix matches
-    ParticipantGazeDataManager.analysis_eye). Falls back to the pre-eye-suffix legacy
-    filename (task_{panel}_fixation.csv), and if no eye was requested, to whichever single
+    matched_data[panel][KEY_ANALYSIS_EYE], which is per-panel, not a single value for the
+    whole participant/event). Falls back to the pre-eye-suffix legacy filename
+    (task_{panel}_fixation.csv), and if no eye was requested, to whichever single
     eye-suffixed cache exists, so already-generated caches keep working.
     Columns: t, eye_horizontal, eye_vertical (normalized [0,1]), status, evt. Reusing this
     avoids re-loading the participant's raw .mat data just to render a QA video.

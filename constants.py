@@ -5,8 +5,8 @@ KEY_TOBII_DATA = "tobii_data"  # Key for Tobii eye movement data
 KEY_TASK_PANEL_IMG = "task_panel_img"  # Key for the image of the task panel
 KEY_PANEL_MESSAGES = "messages"  # Key for messages related to the task
 KEY_CALIBRATION_INFO = "calibration_info"  # Key for the parsed calibration/validation quality report
-KEY_EYE_SELECTION_REASON = "eye_selection_reason"  # Key for why this event's analysis eye was chosen (dominant/explicit_override/fallback_missing_dom_label)
-KEY_ANALYSIS_EYE = "analysis_eye"  # Key for which eye ("l"/"r") was actually used for this calibration event
+KEY_EYE_SELECTION_REASON = "eye_selection_reason"  # Key for why this PANEL's analysis eye was chosen (best_calibrated/only_qualifying_eye/explicit_override) - see participant_gaze_data_manager.prepare_gaze_data_for_preprocessing
+KEY_ANALYSIS_EYE = "analysis_eye"  # Key for which eye ("l"/"r") was actually used for this panel (can differ between panels of the same calibration event, since NaN ratio is per-panel)
 KEY_AUDIO_DATA = "audio_data"  # Key for the audio data file path
 KEY_STRIKE_SCORE = "strike_score"
 KEY_REACTION_TIMES = "reaction_times"  # Key for the raw per-press reaction-time deltas (seconds), fallback for panels with no "press N" messages
@@ -15,6 +15,28 @@ TIME_STAMP = "t"
 SIGNAL_IDX = "signal_index"
 SENTENCE_BREAK = "sentence_breaks"
 MAX_VALID_NAN_VALUES = 0.1 #10% of nan values in the eye tracking data is still valid
+
+# --- Out-of-[0,1]-range gaze sample handling (2026-09-07 decision) ---------------------
+# How to treat raw x/y gaze coordinates outside the normalized [0,1] screen area.
+#   "as_is"              - leave every value exactly as recorded
+#   "all_NaN"             - convert every out-of-range sample (on either side, <0 or >1) to
+#                           NaN
+#   "only_extreme_values" - convert to NaN only outside OUT_OF_RANGE_X_BOUNDS /
+#                           OUT_OF_RANGE_Y_BOUNDS (normalized screen units); within bounds,
+#                           left as-is
+OUT_OF_RANGE_VALUES_METHOD = "only_extreme_values"
+
+# Decided from the empirical out-of-range distributions (calibration_qc/hist_x_out_of_range_only.png,
+# hist_y_out_of_range_only.png): X's out-of-range mass sits well clear of either edge on both
+# sides (looks like real tracking failure, not noise), so the same 0.15 margin is tolerated on
+# both sides; Y's out-of-range mass concentrates tightly just past the TOP edge (y<0, plausible
+# noise) but its y>1 (bottom-edge overshoot) population did not show that same tight
+# near-edge clustering, so no margin is tolerated there - any y>1 is treated as invalid.
+# NOTE: as literally written, "-0.15<x<0.15" would exclude nearly all real on-screen data
+# (which sits around x=0.5) - read as a 0.15 margin on EACH of x's own two edges (0 and 1),
+# mirroring how the y margin was specified. Flag/correct if that reading is wrong.
+OUT_OF_RANGE_X_BOUNDS = (-0.15, 1.15)  # (keep down to 0.15 past the left edge, and 0.15 past the right edge)
+OUT_OF_RANGE_Y_BOUNDS = (-0.15, 1.0)   # (keep down to 0.15 past the top edge; NO margin past the bottom edge)
 
 
 OLD_MIC_REPLACEMENT_DATE = "2024-07-01"

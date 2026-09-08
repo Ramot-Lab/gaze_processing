@@ -283,9 +283,11 @@ def generate_fixations_threshold_based(participants_data ,panel):
     matched_data = np.concatenate((np.expand_dims(eyes_data[:,2], 1), np.expand_dims(eyes_data[:,0],1), np.expand_dims(eyes_data[:,1],1),
                                    np.expand_dims(np.ones_like(fixation_array),1),np.expand_dims(fixation_array,1)), axis=1)
     df_data = pd.DataFrame(matched_data, columns= [TIME_STAMP, FIXATION_CSV_KEY_EYE_H, FIXATION_CSV_KEY_EYE_V, FIXATION_VALID_STATUS,FIXATION_CSV_KEY_FIXATION])
-    # eye suffix keeps a dominant-eye and an override-eye run of the same participant/panel
-    # from clobbering each other's cached CSV (see ParticipantGazeDataManager.analysis_eye).
-    eye_suffix = getattr(participants_data, "analysis_eye", None)
+    # eye suffix keeps different eye choices for the same participant/panel from clobbering
+    # each other's cached CSV. The eye used is per-PANEL now (decision 2026-09-07 -
+    # accuracy+NaN-ratio eye selection is evaluated per panel, not once per event), so this
+    # reads matched_data[panel] rather than a single flat attribute on participants_data.
+    eye_suffix = participants_data.matched_data[panel].get(KEY_ANALYSIS_EYE)
     filename = f"task_{panel}_fixation_{eye_suffix}.csv" if eye_suffix else f"task_{panel}_fixation.csv"
     df_data.to_csv(os.path.join(participants_data.output_path, filename))
     return df_data
@@ -297,7 +299,7 @@ def generate_fixations_pymovements_based(participants_data, panel):
     matched_data = np.concatenate((np.expand_dims(eyes_data[:,2], 1), np.expand_dims(eyes_data[:,0],1), np.expand_dims(eyes_data[:,1],1),
                                    np.expand_dims(np.ones_like(fixation_array),1),np.expand_dims(fixation_array,1)), axis=1)
     df_data = pd.DataFrame(matched_data, columns= [TIME_STAMP, FIXATION_CSV_KEY_EYE_H, FIXATION_CSV_KEY_EYE_V, FIXATION_VALID_STATUS,FIXATION_CSV_KEY_FIXATION])
-    eye_suffix = getattr(participants_data, "analysis_eye", None)
+    eye_suffix = participants_data.matched_data[panel].get(KEY_ANALYSIS_EYE)
     filename = f"task_{panel}_fixation_{eye_suffix}.csv" if eye_suffix else f"task_{panel}_fixation.csv"
     df_data.to_csv(os.path.join(participants_data.output_path, filename))
     return df_data
