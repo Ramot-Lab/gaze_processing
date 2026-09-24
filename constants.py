@@ -35,7 +35,7 @@ OUT_OF_RANGE_VALUES_METHOD = "only_extreme_values"
 # NOTE: as literally written, "-0.15<x<0.15" would exclude nearly all real on-screen data
 # (which sits around x=0.5) - read as a 0.15 margin on EACH of x's own two edges (0 and 1),
 # mirroring how the y margin was specified. Flag/correct if that reading is wrong.
-OUT_OF_RANGE_X_BOUNDS = (-0.15, 1.15)  # (keep down to 0.15 past the left edge, and 0.15 past the right edge)
+OUT_OF_RANGE_X_BOUNDS = (0.0, 1.0)  # valid x range is exactly the panel/screen width, no margin either side
 OUT_OF_RANGE_Y_BOUNDS = (-0.15, 1.0)   # (keep down to 0.15 past the top edge; NO margin past the bottom edge)
 
 
@@ -44,8 +44,8 @@ OLD_MIC_REPLACEMENT_DATE = "2024-07-01"
 VIDEO_CODEC = 'mp4v'   # Codec for .mp4
 FPS = 600              # Frames per second for video output
 RADIUS = 6             # Radius for eye position marker
-FIXATION_COLOR = (0, 0, 255)  # Color for eye marker (red in BGR format)
-SACCADE_COLOR  = (255, 0, 0)  # Blue in OpenCV (BGR)
+SACCADE_COLOR = (0, 0, 255)  # Color for eye marker (red in BGR format)
+FIXATION_COLOR  = (255, 0, 0)  # Blue in OpenCV (BGR)
 THICKNESS = 3          # Thickness of the circle around the eye position
 
 # Heatmap settings

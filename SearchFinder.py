@@ -1,6 +1,7 @@
 from constants import *
 from participant_gaze_data_manager import ParticipantGazeDataManager
 from utils import prepare_image_and_gaze
+from pipeline_config import DICTIONARY_BOUNDARY_RATIO, TEXT_BOUNDARY_RATIO
 import os
 import numpy as np
 import cv2
@@ -39,7 +40,7 @@ class SearchFinder:
         self.searches = self.find()
 
 
-    def find(self, dict_ratio=0.175, text_ratio=0.22) -> list[Search]:
+    def find(self, dict_ratio=DICTIONARY_BOUNDARY_RATIO, text_ratio=TEXT_BOUNDARY_RATIO) -> list[Search]:
         H, W = SCREEN_SIZE
         dict_thresh = H * dict_ratio
         text_thresh = H * text_ratio
@@ -64,17 +65,22 @@ class SearchFinder:
                     # Continue search
                     current_search_fixations.append(fixation)
                 else:
-                    # Search ends
-                    search = Search(
-                        idx=search_idx,
-                        start_time=current_search_fixations[0].start_time,
-                        end_time=current_search_fixations[-1].end_time,
-                        fixations=current_search_fixations
-                    )
-
-                    searches.append(search)
-                    in_search = False
-                    current_search_fixations = []
+                    if y_mean >= text_thresh:
+                        # Fixation is in the text region, so we consider the "Search ends"
+                        search = Search(
+                            idx=search_idx,
+                            start_time=current_search_fixations[0].start_time,
+                            end_time=current_search_fixations[-1].end_time,
+                            fixations=current_search_fixations
+                        )
+                        searches.append(search)
+                        in_search = False
+                        current_search_fixations = []
+                    # else: fixation is in the buffer region between dict_thresh and
+                    # text_thresh - genuinely ignored (not appended, doesn't end the
+                    # search) so a brief measurement-noise excursion out of the
+                    # dictionary doesn't split one real search into two.
+                continue
 
         # Catch last search if it ends at the last fixation
         if in_search and current_search_fixations:

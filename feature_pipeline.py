@@ -17,6 +17,7 @@ from sklearn.preprocessing import StandardScaler
 
 from participant_gaze_data_manager import ParticipantGazeDataManager
 from trial_manager import TrialManager
+import pipeline_config
 
 
 # ============================================================
@@ -26,6 +27,8 @@ NOAM_DATA_PATH = "/Volumes/ramot/Noam_M/Results/Behavior"
 SCORES_CSV = "/Volumes/ramot/Noam_M/preliminary_results/behavior_scores/all_scores.csv"
 SACCADE_LATENCY_CSV = "/Volumes/ramot/Noam_M/preliminary_results/saccade_latency/Maysan_test/compiled_latencies.csv"
 IDO_TABLE_XLSX = "/Volumes/ramot/Noam_M/df_filtered_behavioral_summary_20260427_131437.xlsx"
+# Legacy fallback only - main() resolves the real, per-method output dir via
+# pipeline_config.feature_output_dir(annotation_method).
 OUTPUT_BASE_DIR = "/Volumes/ramot/Noam_M/preliminary_results/all_features/"
 
 EXCLUDED_PARTICIPANTS = ['PT914', 'LY082', 'KH736']
@@ -68,9 +71,11 @@ CORRELATION_SUBSETS = {
     "male": lambda df: df["Gender"].isin(["M", "Male"]),
 }
 
-# "compute" rebuilds everything from raw Tobii data (slow); "load" reads the
-# tables from the most recent (or an explicitly named) previous run.
-MODE = "load"
+# "compute" rebuilds everything fresh (reading Stage 1's saved annotated CSVs where
+# available - see build_trial_managers); "load" reads previously-saved tables instead.
+# Defaults to "compute" - always freshly calculated, per instruction; "load" is kept for
+# ad hoc reuse of a specific prior run but is no longer the default.
+MODE = "compute"
 LOAD_DATE = None  # e.g. "2026_07_12"; None -> most recent available run
 
 RUN_RELIABILITY = True
@@ -148,21 +153,61 @@ def load_scores(participants_dict, scores_csv=SCORES_CSV, data_path=NOAM_DATA_PA
 # ============================================================
 # 2. BUILD TRIAL MANAGERS (compute mode only)
 # ============================================================
-def build_trial_managers(participants, data_path=NOAM_DATA_PATH):
+def build_trial_managers(participants, data_path=NOAM_DATA_PATH, annotation_method="threshold_based"):
+    """
+    Loads the gaze+evt data for each panel from Stage 1's saved annotated CSV
+    (pipeline_config.load_annotated_csv) for annotation_method, instead of re-running
+    annotate_gaze_events live every time - matters most for model_based, which is
+    expensive to re-run. Falls back to live annotation (printed warning) if Stage 1
+    hasn't produced a given participant/panel yet. ParticipantGazeDataManager is still
+    constructed either way - TrialManager needs it for message/press timing and the
+    panel image, neither of which is part of the saved CSV.
+
+    Returns (valid_participants, exclusions) - exclusions is a list of
+    {participant, group, panel, reason} dicts, same shape as markov_loader.py's, so both
+    stages' drops are directly comparable in the final report.
+    """
     valid_participants = []
+    exclusions = []
     for participant in participants:
         participant.trial_managers = {}
         has_any_data = False
         try:
-            participant_data = ParticipantGazeDataManager(participant.name, data_path, "SDMT", participant.group)
+            # Full path, not bare participant.name - required for sd.group/self.name to
+            # come out right inside ParticipantGazeDataManager.
+            subject_dir = os.path.join(data_path, participant.group, participant.name)
+            participant_data = ParticipantGazeDataManager(subject_dir, data_path, "SDMT", participant.group)
             for panel in participant.scores.keys():
                 try:
-                    participant.trial_managers[panel] = TrialManager(participant_data, panel)
+                    stage1_reason = None
+                    try:
+                        # corrected=True (decision 2026-09-22): feature analysis's
+                        # TrialManager construction goes through the same y-value-dependent
+                        # Search/Sequence building as Markov analysis, so it also reads the
+                        # whole-dictionary-drift-corrected gaze, not raw.
+                        annotated_data = pipeline_config.load_annotated_csv(
+                            annotation_method, participant.group, participant.name, panel, corrected=True)
+                    except FileNotFoundError:
+                        stage1_reason = pipeline_config.stage1_exclusion_reason(
+                            annotation_method, participant.name, panel)
+                        if stage1_reason is not None:
+                            raise FileNotFoundError(f"preprocessing_exclusion: {stage1_reason}")
+                        print(f"  no Stage-1 CSV for {participant.name}/{panel}/{annotation_method} - "
+                              f"falling back to live annotation")
+                        annotated_data = None
+                    participant.trial_managers[panel] = TrialManager(
+                        participant_data, panel, annotated_data=annotated_data,
+                        annotation_method=annotation_method)
                     has_any_data = True
                 except Exception as e:
                     print(f"  Error loading {participant.name} - {panel}: {e}")
+                    reason = f"preprocessing_exclusion: {stage1_reason}" if stage1_reason is not None else f"{type(e).__name__}: {e}"
+                    exclusions.append({"participant": participant.name, "group": participant.group,
+                                        "panel": panel, "reason": reason})
         except Exception as e:
             print(f"Could not load data manager for {participant.name}: {e}")
+            exclusions.append({"participant": participant.name, "group": participant.group,
+                                "panel": None, "reason": f"participant_load_error: {type(e).__name__}: {e}"})
 
         if has_any_data:
             valid_participants.append(participant)
@@ -170,7 +215,13 @@ def build_trial_managers(participants, data_path=NOAM_DATA_PATH):
             print(f"Removing {participant.name} (no valid data found for any panel)")
 
     print(f"Final number of participants with valid data: {len(valid_participants)}")
-    return valid_participants
+    return valid_participants, exclusions
+
+
+def save_exclusion_log(exclusions, run_dir):
+    out_path = os.path.join(run_dir, "exclusion_log.csv")
+    pd.DataFrame(exclusions).to_csv(out_path, index=False)
+    print(f"Saved {len(exclusions)} exclusion rows to {out_path}")
 
 
 # ============================================================
@@ -776,6 +827,22 @@ def run_pca_pareto(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANTS):
         plt.savefig(os.path.join(out_dir, f"weights_PC{i + 1}.png"), dpi=150, bbox_inches="tight")
         plt.close()
 
+    # Genuine components x features weights heatmap (alongside the per-component bar
+    # charts above), same idea as markov_analyzer.py's _plot_pca_weights but over the
+    # feature table directly rather than reshaped into a transition-matrix grid.
+    weights_matrix = pca.components_  # shape (n_components, n_features)
+    plt.figure(figsize=(max(10, 0.4 * len(features)), 1.2 * n_components + 2))
+    max_abs = np.abs(weights_matrix).max()
+    sns.heatmap(weights_matrix, cmap="RdBu", center=0, vmin=-max_abs, vmax=max_abs,
+                xticklabels=features, yticklabels=[f"PC{i + 1}" for i in range(n_components)],
+                annot=True, fmt=".2f", cbar_kws={"label": "PCA weight"})
+    plt.title("PCA Weights Heatmap (components x features)", fontsize=13, weight="bold")
+    plt.xticks(rotation=90, fontsize=7)
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "weights_heatmap.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+
     if n_components >= 2 and "score" in df.columns:
         pairs = [(0, 1)] if n_components == 2 else [(0, 1), (0, 2), (1, 2)]
         _, axes = plt.subplots(1, len(pairs), figsize=(7 * len(pairs), 6))
@@ -911,14 +978,16 @@ def run_partial_correlations(df_participants, run_dir, excluded=EXCLUDED_PARTICI
 # ============================================================
 # 12. MAIN DRIVER
 # ============================================================
-def main():
-    run_dir = resolve_run_dir(MODE, load_date=LOAD_DATE)
-    print(f"Run directory: {run_dir} (mode={MODE})")
+def main(annotation_method="threshold_based"):
+    base_dir = pipeline_config.feature_analysis_base_dir(annotation_method)
+    run_dir = resolve_run_dir(MODE, base_dir=base_dir, load_date=LOAD_DATE)
+    print(f"Run directory: {run_dir} (mode={MODE}, annotation_method={annotation_method})")
 
     if MODE == "compute":
         participants_dict = discover_participants()
         participants = load_scores(participants_dict)
-        participants = build_trial_managers(participants)
+        participants, exclusions = build_trial_managers(participants, annotation_method=annotation_method)
+        save_exclusion_log(exclusions, run_dir)
 
         df_trials = extract_trial_table(participants)
         df_panels = build_panel_table(df_trials, participants)
@@ -953,4 +1022,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1:
+        if sys.argv[1] not in pipeline_config.ANNOTATION_METHODS:
+            print(f"usage: python feature_pipeline.py [{'|'.join(pipeline_config.ANNOTATION_METHODS)}]")
+            sys.exit(1)
+        main(sys.argv[1])
+    else:
+        main()

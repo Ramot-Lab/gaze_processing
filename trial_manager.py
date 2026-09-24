@@ -11,11 +11,23 @@ from trial_features import TrialFeatures
 
 
 class TrialManager:
-    def __init__(self, subject_data: ParticipantGazeDataManager, panel: str, gaze_correction=None):
+    def __init__(self, subject_data: ParticipantGazeDataManager, panel: str, gaze_correction=None,
+                 annotated_data=None, annotation_method="threshold_based"):
+        """
+        annotated_data: if given, used as-is instead of calling
+        subject_data.annotate_gaze_events - lets callers load a Stage-1-preprocessed CSV
+        (pipeline_config.load_annotated_csv) instead of re-running annotation (expensive
+        for model_based) every time. subject_data is still required either way, for
+        message/press timing (PanelMessages) and the panel image - neither of which is
+        part of the saved gaze-annotation CSV.
+        annotation_method: which method's live annotation to run when annotated_data is
+        not given (previously hardcoded to "threshold_based" here).
+        """
         # --- Data Loading ---
         panel_messages = PanelMessages(panel, subject_data)
         message_info: MessageInfo = panel_messages.message_info
-        annotated_data = subject_data.annotate_gaze_events(panel, "threshold_based")
+        if annotated_data is None:
+            annotated_data = subject_data.annotate_gaze_events(panel, annotation_method)
         img = subject_data.get_panel_img(panel)
 
         # --- Attributes ---
@@ -76,7 +88,7 @@ class TrialManager:
             
             relevant_fixations_in_roi = [
                 f for f in self.fixations
-                if window_start <= f.start_time <= window_end and roi.contains(f.position, 2)
+                if window_start <= f.start_time <= window_end and roi.contains(f.position)
             ]
 
             # 3. Find the First Fixation on the NEXT ROI
@@ -87,7 +99,7 @@ class TrialManager:
             if next_roi:
                 next_roi_fixations = [
                     f for f in self.fixations
-                    if window_start <= f.start_time <= window_end_next and next_roi.contains(f.position, 2)
+                    if window_start <= f.start_time <= window_end_next and next_roi.contains(f.position)
                 ]
 
             # 4. Determine Trial Start
@@ -281,6 +293,9 @@ class TrialManager:
         - First, try to match fixation center to an ROI.
         - If not found, check microsaccade coordinates within the fixation. roi with most microsaccade points wins.
         - If still not found, assign None.
+        ROI geometry (size, elongation) is entirely owned by RoiFinder/ROI now (2026-09-17
+        standardization) - both passes below use the same roi.contains(point), no separate
+        per-call factor.
         """
         rois_in_dict_area = [r for r in self.rois if r.idx < 18]
 
@@ -288,7 +303,7 @@ class TrialManager:
             fixation_symbol = {} # fixation:symbol
 
             for fixation in search.fixations:
-                roi = next((r for r in rois_in_dict_area if r.contains(fixation.position, shape="square")), None)
+                roi = next((r for r in rois_in_dict_area if r.contains(fixation.position)), None)
 
                 # If fixation center not in ROI, check microsaccades
                 if roi is None:
@@ -297,7 +312,7 @@ class TrialManager:
                     for _, row in fixation.microsaccades.iterrows():
                         point = (row['x'], row['y'])
                         for r in rois_in_dict_area:
-                            if r.contains(point, shape="square", factor = 1.5):
+                            if r.contains(point):
                                 roi_counts[r] += 1
 
                     # Pick ROI with most microsaccades
@@ -324,25 +339,41 @@ class TrialManager:
         raise ValueError(f"Trial number {trial_number} not found.")
     
     def add_trial_statistics_dataframe(self) -> pd.DataFrame:
+        """One row per trial. Sequence/Cleaned_Sequence hold the ordered symbol values
+        (dict insertion order == fixation order) concatenated across all of the trial's
+        searches, "|"-joined per search and ";"-joined across searches - the same raw
+        state sequence GazeMarkovModel builds its transition matrices from
+        (gaze_markov_model.py's search.sequence/search.cleaned_sequence), persisted here
+        so it doesn't have to be rebuilt from the live object graph to be inspected."""
         stats_records = []
         for i, trial in enumerate(self.trials):
             n_fixations = 0
             n_symbols = 0
-            
+            seq_per_search = []
+            clean_seq_per_search = []
+
             # Sum up stats from all searches in this trial
             if trial.searches:
                 for s in trial.searches:
                     clean_seq = s.cleaned_sequence
                     if clean_seq:
                         n_symbols += len(clean_seq)
+                        clean_seq_per_search.append(
+                            "|".join(str(sym.value) if sym is not None else "None" for sym in clean_seq.values())
+                        )
                     seq = s.sequence
                     if seq:
                         n_fixations += len(seq)
+                        seq_per_search.append(
+                            "|".join(str(sym.value) if sym is not None else "None" for sym in seq.values())
+                        )
 
             stats_records.append({
                 "Trial_Index": i,
                 "Num_Fixations": n_fixations,
                 "Num_Symbols": n_symbols,
+                "Sequence": ";".join(seq_per_search),
+                "Cleaned_Sequence": ";".join(clean_seq_per_search),
                 "Is_Zero_Fix": n_fixations == 0,
                 "Is_One_Fix": n_fixations == 1,
                 "Is_Two_Fix": n_fixations == 2,
@@ -350,7 +381,7 @@ class TrialManager:
                 "Is_One_Symbol": n_symbols == 1,
                 "Is_Two_Symbols": n_symbols == 2
             })
-        
+
         trial_df = pd.DataFrame(stats_records)
         return trial_df
 

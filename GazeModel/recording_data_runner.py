@@ -1,6 +1,7 @@
 from GazeModel import model
 import json
 import numpy as np
+import os
 from data_processing.data_loader import EMDataset, GazeDataLoader
 import torch
 import pandas as pd
@@ -9,9 +10,11 @@ from torch.autograd import Variable
 import copy
 from data_processing.training_npy_generator import Recoring2GazeNetProcessor
 
+DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
 
 class RecordingDataRunner:
-    def __init__(self, model ,config = "GazeModel/config.json"):
+    def __init__(self, model, config = DEFAULT_CONFIG_PATH):
         with open(config, 'r') as f:
             self.config = json.load(f)
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -47,6 +50,20 @@ class RecordingDataRunner:
             _dataset["evt"] = 0
             _dataset["evt"][1:] = np.argmax(outputs_split[0], axis=1)+1
         dataset_copy = pd.concat([pd.DataFrame(_d) for _d in dataset_copy]).reset_index(drop=True)
+        # EMDataset builds overlapping seq_len+1 windows (stride_step apart) so the diff-based
+        # input has +1 sample of context; consecutive windows therefore share one raw sample
+        # (previous window's last row == next window's row 0), which is always left at the
+        # default evt=0 ("no prediction yet", see _dataset["evt"][1:]=... above). Concatenating
+        # every window's rows thus produces one duplicate 't' per window boundary: a real
+        # (nonzero) prediction from the earlier window and a placeholder 0 from the later one.
+        # Left-merging _data against dataset_copy while those duplicates exist fans out into
+        # extra output rows (one per match), silently inflating the returned length beyond
+        # len(recording_data). Keep the real prediction over the 0 placeholder at each duplicated
+        # timestamp before merging, so every input sample maps to exactly one output row.
+        dataset_copy = (dataset_copy.sort_values("evt", ascending=False)
+                         .drop_duplicates(subset="t", keep="first")
+                         .sort_values("t")
+                         .reset_index(drop=True))
         _data = pd.DataFrame(recording_data)
         _data = _data.merge(dataset_copy, on='t', suffixes=('', '_pred'), how='left')
         _data['evt'] = _data['evt_pred'].replace({np.nan:0})
@@ -96,7 +113,7 @@ class RecordingDataRunner:
         else:
             test_dataset = EMDataset(config = self.config, gaze_data = [recording_data])
             test_loader = GazeDataLoader(test_dataset, batch_size=1,
-                                        num_workers=1,
+                                        num_workers=0,
                                         shuffle=False)
             return test_loader, test_dataset
 

@@ -483,6 +483,80 @@ def get_whole_dictionary_corrected_trial_manager(subject_data, panel):
     return tm_raw, tm_corrected, estimate
 
 
+def correct_annotated_csv_whole_dictionary(annotated_data, outlier_z_thresh=3.0, reference_ratio=None):
+    """
+    Normalized-[0,1]-space equivalent of estimate_whole_dictionary_drift_from_csv() +
+    build_drift_correction_fn() (decision 2026-09-22: "corrected-to-dict-midline",
+    Approach B - the coarser, whole-panel alternative to estimate_dictionary_drift()'s
+    per-trial ground-truth-anchored Approach A, deliberately NOT used here), operating
+    directly on one of Stage 1's saved annotated CSVs (t, eye_horizontal, eye_vertical,
+    status, evt) instead of a TrialManager's pixel-space fixations. This works because
+    prepare_image_and_gaze's y-axis transform is a pure scale with no offset (pixel_y =
+    normalized_y * SCREEN_SIZE[0]), so every y-ratio here (this module's own
+    DICTIONARY_BOUNDARY_RATIO / DICTIONARY_SECOND_ROW_MID_RATIO - NOT pipeline_config.py's
+    separately-decided ones, see pipeline_config.DICTIONARY_BOUNDARY_RATIO's docstring)
+    applies identically to normalized_y as to pixel_y / SCREEN_SIZE[0]. Lets a corrected
+    CSV be produced without constructing a full TrialManager (no image, ROIs, or presses
+    needed).
+
+    reference_ratio defaults to DICTIONARY_SECOND_ROW_MID_RATIO - the bottom (digit) row's
+    OWN vertical center (decision 2026-09-22b, correcting this function's first version,
+    which defaulted to DICTIONARY_MIDLINE_RATIO - the line BETWEEN the two dictionary rows,
+    not what was intended). Pass reference_ratio=DICTIONARY_MIDLINE_RATIO explicitly to get
+    the other behavior.
+
+    Block-extraction mirrors _extract_fixation_block_ys (same vectorized walk over
+    .to_numpy() arrays, not FixationHandler's .iterrows() - faster on large panels), plus
+    respecting the 'status' validity flag exactly like FixationHandler does (skip samples
+    where status is falsy) - _extract_fixation_block_ys itself does not do this, since its
+    callers use it only for QA histograms/tables, not for producing corrected data.
+
+    Pools every FIXATION BLOCK (not raw sample) above DICTIONARY_BOUNDARY_RATIO, drops
+    blocks more than outlier_z_thresh standard deviations from their own mean, and shifts
+    every RAW SAMPLE above the boundary by the gap between the cleaned mean and
+    reference_ratio. Y-only (dx=0), matching Approach B exactly.
+
+    Returns (corrected_df, dy_normalized, n_fixations_used) - dy_normalized/n_fixations_used
+    are 0 if there were no fixation blocks above the boundary to estimate from
+    (corrected_df is then just an unmodified copy).
+    """
+    if reference_ratio is None:
+        reference_ratio = DICTIONARY_SECOND_ROW_MID_RATIO
+
+    evt = annotated_data[FIXATION_CSV_KEY_FIXATION].to_numpy()
+    y_all = annotated_data[FIXATION_CSV_KEY_EYE_V].to_numpy()
+    valid = annotated_data[FIXATION_VALID_STATUS].to_numpy()
+
+    block_means = []
+    current = []
+    for e, yy, v in zip(evt, y_all, valid):
+        if not v:
+            continue
+        if e == FIXATION_IDX:
+            current.append(yy)
+        elif e == SACCADE_IDX and current:
+            block_means.append(np.mean(current))
+            current = []
+    if current:
+        block_means.append(np.mean(current))
+    fixation_ys = np.array(block_means)
+
+    corrected = annotated_data.copy()
+    dict_ys = fixation_ys[fixation_ys < DICTIONARY_BOUNDARY_RATIO]
+    if len(dict_ys) == 0:
+        return corrected, 0.0, 0
+
+    mean_before = float(dict_ys.mean())
+    std_before = dict_ys.std()
+    cleaned = dict_ys[np.abs(dict_ys - mean_before) <= outlier_z_thresh * std_before] if std_before > 0 else dict_ys
+    mean_after = float(cleaned.mean()) if len(cleaned) else mean_before
+    dy = mean_after - reference_ratio
+
+    mask = corrected[FIXATION_CSV_KEY_EYE_V] < DICTIONARY_BOUNDARY_RATIO
+    corrected.loc[mask, FIXATION_CSV_KEY_EYE_V] = corrected.loc[mask, FIXATION_CSV_KEY_EYE_V] - dy
+    return corrected, dy, len(cleaned)
+
+
 def count_dictionary_grid_gap_fixations(tm: TrialManager):
     """
     Number of fixations in the y-band SearchFinder itself doesn't currently treat as

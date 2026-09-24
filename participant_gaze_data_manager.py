@@ -120,6 +120,33 @@ def extract_last_calibration_message(messages):
     return last
 
 
+class EventExcludedError(ValueError):
+    """
+    Raised when NO panel of a calibration event can be used at all (every panel failed the
+    accuracy/NaN-ratio eye-selection policy). Carries panel_details - one dict per panel of
+    this event with the full accuracy/NaN-ratio breakdown for both eyes - so callers can
+    report exactly why, per panel, instead of only a summary string.
+    """
+    def __init__(self, message, panel_details):
+        super().__init__(message)
+        self.panel_details = panel_details
+
+
+def _other_errors_note(l_acc, r_acc, l_nan_pct, r_nan_pct):
+    """
+    Secondary-criterion note for an excluded panel: flags an eye whose exclusion is
+    "overdetermined" - i.e. it fails BOTH accuracy and NaN-ratio simultaneously, not just
+    whichever one was the stated primary reason. Blank when no eye double-fails.
+    """
+    notes = []
+    for label, acc, nan_pct in (("left", l_acc, l_nan_pct), ("right", r_acc, r_nan_pct)):
+        acc_bad = acc is not None and acc >= ACCURACY_EXCLUSION_THRESHOLD_DEG
+        nan_bad = nan_pct is not None and nan_pct >= MAX_VALID_NAN_VALUES * 100
+        if acc_bad and nan_bad:
+            notes.append(f"{label} eye also fails both criteria (acc={acc:.2f}, NaN={nan_pct:.1f}%)")
+    return "; ".join(notes)
+
+
 class ParticipantGazeDataManager:
     def __init__(self, participant_name, main_data_path, task = "SDMT", participant_group = "pwMS", clean_gaze_data = True, analysis_eye = None) -> None:
         """
@@ -169,7 +196,20 @@ class ParticipantGazeDataManager:
                     except Exception:
                         recording_date = None
                     for reason in panel_failure_reasons:
-                        self.panel_load_errors.append({"recording_date": recording_date, "error": reason})
+                        self.panel_load_errors.append({"recording_date": recording_date, **reason})
+            except EventExcludedError as e:
+                # Whole-event failure with a full per-panel accuracy/NaN-ratio breakdown
+                # (e.panel_details, one dict per panel of this event) - kept as an EXTRA key
+                # on a single load_errors entry (rather than expanding to 3 rows here) so
+                # existing one-row-per-event consumers (e.g. calibration_quality_analysis.py)
+                # are unaffected; a report that wants the per-panel breakdown can read
+                # panel_details itself (see build_exclusion_report.py).
+                try:
+                    recording_date = self.get_creation_time(mat_file)
+                except Exception:
+                    recording_date = None
+                self.load_errors.append({"recording_date": recording_date, "error": str(e),
+                                          "panel_details": e.panel_details})
             except Exception as e:
                 try:
                     recording_date = self.get_creation_time(mat_file)
@@ -446,6 +486,19 @@ class ParticipantGazeDataManager:
 
         # Extract messages
         messages = data['messages']
+
+        # Resolved early (moved up from the end of this function) so panel-level messages
+        # below can name panels by their actual short code (e.g. "i1", "l4") instead of
+        # their presentation-order index - same resolution group_task_info uses.
+        if self.task == "KD":
+            task_data = {"dummy": None, "1": None, "0": None, "2": None, "00": None, "3": None, "000": None}  # TODO: how to get the real task results.
+        elif self.task == "SDMT":
+            task_data = data["task_data"].__dict__
+        panel_codes = [(name[-2:]).replace("_", "").lower() for name in list(task_data.keys())[1::2]]
+
+        def _panel_label(i):
+            return panel_codes[i] if i < len(panel_codes) else f"panel_{i + 1}"
+
         # Find indices for presentation times of each panel and break
         panel_indices , break_indices = self.break_mat_into_pannels(messages)
         # Ensure we found the expected number of indices
@@ -463,11 +516,29 @@ class ParticipantGazeDataManager:
                             (data['data'].gaze.systemTimeStamp < break_start_times[i]))[0]
             panel_presentation_indices.append(indices)
 
-        # Dom_Eye is kept for reference/audit only (see KEY_CALIBRATION_INFO's
-        # dominant_eye) - it no longer plays any role in eye selection (decision
-        # 2026-09-07 below has no dominant-eye fallback branch at all: an event with no
-        # calibration message can't have its accuracy checked, so it's excluded outright).
         Dom_Eye = data['Dom_Eye']
+        # A few recordings have Dom_Eye typed in Hebrew (keyboard-locale slip during the
+        # experiment) instead of English 'r'/'l' - e.g. YO399's second event. Normalize
+        # the known variants rather than losing that event's panels to an assertion error.
+        HEBREW_EYE_ALIASES = {'ר': 'r', 'ך': 'l'}
+        if Dom_Eye in HEBREW_EYE_ALIASES:
+            Dom_Eye = HEBREW_EYE_ALIASES[Dom_Eye]
+
+        # Decision 2026-09-22: default to the participant's own dominant eye,
+        # unconditionally, for every panel - accuracy-based per-panel eye selection
+        # (decision 2026-09-07, the big `else` block below) is disregarded for now. A
+        # cross-participant check found the dominant eye is NOT reliably the
+        # better-calibrated one (calibration accuracy in degrees and dominance were
+        # mildly ANTI-correlated, p=9e-6 - see after_analysis_quality_checks_17_09_26/
+        # eye_accuracy_dominant_vs_nondominant.png), so "best calibrated" was routinely
+        # overriding genuine dominant-eye tracking. Reuses the existing explicit-override
+        # branch just below (originally for a caller-forced eye) rather than duplicating
+        # its NaN-ratio-per-panel logic - passing analysis_eye explicitly still overrides
+        # this default. The accuracy-based branch is left in place, just unreachable by
+        # default, in case this decision is revisited.
+        _eye_was_explicit = analysis_eye is not None
+        if analysis_eye is None:
+            analysis_eye = Dom_Eye
 
         def _nan_ratio(gaze_2d, indices):
             panel_data = np.concatenate((gaze_2d[:, indices].T, np.reshape(tobi_ts[indices], (-1, 1))), axis=1)
@@ -479,11 +550,44 @@ class ParticipantGazeDataManager:
         panel_failure_reasons = []
 
         if analysis_eye is not None:
-            # Explicit override: unconditionally use this eye (no accuracy check) - still
-            # subject to the per-panel NaN-ratio gate, and a panel that fails it is simply
-            # dropped rather than failing the whole event (same per-panel policy as below).
+            # Explicit override: unconditionally use this eye - still subject to the
+            # per-panel NaN-ratio gate, and a panel that fails it is simply dropped rather
+            # than failing the whole event (same per-panel policy as below). No accuracy
+            # check here - an explicit override is meant to bypass that by design (e.g.
+            # for a caller deliberately testing one specific eye).
+            #
+            # But when this branch is running because analysis_eye defaulted to the
+            # dominant eye (not an explicit override), accuracy exclusion is back
+            # (2026-09-22 decision, restoring the 2026-09-07 accuracy gate): the dominant
+            # eye is still used unconditionally for selection, but if its own calibration
+            # accuracy doesn't clear the threshold, the whole event is excluded exactly as
+            # the old per-eye-accuracy policy would have.
             forced_eye = analysis_eye.lower()
             assert forced_eye in ['r', 'l'], f'analysis_eye must be "r" or "l", got {analysis_eye!r}'
+
+            if not _eye_was_explicit:
+                found = extract_last_calibration_message(messages)
+                calib_parsed = parse_calibration_quality_message(found[1]) if found is not None else None
+                eye_key = 'left' if forced_eye == 'l' else 'right'
+                average = (calib_parsed[eye_key]['average'] if calib_parsed else None) or {}
+                dom_acc = average.get('acc')
+                if dom_acc is None or dom_acc >= ACCURACY_EXCLUSION_THRESHOLD_DEG:
+                    acc_txt = f"{dom_acc:.2f}" if dom_acc is not None else "unknown"
+                    event_panels = ", ".join(_panel_label(i) for i in range(3))
+                    panel_details = [{
+                        "panel": _panel_label(i),
+                        "error": f"panel {_panel_label(i)}: dominant eye ('{forced_eye}') calibration "
+                                 f"accuracy={acc_txt} deg is not under {ACCURACY_EXCLUSION_THRESHOLD_DEG} deg",
+                        "l_acc": dom_acc if forced_eye == 'l' else None,
+                        "r_acc": dom_acc if forced_eye == 'r' else None,
+                        "l_nan_pct": None, "r_nan_pct": None, "other_errors": "",
+                    } for i in range(3)]
+                    raise EventExcludedError(
+                        f"Dominant eye ('{forced_eye}') calibration accuracy={acc_txt} deg is not under "
+                        f"{ACCURACY_EXCLUSION_THRESHOLD_DEG} deg - event excluded (panels: {event_panels})",
+                        panel_details,
+                    )
+
             selected_gaze = right_gaze if forced_eye == 'r' else left_gaze
             for i in range(3):
                 indices = panel_presentation_indices[i]
@@ -491,12 +595,15 @@ class ParticipantGazeDataManager:
                 if nan_ratio < MAX_VALID_NAN_VALUES:
                     gaze_data[f'panel_{i + 1}'] = panel_data
                     panel_eye_used[f'panel_{i + 1}'] = forced_eye
-                    panel_eye_reason[f'panel_{i + 1}'] = "explicit_override"
+                    panel_eye_reason[f'panel_{i + 1}'] = "explicit_override" if _eye_was_explicit else "dominant_eye_default"
                 else:
-                    panel_failure_reasons.append(
-                        f"panel {i + 1}: forced eye '{forced_eye}' NaN ratio={nan_ratio:.1%} "
-                        f"(>= {MAX_VALID_NAN_VALUES:.0%})"
-                    )
+                    panel_failure_reasons.append({
+                        "panel": _panel_label(i),
+                        "error": f"panel {_panel_label(i)}: forced eye '{forced_eye}' NaN ratio={nan_ratio:.1%} "
+                                 f"(>= {MAX_VALID_NAN_VALUES:.0%})",
+                        "l_acc": None, "r_acc": None, "l_nan_pct": None, "r_nan_pct": None,
+                        "other_errors": "",
+                    })
         else:
             # Eye selection + exclusion policy (decision 2026-09-07): accuracy and NaN ratio
             # are evaluated jointly, per panel, instead of accuracy picking one eye for the
@@ -526,30 +633,55 @@ class ParticipantGazeDataManager:
             acc_ok = {eye: (acc[eye] is not None and acc[eye] < ACCURACY_EXCLUSION_THRESHOLD_DEG)
                       for eye in ('l', 'r')}
 
+            # NaN ratio is computed for BOTH eyes on every panel unconditionally (not just
+            # the eye(s) that pass accuracy) purely for reporting - so an excluded panel's
+            # full accuracy/NaN-ratio picture is always available, even for the eye that was
+            # never actually a candidate.
+            gaze_by_eye = {'l': left_gaze, 'r': right_gaze}
+            nan_pct = {'l': [None, None, None], 'r': [None, None, None]}
+            panel_data_by_eye = {'l': [None, None, None], 'r': [None, None, None]}
+            for i in range(3):
+                indices = panel_presentation_indices[i]
+                for eye in ('l', 'r'):
+                    panel_data, ratio = _nan_ratio(gaze_by_eye[eye], indices)
+                    nan_pct[eye][i] = ratio * 100
+                    panel_data_by_eye[eye][i] = panel_data
+
             if not acc_ok['l'] and not acc_ok['r']:
                 l_txt = f"{acc['l']:.2f}" if acc['l'] is not None else "unknown"
                 r_txt = f"{acc['r']:.2f}" if acc['r'] is not None else "unknown"
-                raise ValueError(
+                event_panels = ", ".join(_panel_label(i) for i in range(3))
+                panel_details = [{
+                    "panel": _panel_label(i),
+                    "error": f"panel {_panel_label(i)}: neither eye's calibration accuracy is under "
+                             f"{ACCURACY_EXCLUSION_THRESHOLD_DEG} deg (left={l_txt}, right={r_txt})",
+                    "l_acc": acc['l'], "r_acc": acc['r'],
+                    "l_nan_pct": nan_pct['l'][i], "r_nan_pct": nan_pct['r'][i],
+                    "other_errors": _other_errors_note(acc['l'], acc['r'], nan_pct['l'][i], nan_pct['r'][i]),
+                } for i in range(3)]
+                raise EventExcludedError(
                     f"Neither eye's calibration accuracy is under {ACCURACY_EXCLUSION_THRESHOLD_DEG} "
-                    f"deg (left={l_txt}, right={r_txt}) - event excluded"
+                    f"deg (left={l_txt}, right={r_txt}) - event excluded (panels: {event_panels})",
+                    panel_details,
                 )
 
-            gaze_by_eye = {'l': left_gaze, 'r': right_gaze}
             for i in range(3):
-                indices = panel_presentation_indices[i]
                 candidates = []
                 for eye in ('l', 'r'):
                     if not acc_ok[eye]:
                         continue
-                    panel_data, nan_ratio = _nan_ratio(gaze_by_eye[eye], indices)
-                    if nan_ratio < MAX_VALID_NAN_VALUES:
-                        candidates.append((eye, acc[eye], nan_ratio, panel_data))
+                    if nan_pct[eye][i] / 100 < MAX_VALID_NAN_VALUES:
+                        candidates.append((eye, acc[eye], nan_pct[eye][i], panel_data_by_eye[eye][i]))
 
                 if not candidates:
-                    panel_failure_reasons.append(
-                        f"panel {i + 1}: no eye both has accuracy < {ACCURACY_EXCLUSION_THRESHOLD_DEG} "
-                        f"deg and NaN ratio < {MAX_VALID_NAN_VALUES:.0%}"
-                    )
+                    panel_failure_reasons.append({
+                        "panel": _panel_label(i),
+                        "error": f"panel {_panel_label(i)}: no eye both has accuracy < {ACCURACY_EXCLUSION_THRESHOLD_DEG} "
+                                 f"deg and NaN ratio < {MAX_VALID_NAN_VALUES:.0%}",
+                        "l_acc": acc['l'], "r_acc": acc['r'],
+                        "l_nan_pct": nan_pct['l'][i], "r_nan_pct": nan_pct['r'][i],
+                        "other_errors": _other_errors_note(acc['l'], acc['r'], nan_pct['l'][i], nan_pct['r'][i]),
+                    })
                     continue
 
                 # Best accuracy wins; tie-break by lower NaN ratio (only matters in the rare
@@ -563,12 +695,14 @@ class ParticipantGazeDataManager:
                 )
 
         if not gaze_data:
-            raise ValueError(
-                "No panel passed eye-selection/NaN-ratio criteria: " + "; ".join(panel_failure_reasons)
+            raise EventExcludedError(
+                "No panel passed eye-selection/NaN-ratio criteria: "
+                + "; ".join(d["error"] for d in panel_failure_reasons),
+                panel_failure_reasons,
             )
         if panel_failure_reasons:
             print(f"Warning: dropping panel(s) that failed eye-selection/NaN-ratio criteria "
-                  f"for {self.name}: {'; '.join(panel_failure_reasons)}")
+                  f"for {self.name}: {'; '.join(d['error'] for d in panel_failure_reasons)}")
 
         # Calculate presentation durations
         presentation_info = {}
@@ -579,11 +713,6 @@ class ParticipantGazeDataManager:
                 'duration': break_start_times[i] - panel_start_times[i]
             }
 
-        # Extract time_of_slides
-        if self.task == "KD":
-            task_data = {"dummy": None, "1":None, "0":None,"2": None, "00":None, "3":None, "000":None} # TODO: how to get the real task results.
-        elif self.task == "SDMT":
-            task_data = data["task_data"].__dict__
         return task_data, messages, gaze_data, presentation_info, Dom_Eye, panel_eye_used, panel_eye_reason, panel_failure_reasons
     
     def break_mat_into_pannels(self, mat_file_messages):

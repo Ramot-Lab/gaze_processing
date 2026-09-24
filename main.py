@@ -1,16 +1,20 @@
-# from markov_matrix_visualizer import MarkovVisualizer
+import sys
+
+from markov_matrix_visualizer import MarkovVisualizer
 from behavioral_analyzer import BehavioralAnalyzer
 from markov_core import AnalysisConfig
 from markov_loader import DataManager
 from markov_analyzer import MarkovAnalyzer
+from pipeline_config import ANNOTATION_METHODS
 
-def run_pipeline():
-    
+def run_pipeline(annotation_method="threshold_based"):
+
     tasks = [
         # #----------------  WITHOUT REPEATS  ----------------#
         # 1.  with Enter, Exit + All Panels
-        AnalysisConfig(with_repeats=False, only_1_to_9=False, use_mean_matrix=False, from_scratch=False),
-        
+        AnalysisConfig(with_repeats=False, only_1_to_9=False, use_mean_matrix=False, from_scratch=True,
+                       annotation_method=annotation_method),
+
         # # 2. with Enter, Exit + Mean Matrix
         # AnalysisConfig(with_repeats=False, only_1_to_9=False, use_mean_matrix=True, from_scratch=False),
         
@@ -62,6 +66,8 @@ def run_pipeline():
         loader = DataManager(config)
         loader.load_participants_and_scores()
         loader.load_or_compute_matrices(from_scratch=config.from_scratch)
+        if config.from_scratch:
+            loader.save_exclusion_log()
         
         #--------------- Get Data ---------------#
         participants = loader.get_flat_participants()
@@ -71,19 +77,19 @@ def run_pipeline():
         # print("\n--- Running Markov Analysis ---")
 
         analyzer = MarkovAnalyzer(participants, config)
-        
-        # A. PCA Analysis (Includes the Colored Plots loop)
-        # analyzer.run_pca()
-        
+
+        # A. PCA Analysis (Includes the Colored Plots loop: scatter, weights heatmap, elbow)
+        analyzer.run_pca()
+
         # B. Consistency Analysis (Violin + Permutation)
         analyzer.run_consistency_analysis(n_permutations=1000)
-        # #3. Visualize results (Optional)
-        # viz = MarkovVisualizer(output_dir=config.full_output_path)
 
-        # for p in participants:
-        #     for panel in p.matrices.keys():
-        #         viz.plot_heatmap(p, panel)
-                # viz.plot_graph(p, panel)
+        # C. Per-participant/panel matrix visualization (heatmap + graph)
+        viz = MarkovVisualizer(output_dir=config.plot_output_path)
+        for p in participants:
+            for panel in p.matrices.keys():
+                viz.plot_heatmap(p, panel)
+                viz.plot_graph(p, panel)
 
 
         # ---------------------------------------------------------
@@ -114,4 +120,10 @@ def run_pipeline():
         # # behav_analyzer.analyze_correlations_with_score()
 
 if __name__ == "__main__":
-    run_pipeline()
+    if len(sys.argv) > 1:
+        if sys.argv[1] not in ANNOTATION_METHODS:
+            print(f"usage: python main.py [{'|'.join(ANNOTATION_METHODS)}]")
+            sys.exit(1)
+        run_pipeline(sys.argv[1])
+    else:
+        run_pipeline()

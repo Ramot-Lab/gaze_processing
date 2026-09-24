@@ -5,17 +5,33 @@ from dataclasses import dataclass
 from collections import defaultdict
 import warnings
 
+import pipeline_config
+
 @dataclass
 class AnalysisConfig:
-    with_repeats: bool      
-    only_1_to_9: bool       
-    use_mean_matrix: bool   
+    with_repeats: bool
+    only_1_to_9: bool
+    use_mean_matrix: bool
     from_scratch: bool
     concat_panels: bool = False
 
-    raw_behavior_path: str = "/Volumes/ramot/Noam_M/Results/Behavior"
-    output_base_path: str = "/Volumes/ramot/Noam_M/preliminary_results"
-    
+    # Which Stage-1 annotation method this analysis reads from
+    # (pipeline_config.ANNOTATION_METHODS) - drives both which annotated CSVs get read
+    # and which preliminary_results_<method> folder output lands in.
+    annotation_method: str = "threshold_based"
+
+    # None means "derive from pipeline_config using annotation_method" - resolved in
+    # __post_init__ rather than as a dataclass default, since the value depends on
+    # another field (annotation_method) and on the live network mount.
+    raw_behavior_path: str = None
+    output_base_path: str = None
+
+    def __post_init__(self):
+        if self.raw_behavior_path is None:
+            self.raw_behavior_path = pipeline_config.main_data_path()
+        if self.output_base_path is None:
+            self.output_base_path = pipeline_config.preliminary_results_dir(self.annotation_method)
+
     @property
     def folder_name(self):
         repeat_str = "WITH_repeats" if self.with_repeats else "NO_repeats"

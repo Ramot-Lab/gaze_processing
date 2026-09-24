@@ -8,6 +8,7 @@ from markov_core import Participant, AnalysisConfig
 from gaze_markov_model import GazeMarkovModel
 from trial_manager import TrialManager
 from participant_gaze_data_manager import ParticipantGazeDataManager
+import pipeline_config
 
 PANELS = ["0", "i1", "l4", "a3", "a5", "l3"]
 
@@ -15,12 +16,26 @@ class DataManager:
     def __init__(self, config: AnalysisConfig):
         self.cfg = config
         self.participants = {"HC": {}, "pwMS": {}}
-        
+
         self.matrix_save_dir = os.path.join(self.cfg.main_output_path, "markov_matrices")
         os.makedirs(self.matrix_save_dir, exist_ok=True)
 
         self.score_save_dir = os.path.join(self.cfg.output_base_path, "behavior_scores")
         os.makedirs(self.score_save_dir, exist_ok=True)
+
+        # One row per participant/panel dropped during load_or_compute_matrices - saved to
+        # exclusion_log.csv the same way Stage 1 logs its own drops, so both stages'
+        # exclusions are comparable across methods.
+        self.exclusions = []
+
+    def _log_exclusion(self, participant, group, panel, reason):
+        self.exclusions.append({"participant": participant, "group": group, "panel": panel, "reason": reason})
+
+    def save_exclusion_log(self):
+        out_path = os.path.join(pipeline_config.markov_output_dir(self.cfg.annotation_method), "exclusion_log.csv")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        pd.DataFrame(self.exclusions).to_csv(out_path, index=False)
+        print(f"Saved {len(self.exclusions)} exclusion rows to {out_path}")
 
     def _is_matrix_valid(self, df):
         """
@@ -120,110 +135,6 @@ class DataManager:
         df.to_csv(save_path, index=False)
         print(f"✓ Score table saved/updated: {save_path}")
 
-
-    # def load_or_compute_matrices(self, from_scratch=False):
-    #     """
-    #     OPTIMIZED: Loads raw data only once per participant.
-    #     """
-    #     print(f"--- Processing Matrices for: {self.cfg.folder_name} ---")
-        
-    #     # Iterate Participants
-    #     for group in ["HC", "pwMS"]:
-    #         # Use list(items) to safely iterate
-    #         for p_name, p_obj in list(self.participants[group].items()):
-                
-    #             user_folder = os.path.join(self.matrix_save_dir, group, p_name)
-    #             os.makedirs(user_folder, exist_ok=True)
-                
-    #             # Check which panels are missing
-    #             missing_panels = []
-    #             for panel in PANELS:
-    #                 csv_path = os.path.join(user_folder, f"matrix_{p_name}_{panel}.csv")
-    #                 if from_scratch or not os.path.exists(csv_path):
-    #                     missing_panels.append(panel)
-    #                 else:
-    #                     # Load existing
-    #                     try:
-    #                         df = pd.read_csv(csv_path, index_col=0)
-    #                         p_obj.add_matrix(panel, df)
-    #                     except:
-    #                         missing_panels.append(panel)
-
-    #             # OPTIMIZATION: Only load raw data if we actually need to compute something
-    #             if missing_panels:
-    #                 try:
-    #                     # Load Raw Data ONCE
-    #                     print(f"Loading raw data for {p_name}...") 
-    #                     p_data = ParticipantGazeDataManager(p_name, self.cfg.raw_behavior_path, "SDMT", group)
-                        
-    #                     # Process all missing panels with this one object
-    #                     for panel in missing_panels:
-    #                         df = self._compute_matrix_with_loaded_data(p_data, panel)
-    #                         if df is not None:
-    #                             csv_path = os.path.join(user_folder, f"matrix_{p_name}_{panel}.csv")
-    #                             df.to_csv(csv_path)
-    #                             p_obj.add_matrix(panel, df)
-                                
-    #                 except Exception as e:
-    #                     print(f"Error loading raw data for {p_name}: {e}")
-
-    #             p_obj.compute_mean_matrix()
-
-    # def load_or_compute_matrices(self, from_scratch=False):
-    #     print(f"--- Processing Matrices & Features for: {self.cfg.folder_name} ---")
-        
-    #     for group in self.participants.keys():
-    #         for p_name, p_obj in list(self.participants[group].items()):
-    #             print(f" - loading information for {p_name} - ")
-                
-    #             user_folder = os.path.join(self.matrix_save_dir, group, p_name)
-    #             os.makedirs(user_folder, exist_ok=True)
-                
-    #             # 1. Load Existing Matrices
-    #             missing_panels = []
-    #             for panel in PANELS:
-    #                 csv_path = os.path.join(user_folder, f"markov_matrix_{p_name}_panel_{panel}.csv")
-    #                 if from_scratch or not os.path.exists(csv_path):
-    #                     missing_panels.append(panel)
-    #                 else:
-    #                     try:
-    #                         df = pd.read_csv(csv_path, index_col=0)
-    #                         if self._is_matrix_valid(df):
-    #                             p_obj.add_matrix(panel, df)
-    #                         else:
-    #                             print(f" matrix invalid for panel {panel}, {p_name}")
-    #                     except Exception as e:
-    #                         print(f"Warning: Could not load matrix for {p_name} panel {panel}: {e}")
-                
-    #             # 2. Compute Extra Features & Missing Matrices
-    #             try:
-    #                 p_data = ParticipantGazeDataManager(p_name, self.cfg.raw_behavior_path, "SDMT", group)
-                    
-    #                 # A. Compute Missing Matrices
-    #                 for panel in missing_panels:
-    #                     df = self._compute_matrix_with_loaded_data(p_data, panel)
-    #                     if df is not None:
-    #                         csv_path = os.path.join(user_folder, f"markov_matrix_{p_name}_panel_{panel}.csv")
-    #                         df.to_csv(csv_path)
-    #                         p_obj.add_matrix(panel, df)
-                    
-                    # B. Compute Extra Features (Dispersion, Duration, etc.)
-                    # for panel in PANELS:
-                    #     # Only compute for panels we actually have data for
-                    #     if panel not in p_obj.matrices and panel not in missing_panels: 
-                    #         continue
-                        
-                        # dur = self._calculate_duration(p_data, panel)
-                        # p_obj.add_panel_feature(panel, "Duration", dur)
-                        
-                        # disp = self._calculate_dispersion(p_data, panel)
-                        # p_obj.add_panel_feature(panel, "Dispersion", disp)
-
-                # except Exception as e:
-                #     pass
-
-                # p_obj.compute_mean_matrix()
-
     def load_or_compute_matrices(self, from_scratch=False):
         """
         Simplified Logic:
@@ -244,29 +155,36 @@ class DataManager:
                 # =========================================================
                 if from_scratch:
                     try:
-                        # Initialize raw data reader
-                        p_data = ParticipantGazeDataManager(p_name, self.cfg.raw_behavior_path, "SDMT", group)
-                        
-                        for panel in PANELS:
-                            # 1. Compute
-                            result = self._compute_matrix_with_loaded_data(p_data, panel)
-                            
-                            # 2. Validate & Save
-                            if result is not None:
-                                matrix_df, trial_stats_df = result
-
-                                csv_path = os.path.join(user_folder, f"markov_matrix_{p_name}_panel_{panel}.csv")
-                                matrix_df.to_csv(csv_path)
-                                p_obj.add_matrix(panel, matrix_df)
-
-                                if trial_stats_df is not None:
-                                    trial_path = os.path.join(user_folder, f"trial_stats_{p_name}_panel_{panel}.csv")
-                                    trial_stats_df.to_csv(trial_path, index=False)
-                                    p_obj.add_trial_data(panel, trial_stats_df)
-
+                        # Full path, not bare p_name - required for sd.group/self.name to
+                        # come out right inside ParticipantGazeDataManager.
+                        subject_dir = os.path.join(self.cfg.raw_behavior_path, group, p_name)
+                        p_data = ParticipantGazeDataManager(subject_dir, self.cfg.raw_behavior_path, "SDMT", group)
                     except Exception as e:
-                        print(f"Error computing fresh data for {p_name}: {e}")
-                        pass
+                        print(f"Error loading participant data for {p_name}: {e}")
+                        self._log_exclusion(p_name, group, None, f"participant_load_error: {type(e).__name__}: {e}")
+                        continue
+
+                    # One panel's failure must not abort the participant's other panels -
+                    # each panel gets its own try/except, not one shared around the loop.
+                    for panel in PANELS:
+                        try:
+                            result, fail_reason = self._compute_matrix_with_loaded_data(p_data, panel, group=group)
+                        except Exception as e:
+                            result, fail_reason = None, f"unexpected: {type(e).__name__}: {e}"
+
+                        if result is None:
+                            self._log_exclusion(p_name, group, panel, fail_reason or "unknown")
+                            continue
+
+                        matrix_df, trial_stats_df = result
+                        csv_path = os.path.join(user_folder, f"markov_matrix_{p_name}_panel_{panel}.csv")
+                        matrix_df.to_csv(csv_path)
+                        p_obj.add_matrix(panel, matrix_df)
+
+                        if trial_stats_df is not None:
+                            trial_path = os.path.join(user_folder, f"trial_stats_{p_name}_panel_{panel}.csv")
+                            trial_stats_df.to_csv(trial_path, index=False)
+                            p_obj.add_trial_data(panel, trial_stats_df)
 
                 # =========================================================
                 # MODE 2: LOAD EXISTING ONLY (Do not compute missing)
@@ -300,19 +218,49 @@ class DataManager:
                 # Finally, compute Mean Matrix if applicable
                 p_obj.compute_mean_matrix()
 
-    def _compute_matrix_with_loaded_data(self, p_data, panel):
+    def _compute_matrix_with_loaded_data(self, p_data, panel, group=None):
+        """
+        p_data is still a live ParticipantGazeDataManager - TrialManager needs it for
+        message/press timing (PanelMessages) and the panel image, neither of which is
+        part of the saved gaze-annotation CSV. What this DOES skip is re-running
+        annotation live (annotate_gaze_events): the gaze+evt data is loaded straight from
+        Stage 1's saved CSV for self.cfg.annotation_method instead, which matters a lot
+        for model_based (skips re-running inference here). If Stage 1 excluded this
+        participant/panel, that's reported as-is (prefixed "preprocessing_exclusion:")
+        instead of falling back to live annotation and re-discovering the same gap as a
+        fresh, confusingly-labeled failure. Only falls back to live annotation if Stage 1
+        genuinely has no record of this participant/panel at all (e.g. it hasn't been run
+        for this method/date yet), so this can still work before or without Stage 1.
+        """
         try:
-            trial_mgr = TrialManager(p_data, panel)
+            group = group or p_data.group
+            try:
+                # corrected=True (decision 2026-09-22): Markov chain analysis's ROI
+                # matching is y-value-dependent (dictionary-area search sequencing), so it
+                # always reads the whole-dictionary-drift-corrected gaze, not raw.
+                annotated_data = pipeline_config.load_annotated_csv(
+                    self.cfg.annotation_method, group, p_data.name, panel, corrected=True)
+            except FileNotFoundError:
+                stage1_reason = pipeline_config.stage1_exclusion_reason(
+                    self.cfg.annotation_method, p_data.name, panel)
+                if stage1_reason is not None:
+                    return None, f"preprocessing_exclusion: {stage1_reason}"
+                print(f"  no Stage-1 CSV for {p_data.name}/{panel}/{self.cfg.annotation_method} - "
+                      f"falling back to live annotation")
+                annotated_data = None
+
+            trial_mgr = TrialManager(p_data, panel, annotated_data=annotated_data,
+                                      annotation_method=self.cfg.annotation_method)
             trial_df_stats = trial_mgr.add_trial_statistics_dataframe()
             gaze_model = GazeMarkovModel(trial_mgr.trials, only_keys=self.cfg.only_1_to_9)
             raw_df = gaze_model.get_probability_matrix(clean=not self.cfg.with_repeats)
             if self._is_matrix_valid(raw_df) is False:
-                return None
-            return raw_df, trial_df_stats
+                return None, "invalid/empty transition matrix"
+            return (raw_df, trial_df_stats), None
         except Exception as e:
-            print(f"Error computing matrix for panel {panel}, participant {p_data.participant_name}: {e}")
+            print(f"Error computing matrix for panel {panel}, participant {p_data.name}: {e}")
             print(trial_df_stats if 'trial_df_stats' in locals() else "No trial stats available.")
-            return e
+            return None, f"{type(e).__name__}: {e}"
 
     # def _calculate_duration(self, p_data, panel):
     #     try:

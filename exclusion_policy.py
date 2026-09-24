@@ -24,17 +24,36 @@ Participant-level criterion (still a pure downstream filter, unaffected by the a
   Tobii_Sucks == "YES" in the behavioral summary table - a manual "this participant's
   eye-tracking data is unusable" flag from outside this pipeline. Excludes the participant
   outright, in every analysis.
+
+Manual, hand-curated exclusions (decision 2026-09-22): a handful of participants excluded
+outright by direct inspection (e.g. the after_analysis_quality_checks_17_09_26 Tobii_Sucks
+video review), for reasons the automatic criteria above don't (yet) catch - kept here,
+with a reason per participant, rather than silently dropped, so the exclusion_log.csv row
+run_preprocessing.py logs for each one is traceable back to why.
 """
 import pandas as pd
 
 DEFAULT_TOBII_SUCKS_XLSX = "/Volumes/ramot/Noam_M/df_filtered_behavioral_summary_20260427_131437.xlsx"
-ACCURACY_EXCLUSION_THRESHOLD_DEG = 2.0
+ACCURACY_EXCLUSION_THRESHOLD_DEG = 2.5
+
+MANUALLY_EXCLUDED_PARTICIPANTS = {
+    "OY974": "HC control who didn't care/engage with the task - not representative",
+    "YO399": "HC control who didn't care/engage with the task - not representative",
+    "SA803": "eyes jump too much - excessive/erratic saccadic movement",
+    "YN187": "expected to already fail the accuracy exclusion criterion; listed here explicitly as a backup",
+    "YR573": "HC control who didn't care/engage with the task - not representative",
+}
 
 
 def load_tobii_sucks_excluded_participants(xlsx_path=DEFAULT_TOBII_SUCKS_XLSX):
     """Set of Patient_IDs flagged Tobii_Sucks == 'YES' in the behavioral summary table."""
     df = pd.read_excel(xlsx_path)
     return set(df.loc[df["Tobii_Sucks"].astype(str).str.upper() == "YES", "Patient_ID"])
+
+
+def load_manually_excluded_participants():
+    """{participant: reason} for the hand-curated exclusions above."""
+    return dict(MANUALLY_EXCLUDED_PARTICIPANTS)
 
 
 def passes_accuracy_threshold(used_acc, threshold_deg=ACCURACY_EXCLUSION_THRESHOLD_DEG):
