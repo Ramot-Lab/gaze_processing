@@ -1,4 +1,5 @@
 import math
+import os
 from enum import Enum
 
 KEY_TOBII_DATA = "tobii_data"  # Key for Tobii eye movement data
@@ -107,7 +108,9 @@ FIXATION_IDX = 1
 THRESHOLD_FOR_MARKOV_DIAGRAM = 1/11  # Minimum transition probability to include an edge in the Markov diagram
 
 class ModelPropertise(Enum):
-    MODEL_PATH = "/Users/noammizrachi/Documents/Msc/Ramot lab/data analysis/gaze_processing/GazeModel/gazeNET_0004_00003750.pth.tar"
+    # Relative to this file's own location (not a hardcoded path on one machine) so the
+    # weights, checked into the repo under GazeModel/, resolve on any clone.
+    MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "GazeModel", "gazeNET_0004_00003750.pth.tar")
     EVENTS = [1,2,3]
 
 

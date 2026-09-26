@@ -41,8 +41,9 @@ def load(model, fpath_model):
 
         print ("done.")
     else:
-        epoch = 1
-        print ("Pretrained model not found")
+        raise FileNotFoundError(
+            "Pretrained model weights not found at %s - model_based annotation would "
+            "silently run with random (untrained) weights otherwise." % fpath_model)
     return model, epoch
 
 class SequenceWise(nn.Module):
