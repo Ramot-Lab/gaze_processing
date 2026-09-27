@@ -207,10 +207,22 @@ def stage1_exclusion_reason(method, participant, panel, date_str=None):
         csv_path = os.path.join(annotated_gaze_dir(method, date_str), "exclusion_log.csv")
         try:
             df = pd.read_csv(csv_path)
-            _stage1_exclusion_cache[key] = {(r["participant"], r["panel"]): r["reason"] for _, r in df.iterrows()}
+            cache = {}
+            for _, r in df.iterrows():
+                # A whole-participant exclusion (e.g. run_preprocessing.py's manual-
+                # exclusion check) logs ONE row with panel=NaN, not one row per panel -
+                # normalize to None so it's found as a fallback below (decision
+                # 2026-09-27, found via OY974 falling through to live re-annotation on
+                # a full-population run: every per-panel lookup missed that NaN-keyed
+                # row and reported "no reason found").
+                panel_key = None if pd.isna(r["panel"]) else r["panel"]
+                cache[(r["participant"], panel_key)] = r["reason"]
+            _stage1_exclusion_cache[key] = cache
         except Exception:
             _stage1_exclusion_cache[key] = {}
-    return _stage1_exclusion_cache[key].get((participant, panel))
+
+    cache = _stage1_exclusion_cache[key]
+    return cache.get((participant, panel), cache.get((participant, None)))
 
 
 EXCLUSION_SUMMARY_CSV = "analysis_participant_exclusion_summary.csv"

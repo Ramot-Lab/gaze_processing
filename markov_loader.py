@@ -43,7 +43,12 @@ class DataManager:
         self.exclusions.append({"participant": participant, "group": group, "panel": panel, "reason": reason})
 
     def save_exclusion_log(self):
-        out_path = os.path.join(pipeline_config.markov_output_dir(self.cfg.annotation_method), "exclusion_log.csv")
+        # self.cfg.main_output_path (derived from output_base_path) - NOT
+        # pipeline_config.markov_output_dir(), which always recomputes the global
+        # default location and silently ignores any output_base_path/date_str override
+        # (decision 2026-09-27, found via a consolidated/test run's exclusion log
+        # landing in the wrong, global folder instead of the intended one).
+        out_path = os.path.join(self.cfg.main_output_path, "exclusion_log.csv")
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         pd.DataFrame(self.exclusions).to_csv(out_path, index=False)
         print(f"Saved {len(self.exclusions)} exclusion rows to {out_path}")
@@ -233,16 +238,15 @@ class DataManager:
         """
         p_data is still a live ParticipantGazeDataManager - TrialManager needs it for
         message/press timing (PanelMessages) and the panel image, neither of which is
-        part of the saved gaze-annotation CSV. What this DOES skip is re-running
-        annotation live (annotate_gaze_events): the gaze+evt data is loaded straight from
-        Stage 1's saved CSV for self.cfg.annotation_method instead, which matters a lot
-        for model_based (skips re-running inference here). If Stage 1 excluded this
-        participant/panel, that's reported as-is (prefixed "preprocessing_exclusion:")
-        instead of falling back to live annotation and re-discovering the same gap as a
-        fresh, confusingly-labeled failure. Only falls back to live annotation if Stage 1
-        genuinely has no record of this participant/panel at all (e.g. it hasn't been run
-        for this method/date yet), so this can still work before or without Stage 1.
-        """
+        part of the saved gaze-annotation CSV. This NEVER re-runs annotation live
+        (annotate_gaze_events): the gaze+evt data is loaded straight from Stage 1's
+        saved CSV for self.cfg.annotation_method. If Stage 1 excluded this
+        participant/panel, that's reported as-is (prefixed "preprocessing_exclusion:").
+        If Stage 1 has no record of this participant/panel at all - genuinely missing,
+        not excluded - that's ALSO just reported and skipped (decision 2026-09-27: Stage
+        2/3 only ever reads Stage 1's saved output, live re-annotation here is disabled
+        by policy; recomputing model_based inference on demand is exactly the slow,
+        unattended-unfriendly cost Stage 1 exists to pay once, up front)."""
         try:
             group = group or p_data.group
             try:
@@ -257,9 +261,9 @@ class DataManager:
                     self.cfg.annotation_method, p_data.name, panel, date_str=self.cfg.date_str)
                 if stage1_reason is not None:
                     return None, f"preprocessing_exclusion: {stage1_reason}"
-                print(f"  no Stage-1 CSV for {p_data.name}/{panel}/{self.cfg.annotation_method} - "
-                      f"falling back to live annotation")
-                annotated_data = None
+                return None, (f"no Stage 1 annotated CSV found for {p_data.name}/{panel}/"
+                              f"{self.cfg.annotation_method} and no exclusion reason logged - "
+                              f"live re-annotation is disabled here by policy")
 
             trial_mgr = TrialManager(p_data, panel, annotated_data=annotated_data,
                                       annotation_method=self.cfg.annotation_method)

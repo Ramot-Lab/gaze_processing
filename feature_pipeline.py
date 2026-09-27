@@ -243,12 +243,13 @@ def load_scores(participants_dict, scores_csv=SCORES_CSV, data_path=NOAM_DATA_PA
 def build_trial_managers(participants, data_path=NOAM_DATA_PATH, annotation_method="threshold_based", date_str=None):
     """
     Loads the gaze+evt data for each panel from Stage 1's saved annotated CSV
-    (pipeline_config.load_annotated_csv) for annotation_method, instead of re-running
-    annotate_gaze_events live every time - matters most for model_based, which is
-    expensive to re-run. Falls back to live annotation (printed warning) if Stage 1
-    hasn't produced a given participant/panel yet. ParticipantGazeDataManager is still
-    constructed either way - TrialManager needs it for message/press timing and the
-    panel image, neither of which is part of the saved CSV.
+    (pipeline_config.load_annotated_csv) for annotation_method - NEVER re-runs
+    annotate_gaze_events live (decision 2026-09-27: Stage 2/3 only ever reads Stage 1's
+    saved output). A panel with no Stage 1 CSV and no logged exclusion reason is just
+    skipped (logged as its own exclusion reason), not recomputed on demand.
+    ParticipantGazeDataManager is still constructed either way - TrialManager needs it
+    for message/press timing and the panel image, neither of which is part of the
+    saved CSV.
 
     Returns (valid_participants, exclusions) - exclusions is a list of
     {participant, group, panel, reason} dicts, same shape as markov_loader.py's, so both
@@ -280,9 +281,14 @@ def build_trial_managers(participants, data_path=NOAM_DATA_PATH, annotation_meth
                             annotation_method, participant.name, panel, date_str=date_str)
                         if stage1_reason is not None:
                             raise FileNotFoundError(f"preprocessing_exclusion: {stage1_reason}")
-                        print(f"  no Stage-1 CSV for {participant.name}/{panel}/{annotation_method} - "
-                              f"falling back to live annotation")
-                        annotated_data = None
+                        # Decision 2026-09-27: live re-annotation is disabled here by
+                        # policy - Stage 2/3 only ever reads Stage 1's saved output, so
+                        # a genuinely missing (not excluded) CSV is just skipped, not
+                        # recomputed on demand.
+                        raise FileNotFoundError(
+                            f"no Stage 1 annotated CSV found for {participant.name}/{panel}/"
+                            f"{annotation_method} and no exclusion reason logged - live "
+                            f"re-annotation is disabled here by policy")
                     participant.trial_managers[panel] = TrialManager(
                         participant_data, panel, annotated_data=annotated_data,
                         annotation_method=annotation_method)
