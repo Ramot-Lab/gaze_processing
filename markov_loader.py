@@ -8,9 +8,17 @@ from markov_core import Participant, AnalysisConfig
 from gaze_markov_model import GazeMarkovModel
 from trial_manager import TrialManager
 from participant_gaze_data_manager import ParticipantGazeDataManager
+from run_preprocessing import iter_all_subject_dirs
+from exclusion_policy import load_manually_excluded_participants
 import pipeline_config
 
 PANELS = ["0", "i1", "l4", "a3", "a5", "l3"]
+
+# Decision 2026-09-27: a participant with fewer than this many valid per-panel transition
+# matrices isn't a reliable basis for a mean matrix - excluded from Markov analysis
+# entirely (kept out of get_flat_participants() via filter_by_min_panels), same as any
+# other Stage 1 drop, but logged with its own reason so it's traceable.
+MIN_PANELS_FOR_MARKOV = 4
 
 class DataManager:
     def __init__(self, config: AnalysisConfig):
@@ -20,8 +28,11 @@ class DataManager:
         self.matrix_save_dir = os.path.join(self.cfg.main_output_path, "markov_matrices")
         os.makedirs(self.matrix_save_dir, exist_ok=True)
 
+        # Nothing ever writes here (save_score_summary_table is dead code - never
+        # called) - _load_scores_for_participant only ever READS from this path
+        # (falling back to WAV-file parsing if it's missing), so the folder doesn't
+        # need to be pre-created (decision 2026-09-27).
         self.score_save_dir = os.path.join(self.cfg.output_base_path, "behavior_scores")
-        os.makedirs(self.score_save_dir, exist_ok=True)
 
         # One row per participant/panel dropped during load_or_compute_matrices - saved to
         # exclusion_log.csv the same way Stage 1 logs its own drops, so both stages'
@@ -239,10 +250,11 @@ class DataManager:
                 # matching is y-value-dependent (dictionary-area search sequencing), so it
                 # always reads the whole-dictionary-drift-corrected gaze, not raw.
                 annotated_data = pipeline_config.load_annotated_csv(
-                    self.cfg.annotation_method, group, p_data.name, panel, corrected=True)
+                    self.cfg.annotation_method, group, p_data.name, panel,
+                    date_str=self.cfg.date_str, corrected=True)
             except FileNotFoundError:
                 stage1_reason = pipeline_config.stage1_exclusion_reason(
-                    self.cfg.annotation_method, p_data.name, panel)
+                    self.cfg.annotation_method, p_data.name, panel, date_str=self.cfg.date_str)
                 if stage1_reason is not None:
                     return None, f"preprocessing_exclusion: {stage1_reason}"
                 print(f"  no Stage-1 CSV for {p_data.name}/{panel}/{self.cfg.annotation_method} - "
@@ -280,6 +292,75 @@ class DataManager:
     #         return (np.std(x) + np.std(y)) / 2.0
     #     except:
     #         return np.nan
+
+    def filter_by_min_panels(self, min_panels=MIN_PANELS_FOR_MARKOV):
+        """Drop participants with 1..min_panels-1 valid panel matrices from the analysis
+        population - some data, but not enough to trust a mean matrix built from it.
+        Participants with 0 panels are already excluded elsewhere (compute_mean_matrix
+        leaves mean_matrix=None, and get_flat_participants filters on that), so this only
+        needs to catch the partial case. Call after load_or_compute_matrices, before
+        save_exclusion_log so this shows up in the same exclusion_log.csv."""
+        for group in self.participants:
+            for p_name, p_obj in list(self.participants[group].items()):
+                n_panels = len(p_obj.matrices)
+                if 0 < n_panels < min_panels:
+                    self._log_exclusion(
+                        p_name, group, None,
+                        f"only {n_panels} valid panel matrice(s) for Markov analysis "
+                        f"(< {min_panels} required)")
+                    del self.participants[group][p_name]
+
+    def compute_exclusion_summary(self, min_panels=MIN_PANELS_FOR_MARKOV):
+        """One row of participant accounting for this analysis, categorized the way the
+        user wants to see it broken down: hardcoded (exclusion_policy's manual list),
+        panel_count (had some data but fewer than min_panels valid matrices), technical
+        (everything else - Stage 1's accuracy/NaN/saccade/never-visits-.../corrupted/
+        load-error drops, zero panels for any reason). Uses run_preprocessing's own
+        eligible-participant universe (excludes DONTUSE) as the denominator, and must be
+        called BEFORE filter_by_min_panels (needs the pre-filter panel counts). Also
+        reports the group/sex breakdown of the INCLUDED population specifically (same
+        source table as markov_analyzer.py's demographics annotation), so this one row
+        doubles as the same demographic accounting shown on every plot."""
+        import pandas as pd
+        from exclusion_policy import DEFAULT_TOBII_SUCKS_XLSX
+        try:
+            demo = pd.read_excel(DEFAULT_TOBII_SUCKS_XLSX)[["Patient_ID", "Gender"]]
+            gender_map = demo.set_index("Patient_ID")["Gender"].astype(str).str.strip().str.upper().str[:1].to_dict()
+        except Exception:
+            gender_map = {}
+
+        manual = load_manually_excluded_participants()
+        n_included = n_hardcoded = n_panel_count = n_technical = 0
+        n_hc = n_ms = n_female = n_male = 0
+        for group, subject_dir in iter_all_subject_dirs(self.cfg.raw_behavior_path):
+            p_name = os.path.basename(subject_dir)
+            p_obj = self.participants.get(group, {}).get(p_name)
+            n_panels = len(p_obj.matrices) if p_obj is not None else 0
+            if p_name in manual:
+                n_hardcoded += 1
+                continue
+            if n_panels >= min_panels:
+                n_included += 1
+                n_hc += group == "HC"
+                n_ms += group != "HC"
+                gender = gender_map.get(p_name, "")
+                n_female += gender == "F"
+                n_male += gender == "M"
+            elif n_panels > 0:
+                n_panel_count += 1
+            else:
+                n_technical += 1
+        return {
+            "n_total_eligible": n_included + n_technical + n_panel_count + n_hardcoded,
+            "n_included": n_included,
+            "n_excluded_technical": n_technical,
+            "n_excluded_panel_count": n_panel_count,
+            "n_excluded_hardcoded": n_hardcoded,
+            "n_hc": n_hc,
+            "n_ms": n_ms,
+            "n_female": n_female,
+            "n_male": n_male,
+        }
 
     def get_flat_participants(self):
         all_p = []

@@ -28,7 +28,8 @@ class MarkovVisualizer:
         cmap = sns.color_palette("YlGnBu", as_cmap=True)
         cmap.set_bad("gray", 0.3)
         
-        sns.heatmap(df, annot=True, fmt=".2f", cmap=cmap, vmin=0, vmax=1)
+        sns.heatmap(df, annot=True, fmt=".2f", cmap=cmap, vmin=0, vmax=1,
+                    annot_kws={"size": 6})
         plt.title(f"Transitions: {participant.name} ({panel})")
         plt.ylabel("From State")
         plt.xlabel("To State")

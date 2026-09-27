@@ -12,6 +12,7 @@ from scipy.stats import mannwhitneyu
 from tqdm import tqdm
 
 from markov_core import AnalysisConfig, Participant
+from exclusion_policy import DEFAULT_TOBII_SUCKS_XLSX
 
 class MarkovAnalyzer:
     def __init__(self, participants_list: list[Participant], config: AnalysisConfig):
@@ -33,6 +34,7 @@ class MarkovAnalyzer:
             os.makedirs(d, exist_ok=True)
         
         self.global_states = self._get_global_states()
+        self.demographics_text = self._build_demographics_text()
         
         self.special_names = {
             ('ENTER', 'ENTER'): "Non-Symbol Fixations",
@@ -42,6 +44,41 @@ class MarkovAnalyzer:
         }
 
     # --- HELPERS ---
+    def _build_demographics_text(self):
+        """N, group split, and sex split for THIS analysis's actual participant
+        population (post-exclusion) - so every population-level plot can show who's
+        actually in it, not just the raw counts. Gender comes from the same behavioral
+        summary table feature_pipeline.py already uses for demographics."""
+        try:
+            demo = pd.read_excel(DEFAULT_TOBII_SUCKS_XLSX)[["Patient_ID", "Gender"]]
+            gender_map = demo.set_index("Patient_ID")["Gender"].astype(str).str.strip().str.upper().str[:1].to_dict()
+        except Exception:
+            gender_map = {}
+
+        n = len(self.participants)
+        n_hc = sum(1 for p in self.participants if p.group == "HC")
+        n_ms = n - n_hc
+        genders = [gender_map.get(p.name, "") for p in self.participants]
+        n_f = sum(1 for g in genders if g == "F")
+        n_m = sum(1 for g in genders if g == "M")
+        n_unknown = n - n_f - n_m
+        text = f"N={n} (HC={n_hc}, pwMS={n_ms})\nSex: F={n_f}, M={n_m}"
+        if n_unknown:
+            text += f", unknown={n_unknown}"
+        return text
+
+    def _annotate_demographics(self, ax=None, loc="lower left", on_figure=False):
+        """Adds self.demographics_text as a small text box - on the given/current axes
+        by default, or in a figure-level corner (on_figure=True) for plots where every
+        axes position is already full of real content (e.g. a heatmap)."""
+        xy = (0.01, 0.01) if "lower" in loc else (0.01, 0.99)
+        va = "bottom" if "lower" in loc else "top"
+        target = plt.gcf() if on_figure else (ax or plt.gca())
+        transform = plt.gcf().transFigure if on_figure else target.transAxes
+        target.text(xy[0], xy[1], self.demographics_text, transform=transform,
+                     fontsize=10, verticalalignment=va,
+                     bbox=dict(facecolor='white', alpha=0.75, edgecolor='gray'))
+
     def _get_global_states(self):
         states = set()
         for p in self.participants:
@@ -309,28 +346,15 @@ class MarkovAnalyzer:
         for i in range(coords.shape[1]):
             df_metadata[f"PC{i+1}"] = coords[:, i]
 
-        # 4. GROUP SEPARATION
-        top_separators = self._analyze_group_separation(df_metadata)
-        
-        # 5. PLOTTING STRATEGY
-        pcs_to_plot = []
-        
-        # A. Add Top Separators (The logic that caused the error)
-        if len(top_separators) >= 2:
-            # Removed trailing comma and ensured variable names match
-            p1_name, p1_val = top_separators[0] 
-            p2_name, p2_val = top_separators[1]
-            
-            # Extract numbers from strings like "PC10" -> 9 (index)
-            idx1 = int(p1_name.replace("PC", "")) - 1
-            idx2 = int(p2_name.replace("PC", "")) - 1
-            pcs_to_plot.append((idx1, idx2))
-            
-        # B. Add Standard Pairs (PC1 vs PC2, PC1 vs PC3) if not already added
-        standard_pairs = list(itertools.combinations(range(min(3, coords.shape[1])), 2))
-        for pair in standard_pairs:
-            if pair not in pcs_to_plot:
-                pcs_to_plot.append(pair)
+        # 4. GROUP SEPARATION (still computed/saved for reference, no longer used to
+        # pick which PCs to plot - decision 2026-09-27: always plot every PC1-3 pairwise
+        # combination, a fixed and predictable set, rather than sometimes substituting
+        # in whichever PC pair happens to separate groups best)
+        self._analyze_group_separation(df_metadata)
+
+        # 5. PLOTTING STRATEGY: always all PC1-3 pairwise combinations (PC1-2, PC1-3,
+        # PC2-3) - fixed regardless of how many components exist or how they separate.
+        pcs_to_plot = list(itertools.combinations(range(min(3, coords.shape[1])), 2))
 
         # 6. GENERATE PLOTS
         for (idx1, idx2) in pcs_to_plot:
@@ -497,53 +521,48 @@ class MarkovAnalyzer:
     def _plot_pca_scatter(self, coords, color_values, labels, explained_var, mode_name, 
                           col_name, pc_x=0, pc_y=1, is_numeric=False):
         
-        # --- POSTER STYLE SETTINGS ---
-        sns.set_context("poster", font_scale=1.2) # Big fonts
         sns.set_style("whitegrid")
-        plt.figure(figsize=(12, 10))
+        plt.figure(figsize=(8, 6))
 
         # 1. SETUP DATA
         x_vals = coords[:, pc_x]
         y_vals = coords[:, pc_y]
-        
+
         # 2. PLOTTING
         if is_numeric:
             # --- CONTINUOUS COLOR (SDMT Score) ---
             # Remove NaNs for plotting
             mask = ~np.isnan(color_values.astype(float))
-            sc = plt.scatter(x_vals[mask], y_vals[mask], c=color_values[mask], 
-                             cmap='viridis', s=200, edgecolors='k', alpha=0.9) # s=200 for big points
+            sc = plt.scatter(x_vals[mask], y_vals[mask], c=color_values[mask],
+                             cmap='viridis', s=60, edgecolors='k', alpha=0.9)
             cbar = plt.colorbar(sc)
-            cbar.set_label(col_name, fontsize=25, fontweight='bold', labelpad=15)
-            cbar.ax.tick_params(labelsize=20)
-            
+            cbar.set_label(col_name, fontsize=11, labelpad=10)
+
             title_text = f"PCA by {col_name}"
         else:
             # --- CATEGORICAL COLOR (Group) ---
-            # Define specific colors if needed, or let seaborn handle it
+            # red=MS/pwMS, blue=HC (decision 2026-09-27)
             unique_cats = np.unique(color_values)
-            palette = {"HC": "blue", "pwMS": "red"} if set(unique_cats).issubset({"HC", "pwMS", "MS"}) else None
-            
-            sns.scatterplot(x=x_vals, y=y_vals, hue=color_values, palette=palette, 
-                            s=200, edgecolor='k', alpha=0.9) # s=200
-            plt.legend(title=col_name, fontsize=20, title_fontsize=22, loc='best')
+            palette = {"HC": "blue", "pwMS": "red", "MS": "red"} if set(unique_cats).issubset({"HC", "pwMS", "MS"}) else None
+
+            sns.scatterplot(x=x_vals, y=y_vals, hue=color_values, palette=palette,
+                            s=60, edgecolor='k', alpha=0.9)
+            plt.legend(title=col_name, loc='best')
             title_text = f"PCA by {col_name}"
 
-        # 3. LABELS & TITLES (BIG FONTS)
+        # 3. LABELS & TITLES
         var_x = explained_var[pc_x] * 100
         var_y = explained_var[pc_y] * 100
-        
-        plt.xlabel(f"PC{pc_x+1} ({var_x:.1f}%)", fontsize=30, fontweight='bold', labelpad=15)
-        plt.ylabel(f"PC{pc_y+1} ({var_y:.1f}%)", fontsize=30, fontweight='bold', labelpad=15)
-        plt.title(f"{title_text}\n({mode_name})", fontsize=35, fontweight='bold', pad=25)
-        
-        plt.xticks(fontsize=24)
-        plt.yticks(fontsize=24)
-        
+
+        plt.xlabel(f"PC{pc_x+1} ({var_x:.1f}%)")
+        plt.ylabel(f"PC{pc_y+1} ({var_y:.1f}%)")
+        plt.title(f"{title_text}\n({mode_name})")
+
         # Remove top/right spines
         sns.despine(trim=True)
+        self._annotate_demographics()
         plt.tight_layout()
-        
+
         # 4. SAVE
         # Sanitize filename
         safe_col = "".join([c for c in col_name if c.isalnum() or c in (' ', '_')]).strip()
@@ -600,7 +619,7 @@ class MarkovAnalyzer:
                 vec = self._align_vector(mat)
                 pools[panel].append(vec) 
 
-        # self._run_violin_analysis(valid_participants, valid_panels)
+        self._run_violin_analysis(valid_participants, valid_panels)
         self._run_permutation_test(pools, valid_panels, n_permutations)
 
     def _run_violin_analysis(self, participants, valid_panels):
@@ -664,25 +683,33 @@ class MarkovAnalyzer:
         mu_w, sd_w, n_w = np.mean(data[0]), np.std(data[0]), len(data[0])
         mu_b, sd_b, n_b = np.mean(data[1]), np.std(data[1]), len(data[1])
 
+        # Formal test, decision 2026-09-27: is within-subject consistency actually
+        # higher than between-subject, not just descriptively (mean/SD) different?
+        # Mann-Whitney U (same nonparametric choice as _analyze_group_separation) since
+        # correlation coefficients aren't reliably normal, especially near +/-1.
+        u_stat, u_pval = mannwhitneyu(data[0], data[1], alternative='greater')
+
         plt.figure(figsize=(9, 7))
         parts = plt.violinplot(data, showmeans=False, showmedians=False, showextrema=False)
         colors = ['blue', 'red']
         for i, pc in enumerate(parts['bodies']):
             pc.set_facecolor(colors[i])
             pc.set_alpha(0.5)
-            
+
         plt.errorbar([1, 2], [mu_w, mu_b], yerr=[sd_w, sd_b], fmt='o', color='k', label='Mean ± SD')
-        
+
         # --- NEW: STATS TEXT BOX ---
         stats_text = (
             f"WITHIN:\nN = {n_w}\nMean = {mu_w:.3f}\nSD = {sd_w:.3f}\n\n"
-            f"BETWEEN:\nN = {n_b}\nMean = {mu_b:.3f}\nSD = {sd_b:.3f}"
+            f"BETWEEN:\nN = {n_b}\nMean = {mu_b:.3f}\nSD = {sd_b:.3f}\n\n"
+            f"Mann-Whitney U (within > between):\nU = {u_stat:.1f}\np = {u_pval:.2e}"
         )
         # Position box to the right
         plt.text(2.6, np.mean([mu_w, mu_b]), stats_text, fontsize=10, 
                  verticalalignment='center',
                  bbox=dict(facecolor='white', alpha=0.8, edgecolor='black'))
 
+        self._annotate_demographics()
         plt.xticks([1, 2], ['Within-Subject', 'Between-Subject'])
         plt.ylabel("Correlation (r)")
         plt.title("Consistency: Within vs Between Participants")
@@ -744,23 +771,17 @@ class MarkovAnalyzer:
         p_val = (n_better + 1) / (len(valid_nulls) + 1)
         print(f"Permutation P-Value: {p_val:.5f}")
         
-        # --- PLOTTING (POSTER STYLE) ---
+        # --- PLOTTING ---
         mu_null = np.mean(valid_nulls)
         sd_null = np.std(valid_nulls)
         n_null = len(valid_nulls)
 
-        # 1. Set Context for Big Fonts
-        sns.set_context("poster", font_scale=1.2)
         sns.set_style("whitegrid")
-        
-        # 2. Big Figure
-        plt.figure(figsize=(12, 10))
-        
-        # 3. Plot
+        plt.figure(figsize=(8, 6))
+
         plt.hist(valid_nulls, bins=50, color='gray', alpha=0.5, density=True, label='Null Distribution')
-        plt.axvline(obs_mean, color='red', linestyle='--', linewidth=5, label=f'Observed') # Thicker line
-        
-        # --- STATS TEXT BOX (BIGGER) ---
+        plt.axvline(obs_mean, color='red', linestyle='--', linewidth=2, label='Observed')
+
         stats_text = (
             f"Observed Mean: {obs_mean:.4f}\n"
             f"Null Mean: {mu_null:.4f}\n"
@@ -768,93 +789,68 @@ class MarkovAnalyzer:
             f"N Permutations: {n_null}\n"
             f"p-value: {p_val:.5f}"
         )
-        
-        plt.text(0.05, 0.95, stats_text, transform=plt.gca().transAxes,
-                 verticalalignment='top', fontsize=22, fontweight='bold',
-                 bbox=dict(facecolor='white', alpha=0.9, edgecolor='black', boxstyle='round,pad=0.5'))
 
-        # 4. Labels & Titles
-        plt.title("Permutation Test: Within-Subject Consistency", fontsize=35, fontweight='bold', pad=25)
-        plt.xlabel("Mean Correlation", fontsize=30, fontweight='bold', labelpad=20)
-        plt.ylabel("Density", fontsize=30, fontweight='bold', labelpad=20)
-        
-        # 5. Ticks & Legend
-        plt.xticks(fontsize=24)
-        plt.yticks(fontsize=24)
-        plt.legend(loc='upper right', fontsize=22)
-        
-        # 6. Save
+        plt.text(0.05, 0.95, stats_text, transform=plt.gca().transAxes,
+                 verticalalignment='top', fontsize=10,
+                 bbox=dict(facecolor='white', alpha=0.9, edgecolor='black', boxstyle='round,pad=0.5'))
+        plt.text(0.95, 0.95, self.demographics_text, transform=plt.gca().transAxes,
+                 verticalalignment='top', horizontalalignment='right', fontsize=9,
+                 bbox=dict(facecolor='white', alpha=0.75, edgecolor='gray'))
+
+        plt.title("Permutation Test: Within-Subject Consistency")
+        plt.xlabel("Mean Correlation")
+        plt.ylabel("Density")
+        plt.legend(loc='upper right')
+
         sns.despine()
         plt.tight_layout()
         plt.savefig(os.path.join(self.consistency_dir, "permutation_test_histogram.png"), dpi=300)
         plt.close()
 
     def _plot_pca_weights(self, pca, feature_names, mode_name, target_pc_idx=0):
-        """
-        Plots PCA weights as a heatmap over the transition matrix grid.
-        (Poster Style: Large text and annotations)
-        """
+        """Plots PCA weights as a heatmap over the transition matrix grid. cmap
+        "RdBu_r" (decision 2026-09-27): positive weights red, negative blue."""
         pc_num = target_pc_idx + 1
         comp = pca.components_[target_pc_idx]
-        
+
         # 1. Define Matrix Layout
         states = ['ENTER'] + [str(i) for i in range(1, 10)] + ['EXIT']
-        
+
         # Initialize grid with NaN (NaNs will be transparent/black in heatmap)
         matrix_df = pd.DataFrame(np.nan, index=states, columns=states)
-        
+
         # 2. Parse Features and Fill Grid
         for feature, weight in zip(feature_names, comp):
             u, v = self._get_feature_tuple(feature)
             if u in states and v in states:
                 matrix_df.loc[u, v] = weight
 
-        # 3. Plot Heatmap (Poster Style)
-        # Scale up all fonts globally
-        sns.set_context("poster", font_scale=1.2)
-        
-        # Make the figure larger
-        plt.figure(figsize=(14, 12))
-        
+        plt.figure(figsize=(9, 7.5))
+
         max_abs = max(abs(comp.min()), abs(comp.max()))
         ax = plt.gca()
         ax.set_facecolor('black') # Missing values appear black
-        
-        # Draw Heatmap
-        sns.heatmap(matrix_df, 
+
+        sns.heatmap(matrix_df,
                     annot=True,
                     fmt=".2f",
-                    cmap="RdBu",
+                    cmap="RdBu_r",
                     center=0,
                     vmin=-max_abs,
                     vmax=max_abs,
                     square=True,
-                    linewidths=1.0,  # Thicker grid lines
+                    linewidths=1.0,
                     linecolor='gray',
-                    # Bigger numbers inside the boxes
-                    annot_kws={"size": 18, "weight": "bold"}, 
-                    # Colorbar settings passed here, but we can fine-tune below
-                    cbar=False) 
-        
-        # Manually add Colorbar to control size and font
-        from mpl_toolkits.axes_grid1 import make_axes_locatable
-        divider = make_axes_locatable(ax)
-        cax = divider.append_axes("right", size="5%", pad=0.3)
-        cbar = plt.colorbar(ax.collections[0], cax=cax)
-        
-        # Colorbar Font Formatting
-        cbar.set_label(f"PCA Weight (PC{pc_num})", fontsize=30, fontweight='bold', labelpad=20)
-        cbar.ax.tick_params(labelsize=24)
+                    annot_kws={"size": 7},
+                    cbar_kws={"label": f"PCA Weight (PC{pc_num})"})
 
-        # Axis Label Formatting
-        ax.set_title(f"PC{pc_num} Weights Heatmap\n({mode_name})", fontsize=40, fontweight='bold', pad=30)
-        
-        # Ticks
-        ax.tick_params(axis='x', labelsize=24, rotation=45)
-        ax.tick_params(axis='y', labelsize=24, rotation=0)
+        ax.set_title(f"PC{pc_num} Weights Heatmap\n({mode_name})")
+        ax.tick_params(axis='x', rotation=45)
+        ax.tick_params(axis='y', rotation=0)
 
+        self._annotate_demographics(on_figure=True, loc="upper left")
         plt.tight_layout()
-        
+
         save_path = os.path.join(self.weights_dir, f"heatmap_weights_PC{pc_num}.png")
         plt.savefig(save_path, dpi=300)
         plt.close()
@@ -871,5 +867,6 @@ class MarkovAnalyzer:
         plt.plot(range(1, len(evr)+1), cum_var, 'r-o')
         plt.axhline(0.9, color='g', linestyle='--')
         plt.title(f"Elbow Plot - {mode_name}")
+        self._annotate_demographics()
         plt.savefig(os.path.join(self.variance_dir, "elbow_explained_variance.png"))
         plt.close()

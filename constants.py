@@ -101,6 +101,11 @@ FIXATION_VALID_STATUS = "status"
 FIXATION_CSV_TIME = "t"
 SACCADE_IDX = 2
 FIXATION_IDX = 1
+# gazeNET's 3rd event class (ModelPropertise.EVENTS / GazeModel/config.json's "events":
+# [1,2,3]) - post-saccadic oscillation, per the gazeNET paper's 3-class scheme
+# (Zemblys et al. 2018). Only ever produced by model_based annotation - threshold_based
+# has no equivalent 3rd class.
+PSO_IDX = 3
 
 
 # #fixatio saccade preprossesing constants

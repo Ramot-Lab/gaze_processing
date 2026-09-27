@@ -5,15 +5,26 @@ from behavioral_analyzer import BehavioralAnalyzer
 from markov_core import AnalysisConfig
 from markov_loader import DataManager
 from markov_analyzer import MarkovAnalyzer
+import pipeline_config
 from pipeline_config import ANNOTATION_METHODS
 
-def run_pipeline(annotation_method="threshold_based"):
+def run_pipeline(annotation_method="threshold_based", date_str=None, output_base_path=None,
+                  participant_whitelist=None, exclusion_summary_path=None):
+    """date_str: which Stage 1 date-folder to read annotated CSVs from (None
+    auto-resolves to the most recent existing one). output_base_path: override where
+    this run's own output goes (None uses the normal preliminary_results_<method>
+    default) - e.g. a folder shared with the same day's feature-analysis run
+    (pipeline_config.consolidated_results_dir). participant_whitelist: restrict to just
+    these participant names (None runs the full population). exclusion_summary_path:
+    where the shared cross-stage exclusion summary CSV lives (None uses the old global
+    default - see pipeline_config.append_exclusion_summary_row)."""
 
     tasks = [
         # #----------------  WITHOUT REPEATS  ----------------#
-        # 1.  with Enter, Exit + All Panels
-        AnalysisConfig(with_repeats=False, only_1_to_9=False, use_mean_matrix=False, from_scratch=True,
-                       annotation_method=annotation_method),
+        # 1.  with Enter, Exit + Mean Matrix (decision 2026-09-27: analyze each
+        # participant's mean transition matrix, not every panel as its own row)
+        AnalysisConfig(with_repeats=False, only_1_to_9=False, use_mean_matrix=True, from_scratch=True,
+                       annotation_method=annotation_method, date_str=date_str, output_base_path=output_base_path),
 
         # # 2. with Enter, Exit + Mean Matrix
         # AnalysisConfig(with_repeats=False, only_1_to_9=False, use_mean_matrix=True, from_scratch=False),
@@ -65,10 +76,27 @@ def run_pipeline(annotation_method="threshold_based"):
         #--------------- Load ---------------#
         loader = DataManager(config)
         loader.load_participants_and_scores()
+        if participant_whitelist is not None:
+            for group in list(loader.participants.keys()):
+                loader.participants[group] = {
+                    name: p for name, p in loader.participants[group].items() if name in participant_whitelist
+                }
+            print(f"Restricted to whitelist: { {g: list(ps.keys()) for g, ps in loader.participants.items()} }")
         loader.load_or_compute_matrices(from_scratch=config.from_scratch)
+
+        #--------------- Exclusion accounting + <4-panel filter ---------------#
+        loader.filter_by_min_panels()
         if config.from_scratch:
             loader.save_exclusion_log()
-        
+        # compute_exclusion_summary scans the FULL eligible population - meaningless
+        # (and misleading in the shared summary table) when restricted to a whitelist,
+        # since everyone else would show up as a false "technical" exclusion.
+        if participant_whitelist is None:
+            summary_stats = loader.compute_exclusion_summary()
+            pipeline_config.append_exclusion_summary_row(
+                f"Markov ({config.folder_name})", config.annotation_method, summary_stats,
+                out_path=exclusion_summary_path)
+
         #--------------- Get Data ---------------#
         participants = loader.get_flat_participants()
         print(f"Participants: {len(participants)}")
@@ -84,12 +112,12 @@ def run_pipeline(annotation_method="threshold_based"):
         # B. Consistency Analysis (Violin + Permutation)
         analyzer.run_consistency_analysis(n_permutations=1000)
 
-        # C. Per-participant/panel matrix visualization (heatmap + graph)
+        # C. Per-participant/panel matrix visualization (heatmap only - the network
+        # graph visualization was removed per decision 2026-09-27)
         viz = MarkovVisualizer(output_dir=config.plot_output_path)
         for p in participants:
             for panel in p.matrices.keys():
                 viz.plot_heatmap(p, panel)
-                viz.plot_graph(p, panel)
 
 
         # ---------------------------------------------------------

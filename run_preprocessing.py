@@ -30,6 +30,7 @@ from exclusion_policy import load_manually_excluded_participants, load_tobii_suc
 from participant_gaze_data_manager import ParticipantGazeDataManager
 from pipeline_config import (DICTIONARY_BOUNDARY_RATIO, EXCLUDE_TOBII_SUCKS, MAX_SACCADE_FRACTION,
                               TEXT_BOUNDARY_RATIO, annotated_gaze_dir, main_data_path)
+from signal_quality_checks import TIMESTAMP_GAP_THRESHOLD_MS, find_timestamp_gaps
 
 
 def iter_all_subject_dirs(data_path, groups=("HC", "pwMS")):
@@ -177,6 +178,24 @@ def run(method, date_str=None):
                 continue
 
             eye_used = sd.matched_data[panel].get(KEY_ANALYSIS_EYE)
+
+            # Decision 2026-09-27: exclude a panel if the raw timestamp stream has a
+            # gap far bigger than the ~1667us normal sample spacing - a genuine
+            # discontinuity in the recording (tracker dropout, a pause, a merge
+            # artifact), not a real physiological event. Found via ER635/l3: a single
+            # row-to-row jump of ~35s with no missing rows and barely any change in
+            # position (signal_quality_checks.py's diagnostic scans).
+            gaps = find_timestamp_gaps(annotated)
+            if not gaps.empty:
+                max_gap_ms = gaps["gap_ms"].max()
+                exclusion_rows.append({
+                    "participant": participant, "group": group, "panel": panel,
+                    "reason": f"panel {panel}: {len(gaps)} timestamp gap(s) > "
+                              f"{TIMESTAMP_GAP_THRESHOLD_MS:.0f}ms found (largest: {max_gap_ms:.0f}ms)",
+                    "l_acc": None, "r_acc": None, "l_nan_pct": None, "r_nan_pct": None,
+                    "other_errors": None, "scope": "timestamp_gap",
+                })
+                continue
 
             # Decision 2026-09-22: exclude a panel outright if the annotated stream is
             # mostly saccades - not a real eye-movement pattern, a sign of tracking

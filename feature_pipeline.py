@@ -32,21 +32,29 @@ IDO_TABLE_XLSX = "/Volumes/ramot/Noam_M/df_filtered_behavioral_summary_20260427_
 OUTPUT_BASE_DIR = "/Volumes/ramot/Noam_M/preliminary_results/all_features/"
 
 EXCLUDED_PARTICIPANTS = ['PT914', 'LY082', 'KH736']
+PANELS = ["0", "i1", "l4", "a3", "a5", "l3"]
 
 TRIAL_FEATURE_ATTRS = [
     "dispersions_global_bcea",
     "dispersions_global_rms",
     "fixation_counts_per_trial",
     "symbol_counts_per_trial",
-    "trial_in_search_durations",
-    "time_in_relevant_fixations",
+    "trial_in_search_durations_ms",
+    "time_in_relevant_fixations_ms",
     "num_of_searches_per_trial",
     "unique_counts_per_trial",
     "revisits_per_trial",
+    "search_distance_per_trial",
 ]
 
 MIN_TRIALS_RELIABILITY = 150   # internal to trial-level reliability split-half
 MIN_PANELS_RELIABILITY = 4     # internal to panel-level reliability split-half
+# Saccade-latency trial counts (compiled_latencies.csv) are far lower and far more variable
+# per participant than in-task trials/panels (observed range ~7-97, mean ~80, but heavily
+# clustered 75-95 with a handful of low outliers) - 60 keeps ~87/92 participants while still
+# giving a 30-value-per-half split (max_l = min_count // 2), a better inclusion/data-richness
+# trade-off here than reusing MIN_TRIALS_RELIABILITY (150, higher than this data's own max).
+MIN_SACCADE_LATENCY_RELIABILITY = 60
 RELIABILITY_REPETITIONS = 1000
 TYPICALITY_COVERAGE_PCTL = 20  # keep participants above this percentile of total trials (~top 80%)
 
@@ -58,9 +66,10 @@ PARTIAL_CORR_COVARIATES = {
     "dispersions_global_bcea_mean": "Global Dispersion (BCEA)",
     "fixation_counts_per_trial_mean": "Fixation Count",
     "symbol_counts_per_trial_mean": "Symbol Count",
-    "trial_in_search_durations_mean": "Search Duration",
-    "time_in_relevant_fixations_mean": "Time in Relevant Fixations",
+    "trial_in_search_durations_ms_mean": "Search Duration (ms)",
+    "time_in_relevant_fixations_ms_mean": "Time in Relevant Fixations (ms)",
     "num_of_searches_per_trial_mean": "Number of Searches",
+    "search_distance_per_trial_mean": "Search Distance (Dictionary)",
 }
 
 CORRELATION_SUBSETS = {
@@ -70,6 +79,46 @@ CORRELATION_SUBSETS = {
     "female": lambda df: df["Gender"].isin(["F", "Female"]),
     "male": lambda df: df["Gender"].isin(["M", "Male"]),
 }
+
+
+# Standing rule (2026-09-27): every population-level plot in this pipeline shows N, the
+# HC/pwMS split, and the F/M split of whoever's actually behind it - mirrors
+# markov_analyzer.py's MarkovAnalyzer._build_demographics_text/_annotate_demographics.
+def demographics_text(df_participants):
+    """df_participants: any dataframe with 'group' and/or 'Gender' columns (a full
+    participant table, or an already-filtered subset - the text always describes exactly
+    the rows passed in, so callers should filter first)."""
+    n = len(df_participants)
+    if "group" in df_participants.columns:
+        n_hc = int((df_participants["group"] == "HC").sum())
+        n_ms = int(df_participants["group"].isin(["MS", "pwMS"]).sum())
+    else:
+        n_hc = n_ms = 0
+    if "Gender" in df_participants.columns:
+        g = df_participants["Gender"].astype(str).str.strip().str.upper().str[:1]
+        n_f = int((g == "F").sum())
+        n_m = int((g == "M").sum())
+    else:
+        n_f = n_m = 0
+    n_unknown = n - n_f - n_m
+    text = f"N={n} (HC={n_hc}, pwMS={n_ms})\nSex: F={n_f}, M={n_m}"
+    if n_unknown > 0:
+        text += f", unknown={n_unknown}"
+    return text
+
+
+def annotate_demographics(text, ax=None, loc="lower left", on_figure=False):
+    """Draws `text` (from demographics_text) as a small box on the given/current axes,
+    or in a figure-level corner (on_figure=True) when the axes are already full of real
+    content (e.g. a heatmap). No-op if text is falsy, so callers can pass None freely."""
+    if not text:
+        return
+    xy = (0.01, 0.01) if "lower" in loc else (0.01, 0.99)
+    va = "bottom" if "lower" in loc else "top"
+    target = plt.gcf() if on_figure else (ax or plt.gca())
+    transform = plt.gcf().transFigure if on_figure else target.transAxes
+    target.text(xy[0], xy[1], text, transform=transform, fontsize=9,
+                 verticalalignment=va, bbox=dict(facecolor='white', alpha=0.75, edgecolor='gray'))
 
 # "compute" rebuilds everything fresh (reading Stage 1's saved annotated CSVs where
 # available - see build_trial_managers); "load" reads previously-saved tables instead.
@@ -113,6 +162,44 @@ def discover_participants(data_path=NOAM_DATA_PATH):
     return participants_dict
 
 
+def extract_scores_table(participants_dict, data_path=NOAM_DATA_PATH, panels=PANELS):
+    """Extracts SDMT scores directly from each participant's SDMT/*.wav filenames
+    (img_test_<PANEL>_strikes_<SCORE>.wav) - the original source of truth, not a
+    cached/master CSV (decision 2026-09-27, prompted by investigating a missing
+    YP095/panel-0 score: SCORES_CSV was found to be completely empty on disk, meaning
+    load_scores() had been silently depending entirely on its own inline WAV-fallback
+    for every single participant - this makes that extraction an explicit, saved,
+    auditable step instead of an invisible fallback). One row per participant x panel
+    (NaN score if that panel's WAV file is missing/unparseable) - same shape as
+    markov_loader.py's DataManager.save_score_summary_table, but written to
+    feature_pipeline's own SCORES_CSV location."""
+    records = []
+    for group, names in participants_dict.items():
+        for p_name in names:
+            sdmt_path = os.path.join(data_path, group, p_name, "SDMT")
+            panel_scores = {}
+            if os.path.exists(sdmt_path):
+                for f in os.listdir(sdmt_path):
+                    if f.endswith(".wav"):
+                        pm = re.search(r"img_test_(.+?)_strikes", f)
+                        sm = re.search(r"_strikes_(\d+)", f)
+                        if pm and sm:
+                            panel_scores[pm.group(1).strip().lower()] = int(sm.group(1))
+            for panel in panels:
+                records.append({"Group": group, "Participant": p_name, "Panel": panel,
+                                 "SDMT_Score": panel_scores.get(panel, np.nan)})
+    return pd.DataFrame(records)
+
+
+def save_scores_table(participants_dict, out_path=SCORES_CSV, data_path=NOAM_DATA_PATH):
+    df = extract_scores_table(participants_dict, data_path=data_path)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    df.to_csv(out_path, index=False)
+    n_nonnull = int(df["SDMT_Score"].notna().sum())
+    print(f"Saved scores table: {len(df)} rows ({n_nonnull} with a real score) -> {out_path}")
+    return df
+
+
 def load_scores(participants_dict, scores_csv=SCORES_CSV, data_path=NOAM_DATA_PATH):
     try:
         scores_df = pd.read_csv(scores_csv)
@@ -153,7 +240,7 @@ def load_scores(participants_dict, scores_csv=SCORES_CSV, data_path=NOAM_DATA_PA
 # ============================================================
 # 2. BUILD TRIAL MANAGERS (compute mode only)
 # ============================================================
-def build_trial_managers(participants, data_path=NOAM_DATA_PATH, annotation_method="threshold_based"):
+def build_trial_managers(participants, data_path=NOAM_DATA_PATH, annotation_method="threshold_based", date_str=None):
     """
     Loads the gaze+evt data for each panel from Stage 1's saved annotated CSV
     (pipeline_config.load_annotated_csv) for annotation_method, instead of re-running
@@ -186,10 +273,11 @@ def build_trial_managers(participants, data_path=NOAM_DATA_PATH, annotation_meth
                         # Search/Sequence building as Markov analysis, so it also reads the
                         # whole-dictionary-drift-corrected gaze, not raw.
                         annotated_data = pipeline_config.load_annotated_csv(
-                            annotation_method, participant.group, participant.name, panel, corrected=True)
+                            annotation_method, participant.group, participant.name, panel,
+                            date_str=date_str, corrected=True)
                     except FileNotFoundError:
                         stage1_reason = pipeline_config.stage1_exclusion_reason(
-                            annotation_method, participant.name, panel)
+                            annotation_method, participant.name, panel, date_str=date_str)
                         if stage1_reason is not None:
                             raise FileNotFoundError(f"preprocessing_exclusion: {stage1_reason}")
                         print(f"  no Stage-1 CSV for {participant.name}/{panel}/{annotation_method} - "
@@ -259,7 +347,9 @@ def build_panel_table(df_trials, participants):
         counts = group["unique_counts_per_trial"].dropna()
         total = len(counts)
         row = {"participant": participant, "panel": panel}
-        for n in range(10):
+        # Only 0 and 1 unique symbols kept (decision 2026-09-27) - percent_2..percent_9
+        # were noise, not analyzed.
+        for n in (0, 1):
             row[f"percent_{n}_unique_symbols_in_trial"] = (counts == n).sum() / total * 100 if total else np.nan
         percent_rows.append(row)
 
@@ -325,18 +415,48 @@ def _bcea(positions, p=0.68):
     return 2 * np.pi * k * std_x * std_y * np.sqrt(1 - rho ** 2)
 
 
-def compute_whole_panel_dispersion(participants):
+def _collect_fixation_bcea_values(participant):
+    """Per-INDIVIDUAL-fixation BCEA values (each fixation's own microsaccade point
+    cloud) keyed by panel - distinct from trial_features.py's "global" dispersion
+    (dispersions_global_bcea/rms, which pools a whole TRIAL's fixations into one
+    cloud). Shared by the panel-level and participant-level aggregations below so
+    both read from exactly the same underlying values."""
+    values_by_panel = {}
+    for panel, tm in participant.trial_managers.items():
+        panel_values = []
+        for f in tm.fixations:
+            pts = list(zip(f.microsaccades["x"], f.microsaccades["y"]))
+            if len(pts) > 2:
+                val = _bcea(pts)
+                if not np.isnan(val) and not np.isinf(val):
+                    panel_values.append(val)
+        values_by_panel[panel] = panel_values
+    return values_by_panel
+
+
+def compute_fixation_dispersion_by_panel(participants):
+    """Panel-level (participant x panel) individual-fixation BCEA (decision
+    2026-09-27) - previously this only existed collapsed to one number per
+    participant (compute_whole_panel_dispersion, pooling every panel together)."""
     rows = []
     for participant in participants:
-        values = []
-        for tm in participant.trial_managers.values():
-            for f in tm.fixations:
-                pts = list(zip(f.microsaccades["x"], f.microsaccades["y"]))
-                if len(pts) > 2:
-                    val = _bcea(pts)
-                    if not np.isnan(val) and not np.isinf(val):
-                        values.append(val)
+        for panel, values in _collect_fixation_bcea_values(participant).items():
+            if values:
+                rows.append({"participant": participant.name, "panel": panel,
+                              "fixation_bcea_mean": np.mean(values), "fixation_bcea_std": np.std(values, ddof=1)})
+            else:
+                rows.append({"participant": participant.name, "panel": panel,
+                              "fixation_bcea_mean": np.nan, "fixation_bcea_std": np.nan})
+    return pd.DataFrame(rows)
 
+
+def compute_whole_panel_dispersion(participants):
+    """Participant-level individual-fixation BCEA, pooled across all of a
+    participant's panels - unchanged definition; see compute_fixation_dispersion_by_panel
+    for the (newer) panel-level breakdown of the same underlying values."""
+    rows = []
+    for participant in participants:
+        values = [v for panel_values in _collect_fixation_bcea_values(participant).values() for v in panel_values]
         if values:
             rows.append({
                 "participant": participant.name,
@@ -472,7 +592,7 @@ def load_tables(run_dir):
 # ============================================================
 # 7. RELIABILITY (trial level + panel level)
 # ============================================================
-def plot_correlation_hist(array, l_size, subject_amount, feature_name, save_path):
+def plot_correlation_hist(array, l_size, subject_amount, feature_name, save_path, demographics=None):
     valid = np.asarray(array)
     valid = valid[~np.isnan(valid)]
     if len(valid) == 0:
@@ -491,11 +611,12 @@ def plot_correlation_hist(array, l_size, subject_amount, feature_name, save_path
     plt.ylabel("Frequency")
     plt.legend()
     plt.grid(axis="y", alpha=0.5)
+    annotate_demographics(demographics)
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close()
 
 
-def plot_random_scatter(half_a, half_b, r_value, feature_name, l_size, iteration, save_path):
+def plot_random_scatter(half_a, half_b, r_value, feature_name, l_size, iteration, save_path, demographics=None):
     plt.figure(figsize=(6, 6))
     plt.scatter(half_a, half_b, color="teal", alpha=0.7)
     if len(half_a) > 1 and np.std(half_a) > 0:
@@ -507,11 +628,13 @@ def plot_random_scatter(half_a, half_b, r_value, feature_name, l_size, iteration
     plt.xlabel("Mean (Split Half A)")
     plt.ylabel("Mean (Split Half B)")
     plt.grid(True, alpha=0.3)
+    annotate_demographics(demographics)
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close()
 
 
-def calculate_reliability(data, l_size, repetitions, min_value, feature_name, save_dir=None, plot=True, extract_scatters=False):
+def calculate_reliability(data, l_size, repetitions, min_value, feature_name, save_dir=None, plot=True,
+                           extract_scatters=False, demographics=None):
     array_corr = np.zeros(repetitions)
     subjects_amount = len(data)
     random_iters = np.random.choice(repetitions, min(2, repetitions), replace=False) if extract_scatters else []
@@ -527,24 +650,26 @@ def calculate_reliability(data, l_size, repetitions, min_value, feature_name, sa
 
         if i in random_iters and save_dir:
             scatter_path = os.path.join(save_dir, f"{feature_name}_scatter_iter_{i}_L{l_size}.png")
-            plot_random_scatter(half_a, half_b, r_val, feature_name, l_size, i, scatter_path)
+            plot_random_scatter(half_a, half_b, r_val, feature_name, l_size, i, scatter_path, demographics=demographics)
 
     if plot and save_dir:
         hist_path = os.path.join(save_dir, f"{feature_name}_hist_L{l_size}.png")
-        plot_correlation_hist(array_corr, l_size, subjects_amount, feature_name, hist_path)
+        plot_correlation_hist(array_corr, l_size, subjects_amount, feature_name, hist_path, demographics=demographics)
 
     return np.mean(array_corr), l_size
 
 
-def calculate_reliability_distribution(data, max_l, repetitions, min_value, feature_name):
+def calculate_reliability_distribution(data, max_l, repetitions, min_value, feature_name, demographics=None):
     results = []
     for l_value in range(1, max_l + 1):
-        mean_value, _ = calculate_reliability(data, l_value, repetitions, min_value, feature_name, plot=False)
+        mean_value, _ = calculate_reliability(data, l_value, repetitions, min_value, feature_name, plot=False,
+                                               demographics=demographics)
         results.append(mean_value)
     return results
 
 
-def evaluate_feature_reliability(df, feature_name, min_count, out_dir, repetitions=RELIABILITY_REPETITIONS):
+def evaluate_feature_reliability(df, feature_name, min_count, out_dir, repetitions=RELIABILITY_REPETITIONS,
+                                  df_participants=None):
     counts = df.groupby("participant")[feature_name].count()
     valid_participants = counts[counts >= min_count].index.tolist()
     if len(valid_participants) < 3:
@@ -565,7 +690,12 @@ def evaluate_feature_reliability(df, feature_name, min_count, out_dir, repetitio
     ])
     print(f"  {feature_name} (N={len(valid_participants)}, min_count={min_count})")
 
-    mean_correlations = calculate_reliability_distribution(data_matrix, max_l, repetitions, min_count, feature_name)
+    demographics = None
+    if df_participants is not None:
+        demographics = demographics_text(df_participants[df_participants["participant"].isin(valid_participants)])
+
+    mean_correlations = calculate_reliability_distribution(data_matrix, max_l, repetitions, min_count, feature_name,
+                                                             demographics=demographics)
 
     plt.figure(figsize=(8, 5))
     plt.plot(range(1, max_l + 1), mean_correlations, marker="o", linestyle="-", color="purple")
@@ -574,29 +704,54 @@ def evaluate_feature_reliability(df, feature_name, min_count, out_dir, repetitio
     plt.ylabel("Mean Pearson correlation (r)")
     plt.ylim(-0.1, 1.0)
     plt.grid(True, alpha=0.5)
+    annotate_demographics(demographics)
     plt.savefig(os.path.join(feature_dir, f"{feature_name}_growth_curve.png"), dpi=150, bbox_inches="tight")
     plt.close()
 
     calculate_reliability(data_matrix, max_l, repetitions, min_count, feature_name,
-                          save_dir=feature_dir, plot=True, extract_scatters=True)
+                          save_dir=feature_dir, plot=True, extract_scatters=True, demographics=demographics)
 
 
-def run_trial_reliability(df_trials, run_dir, min_trials=MIN_TRIALS_RELIABILITY):
+def run_trial_reliability(df_trials, run_dir, min_trials=MIN_TRIALS_RELIABILITY, df_participants=None):
     out_dir = os.path.join(run_dir, "reliability", "trial_level")
     os.makedirs(out_dir, exist_ok=True)
     feature_cols = [c for c in df_trials.columns if c not in ID_COLS_TRIAL]
     print(f"Running trial-level reliability (min_trials={min_trials})...")
     for feature in feature_cols:
-        evaluate_feature_reliability(df_trials, feature, min_trials, out_dir)
+        evaluate_feature_reliability(df_trials, feature, min_trials, out_dir, df_participants=df_participants)
 
 
-def run_panel_reliability(df_panels, run_dir, min_panels=MIN_PANELS_RELIABILITY):
+def run_panel_reliability(df_panels, run_dir, min_panels=MIN_PANELS_RELIABILITY, df_participants=None):
     out_dir = os.path.join(run_dir, "reliability", "panel_level")
     os.makedirs(out_dir, exist_ok=True)
     feature_cols = [c for c in df_panels.select_dtypes(include=[np.number]).columns if c not in ID_COLS_PANEL]
     print(f"Running panel-level reliability (min_panels={min_panels})...")
     for feature in feature_cols:
-        evaluate_feature_reliability(df_panels, feature, min_panels, out_dir)
+        evaluate_feature_reliability(df_panels, feature, min_panels, out_dir, df_participants=df_participants)
+
+
+def run_saccade_latency_reliability(run_dir, saccade_csv=SACCADE_LATENCY_CSV,
+                                     min_trials=MIN_SACCADE_LATENCY_RELIABILITY,
+                                     df_participants=None):
+    """
+    Split-half reliability of saccade_latency_ms (compiled_latencies.csv is long-format:
+    one row per participant per trial - each participant has many trials, same shape as
+    df_trials, just from a separate external pipeline). Reuses evaluate_feature_reliability,
+    the same bootstrap-permutation split-half methodology (random per-participant reshuffle,
+    correlate half-1 vs half-2 means across participants, repeated RELIABILITY_REPETITIONS
+    times) already used for trial-/panel-level features - this also gives a reliability
+    growth curve and scatterplots, which the one-off notebook version did not.
+    """
+    try:
+        df_lat = pd.read_csv(saccade_csv)
+    except Exception as e:
+        print(f"Warning: could not load saccade latency CSV for reliability: {e}")
+        return
+
+    out_dir = os.path.join(run_dir, "reliability", "saccade_latency")
+    os.makedirs(out_dir, exist_ok=True)
+    print(f"Running saccade-latency reliability (min_trials={min_trials})...")
+    evaluate_feature_reliability(df_lat, "saccade_latency_ms", min_trials, out_dir, df_participants=df_participants)
 
 
 # ============================================================
@@ -634,7 +789,7 @@ def compute_correlation_matrix(df, features):
     return corr, pval, annot
 
 
-def plot_heatmap(corr, annot, title, out_path):
+def plot_heatmap(corr, annot, title, out_path, demographics=None):
     n = len(corr)
     cmap = LinearSegmentedColormap.from_list("custom_blue_red", ["blue", "white", "red"], N=256)
     mask = np.eye(n, dtype=bool)
@@ -646,12 +801,13 @@ def plot_heatmap(corr, annot, title, out_path):
     plt.title(f"{title}\n* p<0.05, ** p<0.01, *** p<0.001", fontsize=14, pad=20)
     plt.xticks(rotation=45, ha="right", fontsize=8)
     plt.yticks(fontsize=8)
+    annotate_demographics(demographics, on_figure=True)
     plt.tight_layout()
     plt.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close()
 
 
-def plot_significant_scatterplots(df, features, corr, pval, out_dir, score_col="score"):
+def plot_significant_scatterplots(df, features, corr, pval, out_dir, score_col="score", demographics=None):
     os.makedirs(out_dir, exist_ok=True)
     count = 0
     for i in range(len(features)):
@@ -685,6 +841,7 @@ def plot_significant_scatterplots(df, features, corr, pval, out_dir, score_col="
             plt.xlabel(col1)
             plt.ylabel(col2)
             plt.grid(True, alpha=0.3)
+            annotate_demographics(demographics)
 
             fname = f"scatter_{col1}_vs_{col2}.png".replace("/", "_")
             plt.savefig(os.path.join(out_dir, fname), dpi=150, bbox_inches="tight")
@@ -705,13 +862,59 @@ def run_correlation_analysis(df_participants, run_dir, excluded=EXCLUDED_PARTICI
         os.makedirs(out_dir, exist_ok=True)
 
         features = _select_feature_columns(subset, extra_exclude={"total_trial_count"})
+        if "saccade_latency_ms_mean" in features:
+            print(f"  '{name}': saccade_latency_ms_mean included in heatmap "
+                  f"(N with data={subset['saccade_latency_ms_mean'].notna().sum()}/{len(subset)}).")
+        else:
+            reason = ("column missing (merge_saccade_latency didn't run or found no rows)"
+                       if "saccade_latency_ms_mean" not in subset.columns
+                       else "excluded - fewer than 2 non-null values in this subset")
+            print(f"  WARNING: '{name}': saccade_latency_ms_mean NOT in heatmap ({reason}).")
         corr, pval, annot = compute_correlation_matrix(subset, features)
         corr.to_csv(os.path.join(out_dir, "correlation_values.csv"))
+        demographics = demographics_text(subset)
         plot_heatmap(corr, annot, f"Feature Correlations - {name} (N={len(subset)})",
-                     os.path.join(out_dir, "heatmap.png"))
+                     os.path.join(out_dir, "heatmap.png"), demographics=demographics)
 
-        n_sig = plot_significant_scatterplots(subset, features, corr, pval, os.path.join(out_dir, "scatterplots"))
+        n_sig = plot_significant_scatterplots(subset, features, corr, pval, os.path.join(out_dir, "scatterplots"),
+                                               demographics=demographics)
         print(f"Correlation subset '{name}': N={len(subset)}, {len(features)} features, {n_sig} significant scatterplots.")
+
+
+# Decision 2026-09-27: a second, smaller feature set for run_correlation_analysis_reduced
+# - drops every "_std" column (means only) plus typicality, unique_counts_per_trial, and
+# dispersions_global_rms entirely, on top of _select_feature_columns' usual filtering.
+REDUCED_CORR_EXCLUDE = {"mean_typicality", "typicality_std", "unique_counts_per_trial_mean",
+                         "unique_counts_per_trial_std", "dispersions_global_rms_mean", "dispersions_global_rms_std"}
+
+
+def _reduced_feature_columns(df, extra_exclude=()):
+    cols = _select_feature_columns(df, extra_exclude=extra_exclude)
+    return [c for c in cols if not c.endswith("_std") and c not in REDUCED_CORR_EXCLUDE]
+
+
+def run_correlation_analysis_reduced(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANTS):
+    """Same mechanism as run_correlation_analysis's 'all' subset (same population - no
+    MS/HC/female/male split here), but with the reduced feature set - written to
+    correlations/reduced/, alongside correlations/all/."""
+    base = df_participants[~df_participants["participant"].isin(excluded)].copy()
+    if len(base) < 5:
+        print(f"Skipping reduced correlation: only {len(base)} participants.")
+        return
+
+    out_dir = os.path.join(run_dir, "correlations", "reduced")
+    os.makedirs(out_dir, exist_ok=True)
+
+    features = _reduced_feature_columns(base, extra_exclude={"total_trial_count"})
+    corr, pval, annot = compute_correlation_matrix(base, features)
+    corr.to_csv(os.path.join(out_dir, "correlation_values.csv"))
+    demographics = demographics_text(base)
+    plot_heatmap(corr, annot, f"Feature Correlations - reduced (N={len(base)})",
+                 os.path.join(out_dir, "heatmap.png"), demographics=demographics)
+
+    n_sig = plot_significant_scatterplots(base, features, corr, pval, os.path.join(out_dir, "scatterplots"),
+                                           demographics=demographics)
+    print(f"Correlation subset 'reduced': N={len(base)}, {len(features)} features, {n_sig} significant scatterplots.")
 
 
 # ============================================================
@@ -748,6 +951,7 @@ def run_group_comparison(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANT
     results_df = results_df.sort_values("p_raw").reset_index(drop=True)
     results_df.to_csv(os.path.join(out_dir, "stats.csv"), index=False)
 
+    demographics = demographics_text(df)
     sorted_features = results_df["feature"].tolist()
     plots_per_image = 4
     for img_idx in range(0, len(sorted_features), plots_per_image):
@@ -766,6 +970,7 @@ def run_group_comparison(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANT
         for j in range(len(chunk), 4):
             fig.delaxes(axes[j])
         plt.suptitle(f"Features ranked {img_idx + 1}-{img_idx + len(chunk)}: MS vs HC", fontsize=14, fontweight="bold", y=1.02)
+        annotate_demographics(demographics, on_figure=True)
         plt.tight_layout()
         plt.savefig(os.path.join(out_dir, f"plot_ranks_{img_idx + 1}_to_{img_idx + len(chunk)}.png"), dpi=200, bbox_inches="tight")
         plt.close()
@@ -793,6 +998,7 @@ def run_pca_pareto(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANTS):
         return
 
     X_scaled = StandardScaler().fit_transform(df[features].values)
+    demographics = demographics_text(df)
 
     pca_full = PCA().fit(X_scaled)
     var = pca_full.explained_variance_ratio_ * 100
@@ -806,6 +1012,7 @@ def run_pca_pareto(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANTS):
     plt.ylim(0, 105)
     plt.grid(True, alpha=0.3)
     plt.legend()
+    annotate_demographics(demographics)
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "elbow.png"), dpi=150, bbox_inches="tight")
     plt.close()
@@ -823,6 +1030,7 @@ def run_pca_pareto(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANTS):
         plt.axhline(0, color="black", linewidth=1)
         plt.grid(axis="y", alpha=0.3)
         plt.xticks(rotation=90, fontsize=7)
+        annotate_demographics(demographics)
         plt.tight_layout()
         plt.savefig(os.path.join(out_dir, f"weights_PC{i + 1}.png"), dpi=150, bbox_inches="tight")
         plt.close()
@@ -839,6 +1047,7 @@ def run_pca_pareto(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANTS):
     plt.title("PCA Weights Heatmap (components x features)", fontsize=13, weight="bold")
     plt.xticks(rotation=90, fontsize=7)
     plt.yticks(rotation=0)
+    annotate_demographics(demographics, on_figure=True)
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "weights_heatmap.png"), dpi=150, bbox_inches="tight")
     plt.close()
@@ -874,6 +1083,7 @@ def run_pca_pareto(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANTS):
         cbar = plt.colorbar(scatter, ax=list(axes), orientation="horizontal", fraction=0.05, pad=0.15)
         cbar.set_label("Mean Participant Score")
         plt.suptitle("PCA Scatters & Convex Hulls", fontsize=16, weight="bold", y=1.05)
+        annotate_demographics(demographics, on_figure=True)
         plt.savefig(os.path.join(out_dir, "hulls.png"), dpi=150, bbox_inches="tight")
         plt.close()
 
@@ -968,6 +1178,7 @@ def run_partial_correlations(df_participants, run_dir, excluded=EXCLUDED_PARTICI
     plt.ylabel("Feature Controlled For", fontsize=13, fontweight="bold")
     xlim = plt.xlim()
     plt.xlim(xlim[0] - 0.1, xlim[1] + 0.1)
+    annotate_demographics(demographics_text(base_df))
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "iterative_partial_corr.png"), dpi=200, bbox_inches="tight")
     plt.close()
@@ -976,23 +1187,159 @@ def run_partial_correlations(df_participants, run_dir, excluded=EXCLUDED_PARTICI
 
 
 # ============================================================
-# 12. MAIN DRIVER
+# 12. MERGE MARKOV'S PC1-3 SCORES INTO df_participants
 # ============================================================
-def main(annotation_method="threshold_based"):
-    base_dir = pipeline_config.feature_analysis_base_dir(annotation_method)
-    run_dir = resolve_run_dir(MODE, base_dir=base_dir, load_date=LOAD_DATE)
+def merge_markov_pca_scores(df_participants, annotation_method, markov_output_base_path=None, n_components=3):
+    """Merges Markov's per-participant PC1..PC{n_components} scores (mean-matrix mode -
+    one row per participant, since use_mean_matrix=True means each participant
+    contributes exactly one vector, decision 2026-09-27) into df_participants, so they
+    become correlatable "features" in run_correlation_analysis' heatmap. Restricted to
+    the first n_components deliberately - the saved CSV can have up to 20 PCs
+    (PCA's max_comps), and only PC1-3 are the ones actually inspected/plotted
+    elsewhere; merging all of them would flood the heatmap with noise components.
+    Prefixed "Markov_PC{i}" so there's no ambiguity with any future feature-pipeline-
+    native PCA. No-op (prints a warning, returns df unchanged) if the file doesn't
+    exist yet - most likely because Markov's mean-matrix run hasn't been done for this
+    base path yet."""
+    if markov_output_base_path is None:
+        markov_output_base_path = pipeline_config.preliminary_results_dir(annotation_method)
+    # Matches markov_core.AnalysisConfig(with_repeats=False, only_1_to_9=False,
+    # use_mean_matrix=True).folder_name / .plot_output_path exactly - the only config
+    # main.py currently runs.
+    pca_csv = os.path.join(markov_output_base_path, "analysis_NO_repeats_ALL_states",
+                            "plots", "mean_matrix", "separation", "pca_scores_and_features.csv")
+    try:
+        df_pca = pd.read_csv(pca_csv)
+    except Exception as e:
+        print(f"Warning: could not load Markov PCA scores from {pca_csv}: {e}")
+        return df_participants
+
+    pc_cols = [f"PC{i}" for i in range(1, n_components + 1) if f"PC{i}" in df_pca.columns]
+    if not pc_cols:
+        print(f"Warning: no PC1..PC{n_components} columns found in {pca_csv}")
+        return df_participants
+
+    rename_map = {c: f"Markov_{c}" for c in pc_cols}
+    df_pca_small = df_pca[["Participant"] + pc_cols].rename(columns={"Participant": "participant", **rename_map})
+    merged = df_participants.merge(df_pca_small, on="participant", how="left")
+    n_matched = merged[list(rename_map.values())[0]].notna().sum()
+    print(f"Merged Markov {list(rename_map.values())} into df_participants "
+          f"({n_matched}/{len(merged)} participants matched).")
+    return merged
+
+
+def compute_exclusion_summary(participants_dict, valid_participants, exclusions):
+    """Same 3-way categorization as markov_loader.DataManager.compute_exclusion_summary
+    (hardcoded/technical/panel_count), so feature analysis contributes its own row to
+    the same shared cross-stage table (decision 2026-09-27). participants_dict must be
+    the FULL discovered dict (not whitelist-filtered), so a small test run doesn't
+    misreport the untouched rest of the population as "excluded". No equivalent
+    min-panel-count filter exists in feature analysis (unlike Markov's <4-panel
+    exclusion), so n_excluded_panel_count is always 0 here."""
+    from exclusion_policy import load_manually_excluded_participants, DEFAULT_TOBII_SUCKS_XLSX
+
+    manual = load_manually_excluded_participants()
+    valid_names = {p.name for p in valid_participants}
+    reasons_by_name = {}
+    for e in exclusions:
+        reasons_by_name.setdefault(e["participant"], []).append(str(e.get("reason") or ""))
+
+    try:
+        demo = pd.read_excel(DEFAULT_TOBII_SUCKS_XLSX)[["Patient_ID", "Gender"]]
+        gender_map = demo.set_index("Patient_ID")["Gender"].astype(str).str.strip().str.upper().str[:1].to_dict()
+    except Exception:
+        gender_map = {}
+
+    n_included = n_hardcoded = n_technical = 0
+    n_hc = n_ms = n_female = n_male = 0
+    for group, names in participants_dict.items():
+        for name in names:
+            if name in manual:
+                n_hardcoded += 1
+                continue
+            if name in valid_names:
+                n_included += 1
+                n_hc += group == "HC"
+                n_ms += group != "HC"
+                gender = gender_map.get(name, "")
+                n_female += gender == "F"
+                n_male += gender == "M"
+            elif "manually_excluded" in " ".join(reasons_by_name.get(name, [])):
+                n_hardcoded += 1
+            else:
+                n_technical += 1
+
+    return {
+        "n_total_eligible": n_included + n_technical + n_hardcoded,
+        "n_included": n_included,
+        "n_excluded_technical": n_technical,
+        "n_excluded_panel_count": 0,
+        "n_excluded_hardcoded": n_hardcoded,
+        "n_hc": n_hc, "n_ms": n_ms, "n_female": n_female, "n_male": n_male,
+    }
+
+
+# ============================================================
+# 13. MAIN DRIVER
+# ============================================================
+def main(annotation_method="threshold_based", date_str=None, run_dir=None, markov_output_base_path=None,
+         scores_csv_path=None, participant_whitelist=None, exclusion_summary_path=None):
+    """date_str: which Stage 1 date-folder to read annotated CSVs from (None auto-
+    resolves to the most recent existing one - see pipeline_config.load_annotated_csv).
+    run_dir: override where this run's own output goes (None uses the normal
+    feature_analysis_base_dir/resolve_run_dir default) - e.g. a consolidated
+    same-day-as-Markov folder (pipeline_config.consolidated_results_dir).
+    markov_output_base_path: where merge_markov_pca_scores looks for Markov's PCA
+    output (None uses Markov's own default location for annotation_method).
+    participant_whitelist: restrict to just these participant names (None runs the
+    full population as usual) - e.g. for a small end-to-end smoke test before
+    committing to a full run. exclusion_summary_path: where the shared cross-stage
+    exclusion summary CSV lives (None uses the old global default - see
+    pipeline_config.append_exclusion_summary_row)."""
+    if run_dir is None:
+        base_dir = pipeline_config.feature_analysis_base_dir(annotation_method)
+        run_dir = resolve_run_dir(MODE, base_dir=base_dir, load_date=LOAD_DATE)
+    else:
+        # resolve_run_dir creates its own dir as a side effect - an explicitly-passed
+        # run_dir (e.g. a consolidated same-day folder) needs the same treatment here.
+        os.makedirs(run_dir, exist_ok=True)
     print(f"Run directory: {run_dir} (mode={MODE}, annotation_method={annotation_method})")
 
+    if scores_csv_path is None:
+        scores_csv_path = SCORES_CSV
+
     if MODE == "compute":
-        participants_dict = discover_participants()
-        participants = load_scores(participants_dict)
-        participants, exclusions = build_trial_managers(participants, annotation_method=annotation_method)
+        full_participants_dict = discover_participants()
+        # Scores are extracted for the FULL population regardless of any whitelist
+        # (cheap - a filename scan, not the expensive trial-manager build below) so a
+        # small test run never overwrites the shared scores CSV with a partial table.
+        save_scores_table(full_participants_dict, out_path=scores_csv_path)
+        participants_dict = full_participants_dict
+        if participant_whitelist is not None:
+            participants_dict = {g: [n for n in names if n in participant_whitelist]
+                                  for g, names in participants_dict.items()}
+            print(f"Restricted to whitelist: {participants_dict}")
+        participants = load_scores(participants_dict, scores_csv=scores_csv_path)
+        participants, exclusions = build_trial_managers(participants, annotation_method=annotation_method,
+                                                          date_str=date_str)
         save_exclusion_log(exclusions, run_dir)
+
+        # Contributes this stage's own row to the same shared cross-stage exclusion
+        # summary table Markov writes to - skipped under a whitelist for the same
+        # reason Markov's own summary is (the untouched rest of the population would
+        # misreport as "excluded").
+        if participant_whitelist is None:
+            summary_stats = compute_exclusion_summary(full_participants_dict, participants, exclusions)
+            pipeline_config.append_exclusion_summary_row(
+                "Feature Analysis", annotation_method, summary_stats, out_path=exclusion_summary_path)
 
         df_trials = extract_trial_table(participants)
         df_panels = build_panel_table(df_trials, participants)
         df_panels = compute_panel_slopes(df_trials, df_panels)
         df_trials = compute_typicality(df_trials)
+
+        panel_dispersion_df = compute_fixation_dispersion_by_panel(participants)
+        df_panels = df_panels.merge(panel_dispersion_df, on=["participant", "panel"], how="left")
 
         df_participants = build_participant_table(df_trials, df_panels, participants)
         dispersion_df = compute_whole_panel_dispersion(participants)
@@ -1001,16 +1348,20 @@ def main(annotation_method="threshold_based"):
         df_participants = merge_saccade_latency(df_participants)
         df_participants = merge_ido_table(df_participants)
         df_participants = add_encoded_demographics(df_participants)
+        df_participants = merge_markov_pca_scores(df_participants, annotation_method,
+                                                    markov_output_base_path=markov_output_base_path)
 
         save_tables(df_trials, df_panels, df_participants, run_dir)
     else:
         df_trials, df_panels, df_participants = load_tables(run_dir)
 
     if RUN_RELIABILITY:
-        run_trial_reliability(df_trials, run_dir)
-        run_panel_reliability(df_panels, run_dir)
+        run_trial_reliability(df_trials, run_dir, df_participants=df_participants)
+        run_panel_reliability(df_panels, run_dir, df_participants=df_participants)
+        run_saccade_latency_reliability(run_dir, df_participants=df_participants)
     if RUN_CORRELATIONS:
         run_correlation_analysis(df_participants, run_dir)
+        run_correlation_analysis_reduced(df_participants, run_dir)
     if RUN_GROUP_COMPARISON:
         run_group_comparison(df_participants, run_dir)
     if RUN_PCA:

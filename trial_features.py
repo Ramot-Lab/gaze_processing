@@ -25,10 +25,11 @@ class TrialFeatures:
         self.dispersions_global_rms = self._extract_dispersions(type="RMS")
         self.fixation_counts_per_trial = self._extract_fixation_counts_per_trial()
         self.symbol_counts_per_trial = self._extract_symbol_counts_per_trial()
-        self.trial_in_search_durations = self._extract_trial_in_search_durations()
-        self.time_in_relevant_fixations = self._extract_time_in_relevant_fixations()
+        self.trial_in_search_durations_ms = self._extract_trial_in_search_durations()
+        self.time_in_relevant_fixations_ms = self._extract_time_in_relevant_fixations()
         self.num_of_searches_per_trial = self._extract_num_of_searches_per_trial()
         self.revisits_per_trial = self._revisits_per_trial()
+        self.search_distance_per_trial = self._extract_search_distance_per_trial()
         
         # Unpacking tuple of dictionaries properly
         self.unique_counts_per_trial, self.percent_n_unique_symbols = self._extract_percent_N_unique_symbols_in_trial()
@@ -90,16 +91,21 @@ class TrialFeatures:
         return {trial.idx: (sum(len(search.cleaned_sequence) for search in trial.searches) if trial.searches else 0) for trial in self.trials}
     
     def _extract_trial_in_search_durations(self):
+        """Milliseconds (decision 2026-09-27) - search.duration() is end_time-start_time
+        in the raw t column's microsecond units (same convention as
+        FixationHandler.Fixation.duration()); /1000 converts to ms for readability in
+        every downstream table/plot."""
         durations = {}
         for trial in self.trials:
             trial_duration = 0
             if trial.searches:
                 for search in trial.searches:
                     trial_duration += search.duration()
-            durations[trial.idx] = trial_duration
+            durations[trial.idx] = trial_duration / 1000.0
         return durations
 
     def _extract_time_in_relevant_fixations(self):
+        """Milliseconds (decision 2026-09-27) - see _extract_trial_in_search_durations."""
         time_in_rel_fix = {}
         for trial in self.trials:
             time_in_fixations = 0
@@ -107,12 +113,28 @@ class TrialFeatures:
                 start = trial.relevant_fixations[0].start_time
                 end = trial.relevant_fixations[-1].end_time
                 time_in_fixations = end - start
-            time_in_rel_fix[trial.idx] = time_in_fixations
+            time_in_rel_fix[trial.idx] = time_in_fixations / 1000.0
         return time_in_rel_fix
         
     def _extract_num_of_searches_per_trial(self):
         return {trial.idx: len(trial.searches) if trial.searches is not None else 0 for trial in self.trials}
-    
+
+    def _extract_search_distance_per_trial(self):
+        """Total gaze path length within the dictionary area for a trial: sum of
+        consecutive-fixation Euclidean distances (search.fixations is dictionary-zone
+        only, per SearchFinder.find), summed across every search in the trial. A search
+        with 0-1 fixations contributes 0 (no consecutive pair to measure)."""
+        distances = {}
+        for trial in self.trials:
+            total = 0.0
+            if trial.searches:
+                for search in trial.searches:
+                    positions = [f.position for f in search.fixations]
+                    for (x1, y1), (x2, y2) in zip(positions, positions[1:]):
+                        total += np.hypot(x2 - x1, y2 - y1)
+            distances[trial.idx] = total
+        return distances
+
 
     def _extract_percent_N_unique_symbols_in_trial(self):
         unique_counts = {}
@@ -211,7 +233,7 @@ class TrialFeatures:
         valid_trials = [t.idx for t in self.trials]
         
         itis = np.array([self.inter_trial_intervals.get(idx, np.nan) for idx in valid_trials])
-        search_times = np.array([self.trial_in_search_durations.get(idx, np.nan) for idx in valid_trials])
+        search_times = np.array([self.trial_in_search_durations_ms.get(idx, np.nan) for idx in valid_trials])
         trial_indices = np.array(valid_trials)
         
         valid_mask = ~np.isnan(itis)

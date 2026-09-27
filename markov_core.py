@@ -20,6 +20,13 @@ class AnalysisConfig:
     # and which preliminary_results_<method> folder output lands in.
     annotation_method: str = "threshold_based"
 
+    # Which Stage 1 date-folder to read annotated CSVs from (decision 2026-09-27) - None
+    # auto-resolves to the most recent existing folder for annotation_method
+    # (pipeline_config.latest_annotated_gaze_date), same as before this field existed.
+    # Pin explicitly (e.g. "26_09_26") when you want to be certain which Stage 1 run is
+    # being read, independent of what folders happen to exist on a given day.
+    date_str: str = None
+
     # None means "derive from pipeline_config using annotation_method" - resolved in
     # __post_init__ rather than as a dataclass default, since the value depends on
     # another field (annotation_method) and on the live network mount.

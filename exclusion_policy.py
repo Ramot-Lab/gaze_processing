@@ -44,11 +44,29 @@ MANUALLY_EXCLUDED_PARTICIPANTS = {
     "YR573": "HC control who didn't care/engage with the task - not representative",
 }
 
+# Panel-level (not whole-participant) hand-curated exclusions (decision 2026-09-27):
+# for issues found in already-preprocessed data that Stage 1 itself now catches going
+# forward (run_preprocessing.py's timestamp_gap check), but won't get re-caught until
+# preprocessing is re-run. Wired into pipeline_config.load_annotated_csv/
+# stage1_exclusion_reason, so every downstream consumer (Markov, feature analysis, and
+# any one-off script reading Stage 1's CSVs) skips these exactly like a real Stage 1
+# drop, without discarding the participant's other, unaffected panels.
+MANUALLY_EXCLUDED_PANELS = {
+    ("ER635", "l3"): "raw recording has a ~35s timestamp discontinuity (single row-to-row "
+                     "gap, no missing samples, position barely changes across it) - found by "
+                     "signal_quality_checks.find_timestamp_gaps' population scan, 2026-09-27",
+}
+
 
 def load_tobii_sucks_excluded_participants(xlsx_path=DEFAULT_TOBII_SUCKS_XLSX):
     """Set of Patient_IDs flagged Tobii_Sucks == 'YES' in the behavioral summary table."""
     df = pd.read_excel(xlsx_path)
     return set(df.loc[df["Tobii_Sucks"].astype(str).str.upper() == "YES", "Patient_ID"])
+
+
+def load_manually_excluded_panels():
+    """{(participant, panel): reason} for the hand-curated panel-level exclusions above."""
+    return dict(MANUALLY_EXCLUDED_PANELS)
 
 
 def load_manually_excluded_participants():

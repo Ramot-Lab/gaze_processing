@@ -114,6 +114,17 @@ def feature_output_dir(method, date_str=None):
     return os.path.join(feature_analysis_base_dir(method), _today(date_str))
 
 
+def consolidated_results_dir(date_str=None):
+    """One shared output root for a joint run of every analysis stage on the same day
+    (decision 2026-09-27) - so a run's Markov + feature-analysis + symbol-search +
+    duration-analysis output all land side by side under one dated folder instead of
+    scattered across each stage's own default location. Opt-in: pass this as
+    AnalysisConfig.output_base_path / feature_pipeline.main's run_dir / the other
+    scripts' run_dir - nothing defaults to it on its own."""
+    resolved = date_str or datetime.now().strftime("%d_%m_%y")
+    return os.path.join(noam_m_root(), f"markov_features_results_{resolved}")
+
+
 def annotated_csv_path(method, group, participant, panel, date_str=None, corrected=False):
     """corrected=True points at the whole-dictionary-drift-corrected CSV saved NEXT TO the
     raw one (decision 2026-09-22) - same directory, same base name, "_corrected" suffix -
@@ -140,8 +151,19 @@ def load_annotated_csv(method, group, participant, panel, date_str=None, correct
     dependent (Markov chain analysis; feature analysis, since its TrialManager construction
     goes through the same y-dependent Search/Sequence building) - raw (uncorrected) stays
     the right choice elsewhere (e.g. this file's own SearchFinder-boundary exclusion checks,
-    which are about where gaze genuinely was, not where it "should" have been)."""
+    which are about where gaze genuinely was, not where it "should" have been).
+
+    Checks exclusion_policy.MANUALLY_EXCLUDED_PANELS first (decision 2026-09-27) and
+    raises FileNotFoundError for those too, same as a genuine missing file - this is the
+    single chokepoint every consumer already reads through, so one entry here excludes
+    the panel everywhere (Markov, feature analysis, and any one-off script) without
+    needing Stage 1 to be re-run."""
     import pandas as pd
+    from exclusion_policy import load_manually_excluded_panels
+    manual_panels = load_manually_excluded_panels()
+    if (participant, panel) in manual_panels:
+        raise FileNotFoundError(f"manually_excluded_panel: {manual_panels[(participant, panel)]}")
+
     if corrected:
         corrected_path = annotated_csv_path(method, group, participant, panel, date_str, corrected=True)
         if os.path.exists(corrected_path):
@@ -167,7 +189,18 @@ def stage1_exclusion_reason(method, participant, panel, date_str=None):
     the exact same missing data). Returns None if Stage 1 has no row for this exact
     (participant, panel) - either it genuinely wasn't excluded (unexpected - the caller
     should treat that as a real, new problem) or Stage 1 hasn't been run for this
-    method/date at all."""
+    method/date at all.
+
+    Checked BEFORE the exclusion_log.csv cache (decision 2026-09-27): a manually
+    excluded panel (exclusion_policy.MANUALLY_EXCLUDED_PANELS) was never actually
+    dropped by the Stage 1 run that produced this date's exclusion_log.csv - Stage 1
+    saved it just fine, the exclusion happens later at load_annotated_csv - so it would
+    otherwise be invisible here and reported as an unexplained new problem."""
+    from exclusion_policy import load_manually_excluded_panels
+    manual_panels = load_manually_excluded_panels()
+    if (participant, panel) in manual_panels:
+        return f"manually_excluded_panel: {manual_panels[(participant, panel)]}"
+
     key = (method, date_str)
     if key not in _stage1_exclusion_cache:
         import pandas as pd
@@ -178,3 +211,33 @@ def stage1_exclusion_reason(method, participant, panel, date_str=None):
         except Exception:
             _stage1_exclusion_cache[key] = {}
     return _stage1_exclusion_cache[key].get((participant, panel))
+
+
+EXCLUSION_SUMMARY_CSV = "analysis_participant_exclusion_summary.csv"
+
+
+def append_exclusion_summary_row(analysis_name, method, stats, out_path=None):
+    """One shared table across every analysis stage (Markov, feature analysis, ...) and
+    method, so participant counts/exclusion-category breakdowns sit side by side instead
+    of scattered per-stage (decision 2026-09-27). `stats` is a dict of
+    {n_total_eligible, n_included, n_excluded_technical, n_excluded_panel_count,
+    n_excluded_hardcoded} - see markov_loader.DataManager.compute_exclusion_summary for
+    how those categories are defined. Upserts by (analysis, method): re-running the same
+    analysis/method replaces its row instead of duplicating it.
+
+    out_path: where the shared CSV lives (None uses the old global default under
+    noam_m_root()) - pass the top level of a consolidated run folder (sibling to
+    markov_analysis/feature_analysis, not nested inside either) so "all steps together"
+    genuinely means one file outside every per-stage folder."""
+    import pandas as pd
+    path = out_path if out_path is not None else os.path.join(noam_m_root(), EXCLUSION_SUMMARY_CSV)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    row = {"analysis": analysis_name, "method": method, **stats}
+    if os.path.exists(path):
+        df = pd.read_csv(path)
+        df = df[~((df["analysis"] == analysis_name) & (df["method"] == method))]
+        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    else:
+        df = pd.DataFrame([row])
+    df.to_csv(path, index=False)
+    print(f"Updated exclusion summary row '{analysis_name}'/{method} -> {path}")
