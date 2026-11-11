@@ -114,6 +114,16 @@ def feature_output_dir(method, date_str=None):
     return os.path.join(feature_analysis_base_dir(method), _today(date_str))
 
 
+def fxsp_annotation_cache_dir():
+    """Shared, run-independent cache of gazeNET per-sample labels for the fxsp task
+    (saccade_latency_analysis.py) - the fxsp counterpart of Stage 1's
+    SDMT_annotated_gaze_<date>_model folders. Model inference is the only slow step
+    (~40 s/participant); keeping it out of the per-run folders lets every feature run
+    recompute latencies in minutes. Files are keyed by participant + source .mat name,
+    so a new recording gets its own entry instead of reusing a stale one."""
+    return os.path.join(noam_m_root(), "fxsp_annotated_gaze_model")
+
+
 def consolidated_results_dir(date_str=None):
     """One shared output root for a joint run of every analysis stage on the same day
     (decision 2026-09-27) - so a run's Markov + feature-analysis + symbol-search +

@@ -7,6 +7,9 @@ import warnings
 
 import pipeline_config
 
+# AnalysisConfig.matrix_type -> output folder suffix ("" keeps the original folder names).
+MATRIX_TYPE_SUFFIXES = {"conditional": "", "normalized_by_n_transitions": "_NORMALIZED_BY_N_TRANSITIONS", "normalized_by_score": "_NORMALIZED_BY_SCORE"}
+
 @dataclass
 class AnalysisConfig:
     with_repeats: bool
@@ -33,7 +36,29 @@ class AnalysisConfig:
     raw_behavior_path: str = None
     output_base_path: str = None
 
+    # What each matrix cell holds:
+    #   "conditional"                 - row-stochastic P(B | A) = count(A->B) / count(A->*)
+    #                                   (original).
+    #   "normalized_by_n_transitions" - count(A->B) / number of all transitions in the
+    #                                   panel; the whole matrix sums to 1
+    #                                   (GazeMarkovModel.get_joint_probability_matrix).
+    #   "normalized_by_score"         - count(A->B) / the panel's SDMT score; not summing
+    #                                   to 1 (GazeMarkovModel.get_per_score_matrix).
+    # Each non-conditional type gets its own folder (folder_name suffix) so it never
+    # overwrites the conditional run's matrices/plots.
+    matrix_type: str = "conditional"
+
+    # If set, from_scratch builds matrices from an EARLIER run's saved
+    # trial_stats_<p>_panel_<panel>.csv files (their Sequence/Cleaned_Sequence columns)
+    # instead of re-reading Stage 1's annotated gaze CSVs. Point it at that run's
+    # analysis folder (the one containing markov_matrices/ and exclusion_log.csv, i.e.
+    # its AnalysisConfig.main_output_path). with_repeats/only_1_to_9 are applied at
+    # count time, so any earlier run's trial_stats serves every variant.
+    trial_stats_source_dir: str = None
+
     def __post_init__(self):
+        if self.matrix_type not in MATRIX_TYPE_SUFFIXES:
+            raise ValueError(f"matrix_type must be one of {list(MATRIX_TYPE_SUFFIXES)}, got {self.matrix_type!r}")
         if self.raw_behavior_path is None:
             self.raw_behavior_path = pipeline_config.main_data_path()
         if self.output_base_path is None:
@@ -43,7 +68,7 @@ class AnalysisConfig:
     def folder_name(self):
         repeat_str = "WITH_repeats" if self.with_repeats else "NO_repeats"
         state_str = "ONLY_1_9" if self.only_1_to_9 else "ALL_states"
-        return f"analysis_{repeat_str}_{state_str}"
+        return f"analysis_{repeat_str}_{state_str}{MATRIX_TYPE_SUFFIXES[self.matrix_type]}"
 
     @property
     def main_output_path(self):

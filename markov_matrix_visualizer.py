@@ -8,8 +8,12 @@ class MarkovVisualizer:
     """
     Handles plotting of existing matrices stored in Participant objects.
     """
-    def __init__(self, output_dir=None):
+    def __init__(self, output_dir=None, matrix_type="conditional"):
         self.output_dir = output_dir
+        # AnalysisConfig.matrix_type - "normalized_by_n_transitions" cells sum to 1 over
+        # the whole matrix and "normalized_by_score" cells aren't bounded by 1, so for
+        # both a fixed 0-1 color scale is wrong; scaled to the matrix's own max instead.
+        self.matrix_type = matrix_type
 
     def plot_heatmap(self, participant, panel, save=True):
         """
@@ -28,9 +32,15 @@ class MarkovVisualizer:
         cmap = sns.color_palette("YlGnBu", as_cmap=True)
         cmap.set_bad("gray", 0.3)
         
-        sns.heatmap(df, annot=True, fmt=".2f", cmap=cmap, vmin=0, vmax=1,
+        if self.matrix_type in ("normalized_by_n_transitions", "normalized_by_score"):
+            vmax = np.nanmax(df.values) if np.isfinite(df.values).any() else 1
+            fmt, title_type = {"normalized_by_n_transitions": (".3f", "A->B / #transitions"),
+                               "normalized_by_score": (".3f", "A->B / SDMT score")}[self.matrix_type]
+        else:
+            vmax, fmt, title_type = 1, ".2f", "P(B | A)"
+        sns.heatmap(df, annot=True, fmt=fmt, cmap=cmap, vmin=0, vmax=vmax,
                     annot_kws={"size": 6})
-        plt.title(f"Transitions: {participant.name} ({panel})")
+        plt.title(f"Transitions [{title_type}]: {participant.name} ({panel})")
         plt.ylabel("From State")
         plt.xlabel("To State")
         

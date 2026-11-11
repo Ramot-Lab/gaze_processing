@@ -10,14 +10,18 @@ import seaborn as sns
 import statsmodels.api as sm
 from scipy.stats import pearsonr, linregress, ttest_ind
 from scipy.spatial import ConvexHull
+from scipy.spatial.distance import squareform
+from scipy.cluster.hierarchy import linkage, optimal_leaf_ordering, leaves_list
 from statsmodels.stats.multitest import multipletests
 from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.patches import Patch
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
 from participant_gaze_data_manager import ParticipantGazeDataManager
 from trial_manager import TrialManager
 import pipeline_config
+import saccade_latency_analysis
 
 
 # ============================================================
@@ -25,7 +29,11 @@ import pipeline_config
 # ============================================================
 NOAM_DATA_PATH = "/Volumes/ramot/Noam_M/Results/Behavior"
 SCORES_CSV = "/Volumes/ramot/Noam_M/preliminary_results/behavior_scores/all_scores.csv"
-SACCADE_LATENCY_CSV = "/Volumes/ramot/Noam_M/preliminary_results/saccade_latency/Maysan_test/compiled_latencies.csv"
+# Saccade latency (decision 2026-11-05): no longer read from the external
+# .../saccade_latency/Maysan_test/compiled_latencies.csv (I-DT @ 100 Hz) - main() computes
+# it per run via saccade_latency_analysis.main (gazeNET @ 600 Hz on fxsp) into
+# <run_dir>/saccade_latency/compiled_latencies.csv. Always model-based, whatever this
+# run's annotation_method, since fxsp has no threshold-based Stage 1 output.
 IDO_TABLE_XLSX = "/Volumes/ramot/Noam_M/df_filtered_behavioral_summary_20260427_131437.xlsx"
 # Legacy fallback only - main() resolves the real, per-method output dir via
 # pipeline_config.feature_output_dir(annotation_method).
@@ -49,14 +57,18 @@ TRIAL_FEATURE_ATTRS = [
 
 MIN_TRIALS_RELIABILITY = 150   # internal to trial-level reliability split-half
 MIN_PANELS_RELIABILITY = 4     # internal to panel-level reliability split-half
-# Saccade-latency trial counts (compiled_latencies.csv) are far lower and far more variable
-# per participant than in-task trials/panels (observed range ~7-97, mean ~80, but heavily
-# clustered 75-95 with a handful of low outliers) - 60 keeps ~87/92 participants while still
-# giving a 30-value-per-half split (max_l = min_count // 2), a better inclusion/data-richness
-# trade-off here than reusing MIN_TRIALS_RELIABILITY (150, higher than this data's own max).
+# Saccade-latency trial counts (compiled_latencies.csv) are far lower than in-task
+# trials/panels - 60 gives a 30-value-per-half split (max_l = min_count // 2), a better
+# inclusion/data-richness trade-off than reusing MIN_TRIALS_RELIABILITY (150, above this
+# data's own max). Originally set on the old I-DT table (range ~7-97, 87/92 kept); on the
+# gazeNET 600 Hz table (2026-11-04: range 59-99, median 91) it keeps 115/116.
 MIN_SACCADE_LATENCY_RELIABILITY = 60
+MIN_FIXATION_BCEA_RELIABILITY = 60
+MIN_PSO_DURATION_RELIABILITY = 60
 RELIABILITY_REPETITIONS = 1000
 TYPICALITY_COVERAGE_PCTL = 20  # keep participants above this percentile of total trials (~top 80%)
+SYMBOL_CORR_SCORE_SD_CUTOFF = 2.0  # #symbols_corr_to_mean: keep participants within +-2 SD of a panel's own mean score
+MIN_TRIALS_FOR_SYMBOL_CORR = 5  # minimum matched trial_idx positions required to compute a participant's own r
 
 ID_COLS_TRIAL = {"participant", "panel", "trial_idx"}
 ID_COLS_PANEL = {"participant", "panel"}
@@ -76,8 +88,6 @@ CORRELATION_SUBSETS = {
     "all": lambda df: pd.Series(True, index=df.index),
     "MS": lambda df: df["group"].isin(["MS", "pwMS"]),
     "HC": lambda df: df["group"] == "HC",
-    "female": lambda df: df["Gender"].isin(["F", "Female"]),
-    "male": lambda df: df["Gender"].isin(["M", "Male"]),
 }
 
 
@@ -406,6 +416,145 @@ def compute_typicality(df_trials, coverage_pctl=TYPICALITY_COVERAGE_PCTL):
     return df_trials
 
 
+def compute_symbols_corr_to_mean(df_trials, df_panels, sd_cutoff=SYMBOL_CORR_SCORE_SD_CUTOFF,
+                                   min_trials=MIN_TRIALS_FOR_SYMBOL_CORR):
+    """#symbols_corr_to_mean (decision 2026-11-08) - deliberately NOT named/treated as a
+    replacement for 'typicality': typicality is a per-trial LEVEL deviation (participant's
+    symbol count minus the population's at the same trial position); this is a SHAPE
+    measure instead - does this participant's own trial-to-trial rise-and-fall in
+    symbol_counts_per_trial correlate with the population's, independent of their overall
+    level. Computed per panel: participants whose panel score falls within sd_cutoff SD of
+    that panel's own mean score define (and receive) the measure - score-outlier
+    participants on a panel get NaN there, excluded from both sides. Among score-eligible
+    participants, the population-mean vector is each trial_idx's mean symbol_counts_per_trial
+    across them; each eligible participant's own vector (their own trial_idx values) is
+    Pearson-correlated against it, matched on trial_idx. Needs >= min_trials matched points
+    and nonzero variance on both sides - otherwise NaN. (Zero variance happens when a
+    participant's own symbol count is identical on every one of their trials - a flat
+    performer - which makes Pearson's std-based denominator zero and the correlation
+    mathematically undefined, the same failure mode already seen elsewhere in this
+    pipeline's BCEA correlation term, independent of the score-based exclusion above.)"""
+    rows = []
+    for panel, panel_scores in df_panels.groupby("panel"):
+        s_mean, s_std = panel_scores["score"].mean(), panel_scores["score"].std()
+        if pd.isna(s_std) or s_std == 0:
+            eligible = set(panel_scores["participant"])
+        else:
+            lo, hi = s_mean - sd_cutoff * s_std, s_mean + sd_cutoff * s_std
+            eligible = set(panel_scores.loc[panel_scores["score"].between(lo, hi), "participant"])
+
+        panel_trials = df_trials[(df_trials["panel"] == panel) & (df_trials["participant"].isin(eligible))]
+        trial_mean = panel_trials.groupby("trial_idx")["symbol_counts_per_trial"].mean()
+
+        for participant, g in panel_trials.groupby("participant"):
+            own = g.set_index("trial_idx")["symbol_counts_per_trial"].rename("own")
+            matched = pd.concat([own, trial_mean.rename("pop_mean")], axis=1, join="inner").dropna()
+            if len(matched) < min_trials or matched["own"].std() == 0 or matched["pop_mean"].std() == 0:
+                r = np.nan
+            else:
+                r, _ = pearsonr(matched["own"], matched["pop_mean"])
+            rows.append({"participant": participant, "panel": panel, "symbols_corr_to_mean": r})
+
+        for participant in set(panel_scores["participant"]) - eligible:
+            rows.append({"participant": participant, "panel": panel, "symbols_corr_to_mean": np.nan})
+
+    return pd.DataFrame(rows)
+
+
+def merge_symbols_corr_to_mean(df_trials, df_panels, df_participants,
+                                 sd_cutoff=SYMBOL_CORR_SCORE_SD_CUTOFF, min_trials=MIN_TRIALS_FOR_SYMBOL_CORR):
+    """Panel- and participant-level #symbols_corr_to_mean in one pass, mean-of-panel-means
+    at participant level (decision 2026-09-29's convention, applied here too)."""
+    corr_df = compute_symbols_corr_to_mean(df_trials, df_panels, sd_cutoff=sd_cutoff, min_trials=min_trials)
+    df_panels = df_panels.merge(corr_df, on=["participant", "panel"], how="left")
+
+    participant_stats = corr_df.groupby("participant")["symbols_corr_to_mean"].agg(["mean", "std"]).reset_index()
+    participant_stats.columns = ["participant", "symbols_corr_to_mean_mean", "symbols_corr_to_mean_std"]
+    df_participants = df_participants.merge(participant_stats, on="participant", how="left")
+
+    n_valid = corr_df["symbols_corr_to_mean"].notna().sum()
+    print(f"#symbols_corr_to_mean: {n_valid}/{len(corr_df)} participant x panel rows have a value "
+          f"(the rest excluded by the +-{sd_cutoff} SD panel-score cutoff, or too few/constant trials).")
+    return df_panels, df_participants
+
+
+def plot_symbols_corr_to_mean_examples(df_trials, df_panels, panel, out_path, demographics=None):
+    """Picks the lowest-, median-, and highest-correlation score-eligible participants on
+    `panel` and overlays each one's own symbol_counts_per_trial trajectory against the
+    population-mean trajectory it was correlated against - the clearest way to see what a
+    high vs. low #symbols_corr_to_mean value actually looks like, rather than just reading
+    the number."""
+    panel_rows = df_panels[(df_panels["panel"] == panel) & df_panels["symbols_corr_to_mean"].notna()]
+    if len(panel_rows) < 3:
+        print(f"Skipping example-trajectory plot for panel {panel}: only {len(panel_rows)} eligible participants.")
+        return
+
+    sorted_rows = panel_rows.sort_values("symbols_corr_to_mean")
+    picks = {
+        "Lowest r": sorted_rows.iloc[0],
+        "Median r": sorted_rows.iloc[len(sorted_rows) // 2],
+        "Highest r": sorted_rows.iloc[-1],
+    }
+
+    eligible = set(panel_rows["participant"])
+    panel_trials = df_trials[(df_trials["panel"] == panel) & (df_trials["participant"].isin(eligible))]
+    trial_mean = panel_trials.groupby("trial_idx")["symbol_counts_per_trial"].mean()
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5), sharey=True)
+    for ax, (label, row) in zip(axes, picks.items()):
+        p = row["participant"]
+        own = (df_trials[(df_trials["panel"] == panel) & (df_trials["participant"] == p)]
+               .set_index("trial_idx")["symbol_counts_per_trial"].sort_index())
+        ax.plot(trial_mean.index, trial_mean.values, "k--", linewidth=2, label="Population mean (eligible)")
+        ax.plot(own.index, own.values, "o-", color="teal", alpha=0.85, label=p)
+        ax.set_title(f"{label}: {p}\nr={row['symbols_corr_to_mean']:.3f}")
+        ax.set_xlabel("trial_idx")
+        ax.legend(fontsize=8)
+    axes[0].set_ylabel("symbol_counts_per_trial")
+    plt.suptitle(f"#symbols_corr_to_mean - example trajectories (panel {panel})", fontsize=14, fontweight="bold")
+    annotate_demographics(demographics, on_figure=True)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Example-trajectory plot saved: panel {panel} -> {out_path}")
+
+
+def run_symbols_corr_to_mean_diagnostics(df_trials, df_panels, df_participants, run_dir,
+                                           excluded=EXCLUDED_PARTICIPANTS):
+    """Interpretive output for #symbols_corr_to_mean (decision 2026-11-08): an example-
+    trajectory plot (what a high/low r actually looks like), a population distribution,
+    and the standard MS-vs-HC boxplot+Welch's-t-test used for every other signal feature."""
+    out_dir = os.path.join(run_dir, "symbols_corr_to_mean")
+    os.makedirs(out_dir, exist_ok=True)
+
+    valid_counts = df_panels[df_panels["symbols_corr_to_mean"].notna()].groupby("panel").size()
+    if valid_counts.empty:
+        print("No panel has any valid #symbols_corr_to_mean values - skipping diagnostics.")
+        return
+
+    df = df_participants[~df_participants["participant"].isin(excluded)]
+    demographics = demographics_text(df)
+
+    plot_symbols_corr_to_mean_examples(df_trials, df_panels, valid_counts.idxmax(),
+                                        os.path.join(out_dir, f"example_trajectories_panel_{valid_counts.idxmax()}.png"),
+                                        demographics=demographics)
+
+    plt.figure(figsize=(8, 6))
+    plt.hist(df["symbols_corr_to_mean_mean"].dropna(), bins=20, color="teal", edgecolor="black", alpha=0.8)
+    plt.xlabel("#symbols_corr_to_mean (participant-level mean)")
+    plt.ylabel("Count")
+    plt.title("Distribution of #symbols_corr_to_mean across participants")
+    annotate_demographics(demographics)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "distribution.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+
+    plot_group_boxplot_with_ttest(df, "symbols_corr_to_mean_mean", "#symbols_corr_to_mean",
+                                   os.path.join(out_dir, "group_comparison.png"), demographics=demographics)
+
+    print(f"#symbols_corr_to_mean diagnostics saved to {out_dir}")
+
+
 # ============================================================
 # 4. WHOLE-PANEL FIXATION DISPERSION (compute mode only)
 # ============================================================
@@ -440,13 +589,22 @@ def _collect_fixation_bcea_values(participant):
     return values_by_panel
 
 
-def compute_fixation_dispersion_by_panel(participants):
+def compute_fixation_dispersion_by_panel(participants, df_bcea=None):
     """Panel-level (participant x panel) individual-fixation BCEA (decision
     2026-09-27) - previously this only existed collapsed to one number per
-    participant (compute_whole_panel_dispersion, pooling every panel together)."""
+    participant (compute_whole_panel_dispersion, pooling every panel together).
+    df_bcea: the saved per-fixation table (build_fixation_bcea_table) to aggregate from
+    (decision 2026-11-10 - the raw table is saved first, then these features are derived
+    from it); None recomputes the values from the TrialManagers."""
     rows = []
     for participant in participants:
-        for panel, values in _collect_fixation_bcea_values(participant).items():
+        if df_bcea is not None:
+            own = df_bcea[df_bcea["participant"] == participant.name]
+            values_by_panel = {panel: own.loc[own["panel"] == panel, "fixation_bcea"].tolist()
+                               for panel in participant.trial_managers}
+        else:
+            values_by_panel = _collect_fixation_bcea_values(participant)
+        for panel, values in values_by_panel.items():
             if values:
                 rows.append({"participant": participant.name, "panel": panel,
                               "fixation_bcea_mean": np.mean(values), "fixation_bcea_std": np.std(values, ddof=1)})
@@ -456,23 +614,17 @@ def compute_fixation_dispersion_by_panel(participants):
     return pd.DataFrame(rows)
 
 
-def compute_whole_panel_dispersion(participants):
-    """Participant-level individual-fixation BCEA, pooled across all of a
-    participant's panels - unchanged definition; see compute_fixation_dispersion_by_panel
-    for the (newer) panel-level breakdown of the same underlying values."""
-    rows = []
-    for participant in participants:
-        values = [v for panel_values in _collect_fixation_bcea_values(participant).values() for v in panel_values]
-        if values:
-            rows.append({
-                "participant": participant.name,
-                "fixation_bcea_mean": np.mean(values),
-                "fixation_bcea_std": np.std(values, ddof=1),
-            })
-        else:
-            rows.append({"participant": participant.name, "fixation_bcea_mean": np.nan, "fixation_bcea_std": np.nan})
-
-    return pd.DataFrame(rows)
+def compute_whole_panel_dispersion(participants, df_bcea=None):
+    """Participant-level individual-fixation BCEA, as mean-of-panel-means (decision
+    2026-09-29, for consistency with pso_duration/pso_bcea/saccade_latency): each panel's
+    own mean fixation_bcea (compute_fixation_dispersion_by_panel) is averaged across
+    panels, so every panel counts equally regardless of how many fixations it happened to
+    contribute, rather than pooling every raw fixation together. Previously pooled raw
+    values directly - superseded by this."""
+    panel_df = compute_fixation_dispersion_by_panel(participants, df_bcea=df_bcea)
+    stats = panel_df.groupby("participant")["fixation_bcea_mean"].agg(["mean", "std"]).reset_index()
+    stats.columns = ["participant", "fixation_bcea_mean", "fixation_bcea_std"]
+    return stats
 
 
 # ============================================================
@@ -484,19 +636,20 @@ def build_participant_table(df_trials, df_panels, participants):
     stats = stats.rename(columns={"typicality_mean": "mean_typicality"})
     stats = stats.reset_index()
 
-    total_trials = df_trials.groupby("participant").size().rename("total_trial_count").reset_index()
     mean_score = df_panels.groupby("participant")["score"].mean().rename("score").reset_index()
     group_lookup = pd.DataFrame([{"participant": p.name, "group": p.group} for p in participants])
     slopes = df_panels.groupby("participant")["first5_last5_slope"].mean().rename("first5_last5_slope_mean").reset_index()
 
-    df_participants = stats.merge(total_trials, on="participant", how="left")
-    df_participants = df_participants.merge(mean_score, on="participant", how="left")
+    df_participants = stats.merge(mean_score, on="participant", how="left")
     df_participants = df_participants.merge(group_lookup, on="participant", how="left")
     df_participants = df_participants.merge(slopes, on="participant", how="left")
     return df_participants
 
 
-def merge_saccade_latency(df_participants, saccade_csv=SACCADE_LATENCY_CSV):
+def merge_saccade_latency(df_participants, saccade_csv):
+    if saccade_csv is None:
+        print("Warning: no saccade latency table for this run - saccade_latency_ms_* not merged.")
+        return df_participants
     try:
         df_lat = pd.read_csv(saccade_csv)
     except Exception as e:
@@ -507,6 +660,53 @@ def merge_saccade_latency(df_participants, saccade_csv=SACCADE_LATENCY_CSV):
         saccade_latency_ms_mean="mean", saccade_latency_ms_std="std"
     ).reset_index()
     return df_participants.merge(lat_stats, on="participant", how="left")
+
+
+def merge_pso_duration(df_participants, annotation_method, date_str=None):
+    """PSO duration is computed directly from Stage 1's raw annotated CSVs
+    (duration_analysis.py), entirely independent of SDMT trial/search structure.
+    Participant-level mean/std is mean-of-panel-means (decision 2026-09-29, for
+    consistency with fixation_bcea/pso_bcea/saccade_latency): each panel's own mean PSO
+    duration is computed first, then averaged/std'd across panels, so every panel counts
+    equally regardless of how many PSO blocks it happened to contribute. Previously
+    pooled every raw PSO block together directly - superseded by this."""
+    from duration_analysis import build_pso_duration_table
+    df_pso = build_pso_duration_table(annotation_method, date_str=date_str)
+    if df_pso.empty:
+        print("Warning: no PSO duration data found.")
+        return df_participants
+
+    panel_means = df_pso.groupby(["participant", "panel"])["pso_duration_ms"].mean().reset_index()
+    pso_stats = panel_means.groupby("participant")["pso_duration_ms"].agg(["mean", "std"]).reset_index()
+    pso_stats.columns = ["participant", "pso_duration_ms_mean", "pso_duration_ms_std"]
+    return df_participants.merge(pso_stats, on="participant", how="left")
+
+
+def merge_pso_bcea(df_panels, df_participants, annotation_method, date_str=None):
+    """Panel- AND participant-level PSO BCEA (dispersion of the raw gaze samples
+    within each PSO block) in one pass - one population scan, not two (decision
+    2026-09-29). Mirrors fixation_bcea's own panel/participant treatment
+    (compute_fixation_dispersion_by_panel / compute_whole_panel_dispersion), but
+    computed directly from raw Stage 1 CSVs like PSO duration, not via
+    TrialManager/Fixation objects."""
+    from duration_analysis import build_pso_bcea_table
+    df_pso_bcea = build_pso_bcea_table(annotation_method, date_str=date_str)
+    if df_pso_bcea.empty:
+        print("Warning: no PSO BCEA data found.")
+        return df_panels, df_participants
+
+    panel_stats = df_pso_bcea.groupby(["participant", "panel"])["pso_bcea"].agg(
+        pso_bcea_mean="mean", pso_bcea_std="std"
+    ).reset_index()
+    df_panels = df_panels.merge(panel_stats, on=["participant", "panel"], how="left")
+
+    # Participant-level is mean-of-panel-means (decision 2026-09-29, for consistency with
+    # fixation_bcea/pso_duration/saccade_latency), not pooled across all raw PSO blocks.
+    participant_stats = panel_stats.groupby("participant")["pso_bcea_mean"].agg(["mean", "std"]).reset_index()
+    participant_stats.columns = ["participant", "pso_bcea_mean", "pso_bcea_std"]
+    df_participants = df_participants.merge(participant_stats, on="participant", how="left")
+
+    return df_panels, df_participants
 
 
 def merge_ido_table(df_participants, ido_xlsx=IDO_TABLE_XLSX):
@@ -640,11 +840,12 @@ def plot_random_scatter(half_a, half_b, r_value, feature_name, l_size, iteration
 
 
 def calculate_reliability(data, l_size, repetitions, min_value, feature_name, save_dir=None, plot=True,
-                           extract_scatters=False, demographics=None):
+                           extract_scatters=False, demographics=None, return_details=False):
     array_corr = np.zeros(repetitions)
     subjects_amount = len(data)
     random_iters = np.random.choice(repetitions, min(2, repetitions), replace=False) if extract_scatters else []
 
+    all_halves = []
     for i in range(repetitions):
         shuffle = np.random.permutation(np.arange(min_value))
         half_a, half_b = [], []
@@ -653,6 +854,8 @@ def calculate_reliability(data, l_size, repetitions, min_value, feature_name, sa
             half_b.append(np.mean(data[participant_idx][shuffle[l_size:2 * l_size]]))
         r_val = np.corrcoef(half_a, half_b)[0, 1]
         array_corr[i] = r_val
+        if return_details:
+            all_halves.append((half_a, half_b))
 
         if i in random_iters and save_dir:
             scatter_path = os.path.join(save_dir, f"{feature_name}_scatter_iter_{i}_L{l_size}.png")
@@ -662,6 +865,10 @@ def calculate_reliability(data, l_size, repetitions, min_value, feature_name, sa
         hist_path = os.path.join(save_dir, f"{feature_name}_hist_L{l_size}.png")
         plot_correlation_hist(array_corr, l_size, subjects_amount, feature_name, hist_path, demographics=demographics)
 
+    if return_details:
+        # Full per-repetition r distribution + every repetition's two half-means, for
+        # consumers that need more than the mean (live_board's stability panel).
+        return array_corr, np.array(all_halves)
     return np.mean(array_corr), l_size
 
 
@@ -674,11 +881,26 @@ def calculate_reliability_distribution(data, max_l, repetitions, min_value, feat
     return results
 
 
-def evaluate_feature_reliability(df, feature_name, min_count, out_dir, repetitions=RELIABILITY_REPETITIONS,
-                                  df_participants=None):
+def build_reliability_matrix(df, feature_name, min_count):
+    """Participants with >= min_count values of feature_name, and their first min_count
+    values as a (participants x min_count) matrix - the input evaluate_feature_reliability
+    split-halves. Returns (valid_participants, data_matrix), or (None, None) if fewer than
+    3 participants qualify."""
     counts = df.groupby("participant")[feature_name].count()
     valid_participants = counts[counts >= min_count].index.tolist()
     if len(valid_participants) < 3:
+        return None, None
+    data_matrix = np.array([
+        df[df["participant"] == p][feature_name].dropna().values[:min_count]
+        for p in valid_participants
+    ])
+    return valid_participants, data_matrix
+
+
+def evaluate_feature_reliability(df, feature_name, min_count, out_dir, repetitions=RELIABILITY_REPETITIONS,
+                                  df_participants=None):
+    valid_participants, data_matrix = build_reliability_matrix(df, feature_name, min_count)
+    if valid_participants is None:
         print(f"  Skipping {feature_name}: fewer than 3 participants have >= {min_count} values.")
         return
 
@@ -689,11 +911,6 @@ def evaluate_feature_reliability(df, feature_name, min_count, out_dir, repetitio
 
     feature_dir = os.path.join(out_dir, feature_name)
     os.makedirs(feature_dir, exist_ok=True)
-
-    data_matrix = np.array([
-        df[df["participant"] == p][feature_name].dropna().values[:min_count]
-        for p in valid_participants
-    ])
     print(f"  {feature_name} (N={len(valid_participants)}, min_count={min_count})")
 
     demographics = None
@@ -730,24 +947,84 @@ def run_trial_reliability(df_trials, run_dir, min_trials=MIN_TRIALS_RELIABILITY,
 def run_panel_reliability(df_panels, run_dir, min_panels=MIN_PANELS_RELIABILITY, df_participants=None):
     out_dir = os.path.join(run_dir, "reliability", "panel_level")
     os.makedirs(out_dir, exist_ok=True)
-    feature_cols = [c for c in df_panels.select_dtypes(include=[np.number]).columns if c not in ID_COLS_PANEL]
+    # fixation_bcea_mean/std are excluded here (decision 2026-09-28: this was computing
+    # reliability by split-halving PANELS - only 4-6 per participant - over an ALREADY
+    # aggregated mean/std of many raw per-fixation BCEA values, not a real split-half of
+    # the underlying per-fixation measurements themselves). run_fixation_bcea_reliability
+    # is the corrected version, mirroring run_saccade_latency_reliability's pattern:
+    # split-half over the raw per-fixation values directly.
+    exclude_here = ID_COLS_PANEL | {"fixation_bcea_mean", "fixation_bcea_std"}
+    feature_cols = [c for c in df_panels.select_dtypes(include=[np.number]).columns if c not in exclude_here]
     print(f"Running panel-level reliability (min_panels={min_panels})...")
     for feature in feature_cols:
         evaluate_feature_reliability(df_panels, feature, min_panels, out_dir, df_participants=df_participants)
 
 
-def run_saccade_latency_reliability(run_dir, saccade_csv=SACCADE_LATENCY_CSV,
+def build_fixation_bcea_table(participants):
+    """Raw, long-format table (one row per individual fixation's BCEA value) - the
+    correct basis for split-half reliability, as opposed to the already-aggregated
+    fixation_bcea_mean/std columns in df_panels/df_participants. Same shape as
+    compiled_latencies.csv (saccade latency's own raw table)."""
+    rows = []
+    for participant in participants:
+        for panel, values in _collect_fixation_bcea_values(participant).items():
+            for i, v in enumerate(values):
+                rows.append({"participant": participant.name, "group": participant.group, "panel": panel,
+                             "fixation_order": i, "fixation_bcea": v})
+    return pd.DataFrame(rows, columns=["participant", "group", "panel", "fixation_order", "fixation_bcea"])
+
+
+def fixation_bcea_table_path(run_dir):
+    return os.path.join(run_dir, "fixation_bcea_per_fixation.csv")
+
+
+def save_fixation_bcea_table(df_bcea, run_dir):
+    path = fixation_bcea_table_path(run_dir)
+    df_bcea.to_csv(path, index=False)
+    print(f"Saved per-fixation BCEA table ({len(df_bcea)} fixations, "
+          f"{df_bcea['participant'].nunique()} participants) -> {path}")
+    return path
+
+
+def run_fixation_bcea_reliability(run_dir, df_bcea=None, min_trials=MIN_FIXATION_BCEA_RELIABILITY,
+                                   df_participants=None):
+    """Split-half reliability of individual-fixation BCEA, computed the same way as
+    run_saccade_latency_reliability: on the raw long-format table (one row per
+    fixation, not per panel), reusing evaluate_feature_reliability directly on the raw
+    values (decision 2026-09-28, correcting the previous panel-level treatment).
+    df_bcea=None reads this run's saved fixation_bcea_per_fixation.csv (decision
+    2026-11-10), so this also works in "load" mode."""
+    if df_bcea is None:
+        try:
+            df_bcea = pd.read_csv(fixation_bcea_table_path(run_dir))
+        except FileNotFoundError:
+            print(f"No saved per-fixation BCEA table at {fixation_bcea_table_path(run_dir)} - "
+                  f"skipping fixation BCEA reliability.")
+            return
+    if df_bcea.empty:
+        print("No fixation BCEA values found - skipping fixation BCEA reliability.")
+        return
+
+    out_dir = os.path.join(run_dir, "reliability", "fixation_bcea")
+    os.makedirs(out_dir, exist_ok=True)
+    print(f"Running fixation-BCEA reliability (min_trials={min_trials})...")
+    evaluate_feature_reliability(df_bcea, "fixation_bcea", min_trials, out_dir, df_participants=df_participants)
+
+
+def run_saccade_latency_reliability(run_dir, saccade_csv=None,
                                      min_trials=MIN_SACCADE_LATENCY_RELIABILITY,
                                      df_participants=None):
     """
     Split-half reliability of saccade_latency_ms (compiled_latencies.csv is long-format:
     one row per participant per trial - each participant has many trials, same shape as
-    df_trials, just from a separate external pipeline). Reuses evaluate_feature_reliability,
+    df_trials, just from the fxsp task via saccade_latency_analysis). saccade_csv=None
+    reads this run's own <run_dir>/saccade_latency/compiled_latencies.csv. Reuses evaluate_feature_reliability,
     the same bootstrap-permutation split-half methodology (random per-participant reshuffle,
     correlate half-1 vs half-2 means across participants, repeated RELIABILITY_REPETITIONS
     times) already used for trial-/panel-level features - this also gives a reliability
     growth curve and scatterplots, which the one-off notebook version did not.
     """
+    saccade_csv = saccade_csv or saccade_latency_analysis.compiled_latencies_path(run_dir)
     try:
         df_lat = pd.read_csv(saccade_csv)
     except Exception as e:
@@ -758,6 +1035,23 @@ def run_saccade_latency_reliability(run_dir, saccade_csv=SACCADE_LATENCY_CSV,
     os.makedirs(out_dir, exist_ok=True)
     print(f"Running saccade-latency reliability (min_trials={min_trials})...")
     evaluate_feature_reliability(df_lat, "saccade_latency_ms", min_trials, out_dir, df_participants=df_participants)
+
+
+def run_pso_duration_reliability(annotation_method, run_dir, date_str=None,
+                                  min_trials=MIN_PSO_DURATION_RELIABILITY, df_participants=None):
+    """Same treatment as run_saccade_latency_reliability/run_fixation_bcea_reliability
+    (decision 2026-09-28): split-half reliability computed directly on the raw
+    per-PSO-block duration values, not an already-aggregated mean/std."""
+    from duration_analysis import build_pso_duration_table
+    df_pso = build_pso_duration_table(annotation_method, date_str=date_str)
+    if df_pso.empty:
+        print("No PSO duration values found - skipping PSO reliability.")
+        return
+
+    out_dir = os.path.join(run_dir, "reliability", "pso_duration")
+    os.makedirs(out_dir, exist_ok=True)
+    print(f"Running PSO-duration reliability (min_trials={min_trials})...")
+    evaluate_feature_reliability(df_pso, "pso_duration_ms", min_trials, out_dir, df_participants=df_participants)
 
 
 # ============================================================
@@ -867,7 +1161,7 @@ def run_correlation_analysis(df_participants, run_dir, excluded=EXCLUDED_PARTICI
         out_dir = os.path.join(run_dir, "correlations", name)
         os.makedirs(out_dir, exist_ok=True)
 
-        features = _select_feature_columns(subset, extra_exclude={"total_trial_count"})
+        features = _select_feature_columns(subset)
         if "saccade_latency_ms_mean" in features:
             print(f"  '{name}': saccade_latency_ms_mean included in heatmap "
                   f"(N with data={subset['saccade_latency_ms_mean'].notna().sum()}/{len(subset)}).")
@@ -899,33 +1193,541 @@ def _reduced_feature_columns(df, extra_exclude=()):
     return [c for c in cols if not c.endswith("_std") and c not in REDUCED_CORR_EXCLUDE]
 
 
-def run_correlation_analysis_reduced(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANTS):
-    """Same mechanism as run_correlation_analysis's 'all' subset (same population - no
-    MS/HC/female/male split here), but with the reduced feature set - written to
-    correlations/reduced/, alongside correlations/all/."""
+def run_correlation_analysis_reduced(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANTS,
+                                       subset_names=("all", "MS", "HC")):
+    """Same mechanism as run_correlation_analysis, but with the reduced feature set (no
+    _std columns, no typicality/unique-counts/global-RMS-dispersion) - written to
+    correlations/reduced/<subset>/, alongside correlations/<subset>/. Only a few
+    subsets by default (decision 2026-09-28: all/MS/HC)."""
     base = df_participants[~df_participants["participant"].isin(excluded)].copy()
-    if len(base) < 5:
-        print(f"Skipping reduced correlation: only {len(base)} participants.")
-        return
 
-    out_dir = os.path.join(run_dir, "correlations", "reduced")
-    os.makedirs(out_dir, exist_ok=True)
+    for name in subset_names:
+        subset = base[CORRELATION_SUBSETS[name](base)].copy()
+        if len(subset) < 5:
+            print(f"Skipping reduced correlation subset '{name}': only {len(subset)} participants.")
+            continue
 
-    features = _reduced_feature_columns(base, extra_exclude={"total_trial_count"})
-    corr, pval, annot = compute_correlation_matrix(base, features)
-    corr.to_csv(os.path.join(out_dir, "correlation_values.csv"))
-    demographics = demographics_text(base)
-    plot_heatmap(corr, annot, f"Feature Correlations - reduced (N={len(base)})",
-                 os.path.join(out_dir, "heatmap.png"), demographics=demographics)
+        out_dir = os.path.join(run_dir, "correlations", "reduced", name)
+        os.makedirs(out_dir, exist_ok=True)
 
-    n_sig = plot_significant_scatterplots(base, features, corr, pval, os.path.join(out_dir, "scatterplots"),
-                                           demographics=demographics)
-    print(f"Correlation subset 'reduced': N={len(base)}, {len(features)} features, {n_sig} significant scatterplots.")
+        features = _reduced_feature_columns(subset)
+        corr, pval, annot = compute_correlation_matrix(subset, features)
+        corr.to_csv(os.path.join(out_dir, "correlation_values.csv"))
+        demographics = demographics_text(subset)
+        plot_heatmap(corr, annot, f"Feature Correlations - reduced/{name} (N={len(subset)})",
+                     os.path.join(out_dir, "heatmap.png"), demographics=demographics)
+
+        n_sig = plot_significant_scatterplots(subset, features, corr, pval, os.path.join(out_dir, "scatterplots"),
+                                               demographics=demographics)
+        print(f"Correlation subset 'reduced/{name}': N={len(subset)}, {len(features)} features, "
+              f"{n_sig} significant scatterplots.")
+
+
+# ============================================================
+# 8b. DOMAIN-GROUPED / COLOR-CODED CORRELATION HEATMAP
+# ============================================================
+# Feature -> cognitive/functional domain, per the user's own categorization
+# (2026-10-29): oculomotor features = yellow, memory/recognition features = "red"
+# (true base color magenta), information-processing-speed features = "blue" (true base
+# color cyan) - these three are the real base colors being mixed. A feature that blends
+# two domains gets the intuitive color-wheel mix of its two colors (red+yellow=orange,
+# red+blue=purple, yellow+blue=green); a feature blending all three gets brown.
+# Demographic/composite (non-domain) variables are grey; `score` is handled separately -
+# always last, bold, not colored into any domain.
+FEATURE_DOMAIN = {
+    # red = memory
+    "num_of_searches_per_trial": "red",
+    "revisits_per_trial": "red",
+    "first5_last5_slope": "red",
+    "CCMT_Acc_Combined": "red",
+    "CFMT_Acc_Combined": "red",
+    # yellow = motor
+    "fixation_bcea": "yellow",
+    "pso_bcea": "yellow",
+    "saccade_latency_ms": "yellow",
+    "pso_duration_ms": "yellow",
+    # orange = motor + memory
+    "search_distance_per_trial": "orange",
+    # blue = information processing
+    "time_in_relevant_fixations_ms": "blue",
+    # purple = memory + information processing
+    "symbol_counts_per_trial": "purple",
+    # derived from symbol_counts_per_trial's trajectory - inherit its domain (decision 2026-11-09)
+    "symbols_corr_to_mean": "purple",
+    "typicality": "purple",
+    # green = information processing + motor
+    "dispersions_global_bcea": "green",
+    "KD_Total": "green",
+    # brown = motor + memory + information processing
+    "fixation_counts_per_trial": "brown",
+    "trial_in_search_durations_ms": "brown",
+    # grey = other (demographic / composite, not a cognitive-domain feature)
+    "Age_Years": "grey",
+    "Markov_PC1": "grey",
+    "Markov_PC2": "grey",
+    "Markov_PC3": "grey",
+}
+
+# Dropped from this heatmap entirely (decision 2026-10-29): clinical/demographic
+# covariate and encoded-dummy columns that aren't cognitive-domain features, on top of
+# the pre-existing REDUCED_CORR_EXCLUDE set (typicality/unique_counts/
+# dispersions_global_rms - "noise, not analyzed").
+DOMAIN_HEATMAP_EXTRA_EXCLUDE = {"Months_Sick", "group_MS", "Gender_F"}
+
+# Left-to-right/top-to-bottom order (the "gradient"): pure motor -> motor+memory mix ->
+# pure memory -> memory+info mix -> pure info -> info+motor mix -> all-three mix ->
+# other -> score (score appended separately, always last).
+DOMAIN_ORDER = ["yellow", "orange", "red", "purple", "blue", "green", "brown", "grey"]
+DOMAIN_COLORS = {
+    "yellow": "#B8960B",
+    "orange": "#E07B00",
+    "red": "#D6006D",
+    "purple": "#8E3BC7",
+    "blue": "#0087A8",
+    "green": "#2E8B57",
+    "brown": "#8B5A2B",
+    "grey": "#767676",
+}
+DOMAIN_LABELS = {
+    "yellow": "Motor",
+    "orange": "Motor + Memory",
+    "red": "Memory",
+    "purple": "Memory + Information Processing",
+    "blue": "Information Processing",
+    "green": "Information Processing + Motor",
+    "brown": "Motor + Memory + Information Processing",
+    "grey": "Other (demographic / composite)",
+}
+SCORE_COLOR = "black"
+
+
+def _domain_base_name(col):
+    """Strips the aggregation suffix/prefix so a feature's _std (and mean_typicality /
+    typicality_std) variant inherits its base feature's FEATURE_DOMAIN/MEASURE_TYPE
+    entry (decision 2026-11-09) instead of falling through to grey/other."""
+    for suffix in ("_mean", "_std"):
+        if col.endswith(suffix):
+            return col[: -len(suffix)]
+    return col[len("mean_"):] if col.startswith("mean_") else col
+
+
+def _order_features_by_domain(features):
+    """Buckets `features` (already-selected column names) by cognitive domain and
+    returns them concatenated in DOMAIN_ORDER, with 'score' always last. A feature with
+    no entry in FEATURE_DOMAIN (e.g. a new one added later without updating this
+    mapping) falls into 'grey' with a printed warning, rather than silently
+    disappearing from the heatmap or crashing."""
+    buckets = {d: [] for d in DOMAIN_ORDER}
+    score_col = None
+    for col in features:
+        if col == "score":
+            score_col = col
+            continue
+        domain = FEATURE_DOMAIN.get(_domain_base_name(col))
+        if domain is None:
+            print(f"Warning: '{col}' has no domain mapping - defaulting to grey. "
+                  f"Add it to FEATURE_DOMAIN if it belongs to a real domain.")
+            domain = "grey"
+        buckets[domain].append(col)
+
+    ordered = [c for d in DOMAIN_ORDER for c in buckets[d]]
+    if score_col is not None:
+        ordered.append(score_col)
+    return ordered
+
+
+def _draw_colored_correlation_heatmap(corr, annot, feature_order, title, out_path, color_fn,
+                                        legend_handles, legend_title="Feature group",
+                                        demographics=None, bold_fn=lambda f: f == "score"):
+    """Shared drawing core behind every colored/reordered correlation heatmap variant
+    (domain, measure-type, importance) - same correlation-value coloring throughout
+    (red=positive/blue=negative, unchanged per decision 2026-10-29); only the per-label
+    color/bold rule and legend differ by organization, passed in by the caller."""
+    corr = corr.loc[feature_order, feature_order]
+    annot = annot.loc[feature_order, feature_order]
+    n = len(corr)
+    cmap = LinearSegmentedColormap.from_list("custom_blue_red", ["blue", "white", "red"], N=256)
+    mask = np.eye(n, dtype=bool)
+
+    plt.figure(figsize=(max(12, n * 0.65), max(9, n * 0.55)))
+    plt.gca().set_facecolor("black")
+    ax = sns.heatmap(corr, annot=annot, fmt="", cmap=cmap, vmin=-1, vmax=1, mask=mask,
+                      linewidths=0.5, linecolor="gray", cbar_kws={"label": "Pearson Correlation (r)"},
+                      annot_kws={"size": 6})
+    plt.title(f"{title}\n* p<0.05, ** p<0.01, *** p<0.001", fontsize=14, pad=20)
+    plt.xticks(rotation=45, ha="right", fontsize=8)
+    plt.yticks(fontsize=8)
+
+    for label in list(ax.get_xticklabels()) + list(ax.get_yticklabels()):
+        feat = label.get_text()
+        label.set_color(color_fn(feat))
+        if bold_fn(feat):
+            label.set_fontweight("bold")
+
+    plt.legend(handles=legend_handles, bbox_to_anchor=(1.3, 1), loc="upper left",
+               fontsize=8, title=legend_title, frameon=True)
+
+    annotate_demographics(demographics, on_figure=True)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+
+
+def plot_domain_grouped_heatmap(corr, annot, feature_order, title, out_path, demographics=None):
+    """Thin wrapper over _draw_colored_correlation_heatmap for the cognitive-domain
+    organization: axis labels colored/bolded by domain, with a domain legend."""
+    def color_fn(feat):
+        return SCORE_COLOR if feat == "score" else DOMAIN_COLORS[FEATURE_DOMAIN.get(_domain_base_name(feat), "grey")]
+
+    legend_handles = [Patch(facecolor=DOMAIN_COLORS[d], label=DOMAIN_LABELS[d]) for d in DOMAIN_ORDER]
+    legend_handles.append(Patch(facecolor=SCORE_COLOR, label="Score"))
+    _draw_colored_correlation_heatmap(corr, annot, feature_order, title, out_path, color_fn,
+                                       legend_handles, legend_title="Feature domain", demographics=demographics)
+
+
+def run_domain_grouped_correlation_analysis(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANTS,
+                                              subset_names=("all", "MS", "HC")):
+    """Domain-organized version of run_correlation_analysis_reduced: same reduced
+    feature set (means only, typicality/unique_counts/dispersions_global_rms dropped),
+    plus Months_Sick/group_MS/Gender_F dropped (decision 2026-10-29: clinical covariate
+    and dummy-encoded columns, not cognitive-domain features) - features are grouped and
+    ordered by cognitive domain with colored/bolded axis labels and a domain legend,
+    written to correlations/by_domain/<subset>/."""
+    base = df_participants[~df_participants["participant"].isin(excluded)].copy()
+
+    for name in subset_names:
+        subset = base[CORRELATION_SUBSETS[name](base)].copy()
+        if len(subset) < 5:
+            print(f"Skipping domain-grouped correlation subset '{name}': only {len(subset)} participants.")
+            continue
+
+        out_dir = os.path.join(run_dir, "correlations", "by_domain", name)
+        os.makedirs(out_dir, exist_ok=True)
+
+        features = _reduced_feature_columns(subset, extra_exclude=DOMAIN_HEATMAP_EXTRA_EXCLUDE)
+        ordered_features = _order_features_by_domain(features)
+        corr, pval, annot = compute_correlation_matrix(subset, ordered_features)
+        corr.to_csv(os.path.join(out_dir, "correlation_values.csv"))
+        demographics = demographics_text(subset)
+        plot_domain_grouped_heatmap(corr, annot, ordered_features,
+                                     f"Feature Correlations by Domain - {name} (N={len(subset)})",
+                                     os.path.join(out_dir, "heatmap.png"), demographics=demographics)
+
+        n_sig = plot_significant_scatterplots(subset, ordered_features, corr, pval,
+                                               os.path.join(out_dir, "scatterplots"), demographics=demographics)
+        print(f"Domain-grouped correlation subset '{name}': N={len(subset)}, {len(ordered_features)} features, "
+              f"{n_sig} significant scatterplots.")
+
+
+# ============================================================
+# 8c. CORRELATION-CLUSTERED HEATMAP (second organization, decision 2026-10-29)
+# ============================================================
+def _order_features_by_clustering(corr, absolute=False):
+    """Seriation by hierarchical clustering + optimal leaf ordering (Friendly, 2002,
+    'Corrgrams: Exploratory Displays for Correlation Matrices', The American
+    Statistician 56(4):316-324 - the standard reference for reordering a correlation
+    matrix so correlated blocks of features sit together). Dissimilarity = 1 - r, so
+    strongly positively correlated features end up close together and strongly
+    negatively correlated ones end up far apart; average-linkage clustering, then
+    optimal leaf ordering (Bar-Joseph et al., 2001) to additionally minimize the
+    dissimilarity between adjacent leaves, giving a cleaner block structure than plain
+    hierarchical clustering alone."""
+    features = list(corr.columns)
+    # absolute=True (decision 2026-11-09, live_board sub-toggle): dissimilarity 1 - |r|,
+    # so strongly NEGATIVELY correlated features also cluster together - the view for
+    # spotting redundant features regardless of sign. Default stays 1 - r.
+    dist = 1 - (np.abs(corr.values) if absolute else corr.values)
+    dist = np.nan_to_num(dist, nan=1.0)
+    dist = (dist + dist.T) / 2
+    np.fill_diagonal(dist, 0.0)
+    condensed = squareform(dist, checks=False)
+    Z = linkage(condensed, method="average")
+    Z = optimal_leaf_ordering(Z, condensed)
+    order = leaves_list(Z)
+    return [features[i] for i in order]
+
+
+def run_clustered_correlation_analysis(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANTS,
+                                         subset_names=("all", "MS", "HC")):
+    """Second organization of the colored correlation heatmap (decision 2026-10-29):
+    same feature set, same domain-colored/bolded labels + legend, and the same
+    correlation-value coloring as run_domain_grouped_correlation_analysis, but features
+    are ordered by hierarchical-clustering seriation on the correlation matrix itself
+    (_order_features_by_clustering) instead of by predefined cognitive domain - so
+    correlated blocks of features sit together regardless of which domain they were
+    assigned to. Written to correlations/by_cluster/<subset>/."""
+    base = df_participants[~df_participants["participant"].isin(excluded)].copy()
+
+    for name in subset_names:
+        subset = base[CORRELATION_SUBSETS[name](base)].copy()
+        if len(subset) < 5:
+            print(f"Skipping clustered correlation subset '{name}': only {len(subset)} participants.")
+            continue
+
+        out_dir = os.path.join(run_dir, "correlations", "by_cluster", name)
+        os.makedirs(out_dir, exist_ok=True)
+
+        features = _reduced_feature_columns(subset, extra_exclude=DOMAIN_HEATMAP_EXTRA_EXCLUDE)
+        corr, pval, annot = compute_correlation_matrix(subset, features)
+        ordered_features = _order_features_by_clustering(corr)
+        corr = corr.loc[ordered_features, ordered_features]
+        annot = annot.loc[ordered_features, ordered_features]
+        corr.to_csv(os.path.join(out_dir, "correlation_values.csv"))
+        demographics = demographics_text(subset)
+        plot_domain_grouped_heatmap(corr, annot, ordered_features,
+                                     f"Feature Correlations by Cluster - {name} (N={len(subset)})",
+                                     os.path.join(out_dir, "heatmap.png"), demographics=demographics)
+
+        n_sig = plot_significant_scatterplots(subset, ordered_features, corr, pval,
+                                               os.path.join(out_dir, "scatterplots"), demographics=demographics)
+        print(f"Clustered correlation subset '{name}': N={len(subset)}, {len(ordered_features)} features, "
+              f"{n_sig} significant scatterplots.")
+
+
+# ============================================================
+# 8d. MEASURE-TYPE-GROUPED HEATMAP (first organization, decision 2026-11-05)
+# ============================================================
+# Feature -> measurement modality, distinct from FEATURE_DOMAIN's cognitive-skill
+# grouping: this asks "what kind of measurement is this" (a raw eye-movement signal
+# property, a visual-search task-performance metric, an external standardized
+# neuropsych test, or a demographic/composite variable) rather than "which cognitive
+# skill does this tap."
+MEASURE_TYPE = {
+    # eye-movement / oculomotor - raw gaze-signal properties, independent of task content
+    "saccade_latency_ms": "oculomotor",
+    "fixation_bcea": "oculomotor",
+    "pso_duration_ms": "oculomotor",
+    "pso_bcea": "oculomotor",
+    "time_in_relevant_fixations_ms": "oculomotor",
+    "dispersions_global_bcea": "oculomotor",
+    # visual-search task behavior - derived from how the SDMT search task was performed
+    "num_of_searches_per_trial": "task_behavior",
+    "revisits_per_trial": "task_behavior",
+    "search_distance_per_trial": "task_behavior",
+    "symbol_counts_per_trial": "task_behavior",
+    "symbols_corr_to_mean": "task_behavior",
+    "typicality": "task_behavior",
+    "trial_in_search_durations_ms": "task_behavior",
+    "fixation_counts_per_trial": "task_behavior",
+    "first5_last5_slope": "task_behavior",
+    # standardized cognitive/neuropsych tests - external validated scores
+    "CCMT_Acc_Combined": "cognitive_test",
+    "CFMT_Acc_Combined": "cognitive_test",
+    "KD_Total": "cognitive_test",
+    # demographic / composite - not a performance measure
+    "Age_Years": "other",
+    "Markov_PC1": "other",
+    "Markov_PC2": "other",
+    "Markov_PC3": "other",
+}
+MEASURE_TYPE_ORDER = ["oculomotor", "task_behavior", "cognitive_test", "other"]
+MEASURE_TYPE_COLORS = {
+    "oculomotor": "#2A9D8F",
+    "task_behavior": "#E76F51",
+    "cognitive_test": "#6A4C93",
+    "other": "#767676",
+}
+MEASURE_TYPE_LABELS = {
+    "oculomotor": "Eye-Movement / Oculomotor",
+    "task_behavior": "Visual-Search Task Behavior",
+    "cognitive_test": "Standardized Cognitive Test",
+    "other": "Demographic / Composite",
+}
+
+
+def _order_features_by_measure_type(features):
+    """Same bucket-and-concatenate pattern as _order_features_by_domain, keyed by
+    MEASURE_TYPE instead of FEATURE_DOMAIN; 'score' always last."""
+    buckets = {t: [] for t in MEASURE_TYPE_ORDER}
+    score_col = None
+    for col in features:
+        if col == "score":
+            score_col = col
+            continue
+        t = MEASURE_TYPE.get(_domain_base_name(col))
+        if t is None:
+            print(f"Warning: '{col}' has no measure-type mapping - defaulting to 'other'. "
+                  f"Add it to MEASURE_TYPE if it belongs to a real category.")
+            t = "other"
+        buckets[t].append(col)
+
+    ordered = [c for t in MEASURE_TYPE_ORDER for c in buckets[t]]
+    if score_col is not None:
+        ordered.append(score_col)
+    return ordered
+
+
+def plot_measure_type_heatmap(corr, annot, feature_order, title, out_path, demographics=None):
+    def color_fn(feat):
+        return SCORE_COLOR if feat == "score" else MEASURE_TYPE_COLORS[MEASURE_TYPE.get(_domain_base_name(feat), "other")]
+
+    legend_handles = [Patch(facecolor=MEASURE_TYPE_COLORS[t], label=MEASURE_TYPE_LABELS[t]) for t in MEASURE_TYPE_ORDER]
+    legend_handles.append(Patch(facecolor=SCORE_COLOR, label="Score"))
+    _draw_colored_correlation_heatmap(corr, annot, feature_order, title, out_path, color_fn,
+                                       legend_handles, legend_title="Measure type", demographics=demographics)
+
+
+def run_measure_type_correlation_analysis(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANTS,
+                                            subset_names=("all", "MS", "HC")):
+    """First organization (decision 2026-11-05): same reduced feature set as the domain
+    and cluster organizations, but grouped/ordered by measurement modality (MEASURE_TYPE)
+    instead of cognitive domain - written to correlations/by_measure_type/<subset>/."""
+    base = df_participants[~df_participants["participant"].isin(excluded)].copy()
+
+    for name in subset_names:
+        subset = base[CORRELATION_SUBSETS[name](base)].copy()
+        if len(subset) < 5:
+            print(f"Skipping measure-type correlation subset '{name}': only {len(subset)} participants.")
+            continue
+
+        out_dir = os.path.join(run_dir, "correlations", "by_measure_type", name)
+        os.makedirs(out_dir, exist_ok=True)
+
+        features = _reduced_feature_columns(subset, extra_exclude=DOMAIN_HEATMAP_EXTRA_EXCLUDE)
+        ordered_features = _order_features_by_measure_type(features)
+        corr, pval, annot = compute_correlation_matrix(subset, ordered_features)
+        corr.to_csv(os.path.join(out_dir, "correlation_values.csv"))
+        demographics = demographics_text(subset)
+        plot_measure_type_heatmap(corr, annot, ordered_features,
+                                   f"Feature Correlations by Measure Type - {name} (N={len(subset)})",
+                                   os.path.join(out_dir, "heatmap.png"), demographics=demographics)
+
+        n_sig = plot_significant_scatterplots(subset, ordered_features, corr, pval,
+                                               os.path.join(out_dir, "scatterplots"), demographics=demographics)
+        print(f"Measure-type correlation subset '{name}': N={len(subset)}, {len(ordered_features)} features, "
+              f"{n_sig} significant scatterplots.")
+
+
+# ============================================================
+# 8e. IMPORTANCE-ORDERED HEATMAP (third organization, decision 2026-11-05)
+# ============================================================
+# "Importance" = each feature's mean |r| with every other feature in the set - how
+# strongly, on average, a feature is correlated with the rest of the panel. Distinct
+# from run_clustered_correlation_analysis's hierarchical-clustering seriation: clustering
+# groups locally similar features into blocks with no overall ranking; this gives a
+# single most-to-least-correlated ordering instead, colored by tier.
+IMPORTANCE_TIER_ORDER = ["high", "medium", "low"]
+IMPORTANCE_TIER_COLORS = {
+    "high": "#D62828",
+    "medium": "#F77F00",
+    "low": "#577590",
+}
+IMPORTANCE_TIER_LABELS = {
+    "high": "High importance (top third, mean |r|)",
+    "medium": "Medium importance (middle third)",
+    "low": "Low importance (bottom third)",
+}
+
+
+def _order_features_by_importance(corr):
+    """Ranks every feature except 'score' by mean |r| with all the others (descending);
+    'score' is excluded from the ranking itself but still always appended last, bold,
+    per the other two organizations' convention. Returns (ordered_features, importance)
+    where `importance` is the Series used to derive color tiers."""
+    features = [f for f in corr.columns if f != "score"]
+    importance = corr.loc[features, features].abs().mean(axis=1).sort_values(ascending=False)
+    ordered = list(importance.index)
+    if "score" in corr.columns:
+        ordered.append("score")
+    return ordered, importance
+
+
+def _importance_tiers(importance):
+    n = len(importance)
+    third = max(1, round(n / 3))
+    tiers = {}
+    for i, feat in enumerate(importance.index):
+        tiers[feat] = "high" if i < third else "medium" if i < 2 * third else "low"
+    return tiers
+
+
+def plot_importance_ordered_heatmap(corr, annot, feature_order, tiers, title, out_path, demographics=None):
+    def color_fn(feat):
+        return SCORE_COLOR if feat == "score" else IMPORTANCE_TIER_COLORS[tiers.get(feat, "low")]
+
+    legend_handles = [Patch(facecolor=IMPORTANCE_TIER_COLORS[t], label=IMPORTANCE_TIER_LABELS[t])
+                       for t in IMPORTANCE_TIER_ORDER]
+    legend_handles.append(Patch(facecolor=SCORE_COLOR, label="Score"))
+    _draw_colored_correlation_heatmap(corr, annot, feature_order, title, out_path, color_fn,
+                                       legend_handles, legend_title="Importance", demographics=demographics)
+
+
+def run_importance_correlation_analysis(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANTS,
+                                          subset_names=("all", "MS", "HC")):
+    """Third organization (decision 2026-11-05): same reduced feature set as the other
+    two organizations, ordered by _order_features_by_importance instead of domain/measure
+    type/clustering - written to correlations/by_importance/<subset>/, alongside an
+    importance_scores.csv of each feature's mean |r|."""
+    base = df_participants[~df_participants["participant"].isin(excluded)].copy()
+
+    for name in subset_names:
+        subset = base[CORRELATION_SUBSETS[name](base)].copy()
+        if len(subset) < 5:
+            print(f"Skipping importance correlation subset '{name}': only {len(subset)} participants.")
+            continue
+
+        out_dir = os.path.join(run_dir, "correlations", "by_importance", name)
+        os.makedirs(out_dir, exist_ok=True)
+
+        features = _reduced_feature_columns(subset, extra_exclude=DOMAIN_HEATMAP_EXTRA_EXCLUDE)
+        corr_raw, pval_raw, annot_raw = compute_correlation_matrix(subset, features)
+        ordered_features, importance = _order_features_by_importance(corr_raw)
+        tiers = _importance_tiers(importance)
+        corr = corr_raw.loc[ordered_features, ordered_features]
+        annot = annot_raw.loc[ordered_features, ordered_features]
+        corr.to_csv(os.path.join(out_dir, "correlation_values.csv"))
+        importance.rename("mean_abs_r").to_csv(os.path.join(out_dir, "importance_scores.csv"))
+        demographics = demographics_text(subset)
+        plot_importance_ordered_heatmap(corr, annot, ordered_features, tiers,
+                                         f"Feature Correlations by Importance - {name} (N={len(subset)})",
+                                         os.path.join(out_dir, "heatmap.png"), demographics=demographics)
+
+        n_sig = plot_significant_scatterplots(subset, ordered_features, corr_raw, pval_raw,
+                                               os.path.join(out_dir, "scatterplots"), demographics=demographics)
+        print(f"Importance correlation subset '{name}': N={len(subset)}, {len(ordered_features)} features, "
+              f"{n_sig} significant scatterplots.")
 
 
 # ============================================================
 # 9. GROUP COMPARISON (MS vs HC)
 # ============================================================
+def plot_group_boxplot_with_ttest(df_participants, feature, ylabel, out_path, demographics=None,
+                                    excluded=EXCLUDED_PARTICIPANTS):
+    """Dedicated, full-size MS-vs-HC box plot for one feature, with Welch's t-test in the
+    title - the same test and number run_group_comparison() already computes for this
+    feature (ttest_ind(..., equal_var=False)), just rendered as its own prominent figure
+    instead of one quarter of a ranked 2x2 grid (decision 2026-09-29: dropped the
+    Mann-Whitney/permutation textbox that used to sit alongside it - that was a second,
+    redundant test rather than a presentation choice, and Welch's is the single test this
+    pipeline now standardizes on for group comparison)."""
+    df = df_participants[~df_participants["participant"].isin(excluded)].copy()
+    df["group_2"] = df["group"].replace({"pwMS": "MS"})
+    df = df[df["group_2"].isin(["HC", "MS"])]
+
+    ms_vals = df.loc[df["group_2"] == "MS", feature].dropna().to_numpy()
+    hc_vals = df.loc[df["group_2"] == "HC", feature].dropna().to_numpy()
+    if len(ms_vals) < 5 or len(hc_vals) < 5:
+        print(f"Skipping group boxplot for {feature}: not enough data (MS={len(ms_vals)}, HC={len(hc_vals)}).")
+        return
+
+    t_stat, p_val = ttest_ind(ms_vals, hc_vals, equal_var=False)
+
+    plt.figure(figsize=(7, 6))
+    sns.boxplot(data=df, x="group_2", y=feature, order=["HC", "MS"], hue="group_2",
+                palette={"HC": "skyblue", "MS": "lightcoral"}, legend=False)
+    sns.stripplot(data=df, x="group_2", y=feature, order=["HC", "MS"], color="black", alpha=0.4, jitter=True)
+
+    plt.title(f"{ylabel}: HC vs MS\nWelch's t-test: t={t_stat:.2f}, p={p_val:.2e}", fontweight="bold")
+    plt.ylabel(ylabel)
+    plt.xlabel("")
+    annotate_demographics(demographics)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Group boxplot saved: {feature} (MS N={len(ms_vals)}, HC N={len(hc_vals)}, "
+          f"Welch p={p_val:.2e}) -> {out_path}")
+
+
 def run_group_comparison(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANTS):
     out_dir = os.path.join(run_dir, "group_comparison")
     os.makedirs(out_dir, exist_ok=True)
@@ -934,7 +1736,7 @@ def run_group_comparison(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANT
     df = df[df["group"].isin(["HC", "MS", "pwMS"])].copy()
     df["group"] = df["group"].replace({"pwMS": "MS"})
 
-    features = _select_feature_columns(df, extra_exclude={"total_trial_count", "group_MS"})
+    features = _select_feature_columns(df, extra_exclude={"group_MS"})
     print(f"Group comparison: {df['group'].value_counts().to_dict()}")
 
     results = []
@@ -992,7 +1794,7 @@ def run_pca_pareto(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANTS):
     os.makedirs(out_dir, exist_ok=True)
 
     df = df_participants[~df_participants["participant"].isin(excluded)].copy()
-    features = _select_feature_columns(df, extra_exclude={"total_trial_count", "score"})
+    features = _select_feature_columns(df, extra_exclude={"score"})
     if len(features) < 3:
         print("Not enough features for PCA/Pareto analysis.")
         return
@@ -1105,7 +1907,7 @@ def run_partial_correlations(df_participants, run_dir, excluded=EXCLUDED_PARTICI
     os.makedirs(out_dir, exist_ok=True)
 
     df = df_participants[~df_participants["participant"].isin(excluded)].copy()
-    features = _select_feature_columns(df, extra_exclude={"total_trial_count"})
+    features = _select_feature_columns(df)
     df_clean = df.replace([np.inf, -np.inf], np.nan).dropna(subset=[var_y])
     df_clean[features] = df_clean[features].fillna(df_clean[features].median())
 
@@ -1195,7 +1997,8 @@ def run_partial_correlations(df_participants, run_dir, excluded=EXCLUDED_PARTICI
 # ============================================================
 # 12. MERGE MARKOV'S PC1-3 SCORES INTO df_participants
 # ============================================================
-def merge_markov_pca_scores(df_participants, annotation_method, markov_output_base_path=None, n_components=3):
+def merge_markov_pca_scores(df_participants, annotation_method, markov_output_base_path=None, n_components=3,
+                            analysis_folder="analysis_NO_repeats_ALL_states"):
     """Merges Markov's per-participant PC1..PC{n_components} scores (mean-matrix mode -
     one row per participant, since use_mean_matrix=True means each participant
     contributes exactly one vector, decision 2026-09-27) into df_participants, so they
@@ -1206,13 +2009,14 @@ def merge_markov_pca_scores(df_participants, annotation_method, markov_output_ba
     Prefixed "Markov_PC{i}" so there's no ambiguity with any future feature-pipeline-
     native PCA. No-op (prints a warning, returns df unchanged) if the file doesn't
     exist yet - most likely because Markov's mean-matrix run hasn't been done for this
-    base path yet."""
+    base path yet. analysis_folder: which Markov variant's folder to read
+    (markov_core.AnalysisConfig.folder_name) - e.g. a matrix_type variant's
+    analysis_NO_repeats_ALL_states_NORMALIZED_BY_SCORE."""
     if markov_output_base_path is None:
         markov_output_base_path = pipeline_config.preliminary_results_dir(annotation_method)
-    # Matches markov_core.AnalysisConfig(with_repeats=False, only_1_to_9=False,
-    # use_mean_matrix=True).folder_name / .plot_output_path exactly - the only config
-    # main.py currently runs.
-    pca_csv = os.path.join(markov_output_base_path, "analysis_NO_repeats_ALL_states",
+    # Default matches markov_core.AnalysisConfig(with_repeats=False, only_1_to_9=False,
+    # use_mean_matrix=True).folder_name / .plot_output_path exactly.
+    pca_csv = os.path.join(markov_output_base_path, analysis_folder,
                             "plots", "mean_matrix", "separation", "pca_scores_and_features.csv")
     try:
         df_pca = pd.read_csv(pca_csv)
@@ -1344,14 +2148,30 @@ def main(annotation_method="threshold_based", date_str=None, run_dir=None, marko
         df_panels = compute_panel_slopes(df_trials, df_panels)
         df_trials = compute_typicality(df_trials)
 
-        panel_dispersion_df = compute_fixation_dispersion_by_panel(participants)
+        # Per-fixation BCEA is saved as its own table FIRST, and the panel/participant
+        # fixation_bcea features are aggregated from that saved table (decision
+        # 2026-11-10), so the raw values behind those features are always on disk.
+        df_bcea = build_fixation_bcea_table(participants)
+        save_fixation_bcea_table(df_bcea, run_dir)
+        panel_dispersion_df = compute_fixation_dispersion_by_panel(participants, df_bcea=df_bcea)
         df_panels = df_panels.merge(panel_dispersion_df, on=["participant", "panel"], how="left")
 
         df_participants = build_participant_table(df_trials, df_panels, participants)
-        dispersion_df = compute_whole_panel_dispersion(participants)
+        dispersion_df = compute_whole_panel_dispersion(participants, df_bcea=df_bcea)
         df_participants = df_participants.merge(dispersion_df, on="participant", how="left")
 
-        df_participants = merge_saccade_latency(df_participants)
+        # Computed here, per run (fast: gazeNET labels come from the shared
+        # fxsp_annotation_cache_dir; only never-annotated participants run the model). A
+        # failure only drops this one feature, as the old missing-CSV path did.
+        try:
+            saccade_csv = saccade_latency_analysis.main(run_dir=run_dir, participant_whitelist=participant_whitelist)
+        except Exception as e:
+            print(f"Warning: saccade latency computation failed ({type(e).__name__}: {e}) - feature skipped.")
+            saccade_csv = None
+        df_participants = merge_saccade_latency(df_participants, saccade_csv)
+        df_participants = merge_pso_duration(df_participants, annotation_method, date_str=date_str)
+        df_panels, df_participants = merge_pso_bcea(df_panels, df_participants, annotation_method, date_str=date_str)
+        df_panels, df_participants = merge_symbols_corr_to_mean(df_trials, df_panels, df_participants)
         df_participants = merge_ido_table(df_participants)
         df_participants = add_encoded_demographics(df_participants)
         df_participants = merge_markov_pca_scores(df_participants, annotation_method,
@@ -1365,11 +2185,36 @@ def main(annotation_method="threshold_based", date_str=None, run_dir=None, marko
         run_trial_reliability(df_trials, run_dir, df_participants=df_participants)
         run_panel_reliability(df_panels, run_dir, df_participants=df_participants)
         run_saccade_latency_reliability(run_dir, df_participants=df_participants)
+        run_pso_duration_reliability(annotation_method, run_dir, date_str=date_str, df_participants=df_participants)
+        run_fixation_bcea_reliability(run_dir, df_participants=df_participants)
     if RUN_CORRELATIONS:
         run_correlation_analysis(df_participants, run_dir)
         run_correlation_analysis_reduced(df_participants, run_dir)
+        run_domain_grouped_correlation_analysis(df_participants, run_dir)
+        run_clustered_correlation_analysis(df_participants, run_dir)
+        run_measure_type_correlation_analysis(df_participants, run_dir)
+        run_importance_correlation_analysis(df_participants, run_dir)
     if RUN_GROUP_COMPARISON:
         run_group_comparison(df_participants, run_dir)
+        # Dedicated boxplot+t-test for the 3 "signal-level" features (decision
+        # 2026-09-28) - these already appear in run_group_comparison's generic ranked
+        # grid too, but buried among every other feature; this gives each its own
+        # prominent plot, matching the demographics/N convention used everywhere else.
+        signal_out_dir = os.path.join(run_dir, "group_comparison", "signal_features")
+        os.makedirs(signal_out_dir, exist_ok=True)
+        demographics = demographics_text(df_participants[~df_participants["participant"].isin(EXCLUDED_PARTICIPANTS)])
+        for feature, ylabel in [
+            ("pso_duration_ms_mean", "PSO Duration (ms)"),
+            ("fixation_bcea_mean", "Individual-Fixation BCEA"),
+            ("saccade_latency_ms_mean", "Saccade Latency (ms)"),
+        ]:
+            if feature in df_participants.columns:
+                plot_group_boxplot_with_ttest(df_participants, feature, ylabel,
+                                               os.path.join(signal_out_dir, f"{feature}_boxplot.png"),
+                                               demographics=demographics)
+            else:
+                print(f"Skipping group boxplot for {feature}: column not found in df_participants.")
+        run_symbols_corr_to_mean_diagnostics(df_trials, df_panels, df_participants, run_dir)
     if RUN_PCA:
         run_pca_pareto(df_participants, run_dir)
     if RUN_PARTIAL_CORR:

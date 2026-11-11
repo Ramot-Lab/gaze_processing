@@ -169,7 +169,10 @@ class DataManager:
                 # =========================================================
                 # MODE 1: COMPUTE FRESH (Ignore existing files)
                 # =========================================================
-                if from_scratch:
+                if from_scratch and self.cfg.trial_stats_source_dir:
+                    self._compute_from_trial_stats(group, p_name, p_obj, user_folder)
+
+                elif from_scratch:
                     try:
                         # Full path, not bare p_name - required for sd.group/self.name to
                         # come out right inside ParticipantGazeDataManager.
@@ -269,14 +272,83 @@ class DataManager:
                                       annotation_method=self.cfg.annotation_method)
             trial_df_stats = trial_mgr.add_trial_statistics_dataframe()
             gaze_model = GazeMarkovModel(trial_mgr.trials, only_keys=self.cfg.only_1_to_9)
-            raw_df = gaze_model.get_probability_matrix(clean=not self.cfg.with_repeats)
-            if self._is_matrix_valid(raw_df) is False:
-                return None, "invalid/empty transition matrix"
+            score = self.participants[group][p_data.name].get_score(panel)
+            raw_df, fail_reason = self._matrix_from_model(gaze_model, score=score)
+            if raw_df is None:
+                return None, fail_reason
             return (raw_df, trial_df_stats), None
         except Exception as e:
             print(f"Error computing matrix for panel {panel}, participant {p_data.name}: {e}")
             print(trial_df_stats if 'trial_df_stats' in locals() else "No trial stats available.")
             return None, f"{type(e).__name__}: {e}"
+
+    def _matrix_from_model(self, gaze_model, score=np.nan):
+        """Returns (matrix of self.cfg.matrix_type, None) or (None, fail_reason). The
+        validity gate always runs on the CONDITIONAL matrix, whichever type is returned,
+        so all matrix types keep exactly the same panels/participants (_is_matrix_valid's
+        binary-artifact rule is defined in row-probability terms). score: the panel's
+        SDMT score, only used by matrix_type "normalized_by_score"."""
+        clean = not self.cfg.with_repeats
+        cond_df = gaze_model.get_probability_matrix(clean=clean)
+        if self._is_matrix_valid(cond_df) is False:
+            return None, "invalid/empty transition matrix"
+        if self.cfg.matrix_type == "normalized_by_n_transitions":
+            return gaze_model.get_joint_probability_matrix(clean=clean), None
+        if self.cfg.matrix_type == "normalized_by_score":
+            if not np.isfinite(score) or score <= 0:
+                return None, f"no valid SDMT score for normalized_by_score (score={score})"
+            return gaze_model.get_per_score_matrix(clean=clean, score=score), None
+        return cond_df, None
+
+    def _load_source_exclusion_reasons(self):
+        """{(participant, panel): reason} from the trial_stats source run's
+        exclusion_log.csv, panel=None for participant-level rows - so a panel missing
+        from the source run is logged with WHY it was missing there, not just 'absent'."""
+        if hasattr(self, "_source_exclusions"):
+            return self._source_exclusions
+        self._source_exclusions = {}
+        log_path = os.path.join(self.cfg.trial_stats_source_dir, "exclusion_log.csv")
+        if os.path.exists(log_path):
+            df = pd.read_csv(log_path, dtype=str)
+            for _, row in df.iterrows():
+                panel = row["panel"] if isinstance(row["panel"], str) and row["panel"] else None
+                self._source_exclusions.setdefault((row["participant"], panel), row["reason"])
+        else:
+            print(f"Warning: no exclusion_log.csv in trial_stats source {self.cfg.trial_stats_source_dir}")
+        return self._source_exclusions
+
+    def _compute_from_trial_stats(self, group, p_name, p_obj, user_folder):
+        """from_scratch variant reading an earlier run's saved trial_stats CSVs
+        (cfg.trial_stats_source_dir) instead of Stage 1's annotated gaze - see
+        GazeMarkovModel.from_trial_stats. Saves matrices + a copy of the trial stats
+        into this run's own folder, same layout as the normal from_scratch path."""
+        source_reasons = self._load_source_exclusion_reasons()
+        src_folder = os.path.join(self.cfg.trial_stats_source_dir, "markov_matrices", group, p_name)
+        for panel in PANELS:
+            src_path = os.path.join(src_folder, f"trial_stats_{p_name}_panel_{panel}.csv")
+            if not os.path.exists(src_path):
+                reason = source_reasons.get((p_name, panel)) or source_reasons.get((p_name, None))
+                self._log_exclusion(p_name, group, panel,
+                                    f"source_run_exclusion: {reason}" if reason
+                                    else "no trial_stats CSV in source run")
+                continue
+            try:
+                trial_stats_df = pd.read_csv(src_path)
+                if not {"Sequence", "Cleaned_Sequence"} <= set(trial_stats_df.columns):
+                    raise ValueError("trial_stats CSV has no Sequence/Cleaned_Sequence columns")
+                gaze_model = GazeMarkovModel.from_trial_stats(trial_stats_df, only_keys=self.cfg.only_1_to_9)
+                matrix_df, fail_reason = self._matrix_from_model(gaze_model, score=p_obj.get_score(panel))
+            except Exception as e:
+                matrix_df, fail_reason = None, f"{type(e).__name__}: {e}"
+
+            if matrix_df is None:
+                self._log_exclusion(p_name, group, panel, fail_reason)
+                continue
+
+            matrix_df.to_csv(os.path.join(user_folder, f"markov_matrix_{p_name}_panel_{panel}.csv"))
+            p_obj.add_matrix(panel, matrix_df)
+            trial_stats_df.to_csv(os.path.join(user_folder, f"trial_stats_{p_name}_panel_{panel}.csv"), index=False)
+            p_obj.add_trial_data(panel, trial_stats_df)
 
     # def _calculate_duration(self, p_data, panel):
     #     try:
@@ -296,6 +368,44 @@ class DataManager:
     #         return (np.std(x) + np.std(y)) / 2.0
     #     except:
     #         return np.nan
+
+    def compute_digit_asymmetry(self):
+        """Per participant x panel symbol->symbol asymmetry
+        (GazeMarkovModel.get_digit_asymmetry), rebuilt from each panel's trial stats
+        (Sequence/Cleaned_Sequence), so it's identical regardless of matrix_type. Only
+        panels with a valid matrix in the analysis (p.matrices) - call after
+        filter_by_min_panels so the population matches the PCA's. Returns
+        (per_panel_df, per_participant_df); participant level = mean over panels."""
+        rows = []
+        for group in self.participants:
+            for p_name, p_obj in self.participants[group].items():
+                for panel in p_obj.matrices:
+                    trial_df = p_obj.trial_data.get(panel)
+                    if trial_df is None:
+                        continue
+                    model = GazeMarkovModel.from_trial_stats(trial_df, only_keys=self.cfg.only_1_to_9)
+                    asym, n_digit = model.get_digit_asymmetry(clean=not self.cfg.with_repeats)
+                    rows.append({"Participant": p_name, "Group": group, "Panel": panel,
+                                 "SDMT_Score": p_obj.get_score(panel),
+                                 "digit_asymmetry": asym, "n_digit_transitions": n_digit})
+        per_panel = pd.DataFrame(rows)
+        per_participant = (per_panel.groupby(["Participant", "Group"])
+                           .agg(digit_asymmetry_mean=("digit_asymmetry", "mean"),
+                                digit_asymmetry_std=("digit_asymmetry", "std"),
+                                n_digit_transitions_mean=("n_digit_transitions", "mean"),
+                                SDMT_Score_mean=("SDMT_Score", "mean"),
+                                n_panels=("Panel", "count"))
+                           .reset_index())
+        return per_panel, per_participant
+
+    def save_digit_asymmetry(self):
+        per_panel, per_participant = self.compute_digit_asymmetry()
+        out_dir = os.path.join(self.cfg.main_output_path, "digit_asymmetry")
+        os.makedirs(out_dir, exist_ok=True)
+        per_panel.to_csv(os.path.join(out_dir, "digit_asymmetry_per_panel.csv"), index=False)
+        per_participant.to_csv(os.path.join(out_dir, "digit_asymmetry_per_participant.csv"), index=False)
+        print(f"Saved digit asymmetry for {len(per_panel)} panels / {len(per_participant)} participants to {out_dir}")
+        return per_panel, per_participant
 
     def filter_by_min_panels(self, min_panels=MIN_PANELS_FOR_MARKOV):
         """Drop participants with 1..min_panels-1 valid panel matrices from the analysis

@@ -26,6 +26,20 @@ def run_pipeline(annotation_method="threshold_based", date_str=None, output_base
         AnalysisConfig(with_repeats=False, only_1_to_9=False, use_mean_matrix=True, from_scratch=True,
                        annotation_method=annotation_method, date_str=date_str, output_base_path=output_base_path),
 
+        # 1b/1c. Same as 1, but instead of row-conditional P(B | A):
+        #   1b "normalized_by_score":         count(A->B) / the panel's SDMT score
+        #   1c "normalized_by_n_transitions": count(A->B) / all transitions in the panel
+        #                                     (matrix sums to 1)
+        # Built from task 1's freshly saved trial_stats CSVs (no second pass over Stage
+        # 1's annotated gaze), so they must stay AFTER task 1. Each lands in its own
+        # analysis_..._NORMALIZED_BY_SCORE / analysis_..._NORMALIZED_BY_N_TRANSITIONS folder.
+        AnalysisConfig(with_repeats=False, only_1_to_9=False, use_mean_matrix=True, from_scratch=True,
+                       annotation_method=annotation_method, date_str=date_str, output_base_path=output_base_path,
+                       matrix_type="normalized_by_score"),
+        AnalysisConfig(with_repeats=False, only_1_to_9=False, use_mean_matrix=True, from_scratch=True,
+                       annotation_method=annotation_method, date_str=date_str, output_base_path=output_base_path,
+                       matrix_type="normalized_by_n_transitions"),
+
         # # 2. with Enter, Exit + Mean Matrix
         # AnalysisConfig(with_repeats=False, only_1_to_9=False, use_mean_matrix=True, from_scratch=False),
         
@@ -68,84 +82,113 @@ def run_pipeline(annotation_method="threshold_based", date_str=None, output_base
     
     ]
 
+    # Non-conditional tasks with no explicit trial_stats source read the conditional task with the
+    # same repeats/states settings from this same run (listed earlier in tasks).
     for config in tasks:
-        print(f"\n{'='*50}")
-        print(f"STARTING: {config.folder_name} - {'Mean Matrix' if config.use_mean_matrix else 'All Panels'} - {'Concatenated Panels' if config.concat_panels else ''}")
-        print(f"{'='*50}")
-        
-        #--------------- Load ---------------#
-        loader = DataManager(config)
-        loader.load_participants_and_scores()
-        if participant_whitelist is not None:
-            for group in list(loader.participants.keys()):
-                loader.participants[group] = {
-                    name: p for name, p in loader.participants[group].items() if name in participant_whitelist
-                }
-            print(f"Restricted to whitelist: { {g: list(ps.keys()) for g, ps in loader.participants.items()} }")
-        loader.load_or_compute_matrices(from_scratch=config.from_scratch)
+        if config.matrix_type != "conditional" and config.from_scratch and config.trial_stats_source_dir is None:
+            config.trial_stats_source_dir = AnalysisConfig(
+                with_repeats=config.with_repeats, only_1_to_9=config.only_1_to_9,
+                use_mean_matrix=config.use_mean_matrix, from_scratch=False,
+                annotation_method=config.annotation_method, date_str=config.date_str,
+                raw_behavior_path=config.raw_behavior_path,
+                output_base_path=config.output_base_path).main_output_path
 
-        #--------------- Exclusion accounting + <4-panel filter ---------------#
-        loader.filter_by_min_panels()
-        if config.from_scratch:
-            loader.save_exclusion_log()
-        # compute_exclusion_summary scans the FULL eligible population - meaningless
-        # (and misleading in the shared summary table) when restricted to a whitelist,
-        # since everyone else would show up as a false "technical" exclusion.
-        if participant_whitelist is None:
-            summary_stats = loader.compute_exclusion_summary()
-            pipeline_config.append_exclusion_summary_row(
-                f"Markov ({config.folder_name})", config.annotation_method, summary_stats,
-                out_path=exclusion_summary_path)
-
-        #--------------- Get Data ---------------#
-        participants = loader.get_flat_participants()
-        print(f"Participants: {len(participants)}")
-        
-        #--------------- Markov Analysis ---------------#
-        # print("\n--- Running Markov Analysis ---")
-
-        analyzer = MarkovAnalyzer(participants, config)
-
-        # A. PCA Analysis (Includes the Colored Plots loop: scatter, weights heatmap, elbow)
-        analyzer.run_pca()
-
-        # B. Consistency Analysis (Violin + Permutation)
-        analyzer.run_consistency_analysis(n_permutations=1000)
-
-        # C. Per-participant/panel matrix visualization (heatmap only - the network
-        # graph visualization was removed per decision 2026-09-27)
-        viz = MarkovVisualizer(output_dir=config.plot_output_path)
-        for p in participants:
-            for panel in p.matrices.keys():
-                viz.plot_heatmap(p, panel)
+    for config in tasks:
+        run_task(config, participant_whitelist=participant_whitelist,
+                 exclusion_summary_path=exclusion_summary_path)
 
 
-        # ---------------------------------------------------------
-        # 2. RUN BEHAVIORAL ANALYSIS
-        # ---------------------------------------------------------
-        # print("\n--- Running Behavioral Analysis ---")
-        # behav_analyzer = BehavioralAnalyzer(participants, config)
-        
-        # # A. POPULATE DATA (Master Loader)
-        # # force_recompute=True -> Forces calculation of 'Is_One_Fix', 'Is_Two_Fix' etc.
-        # behav_analyzer.populate_trial_stats(force_recompute=False)
-        # # Plot Global Symbols (Mean across panels)
-        # behav_analyzer.plot_metric_global_average(metric="Num_Symbols", title_suffix="Symbols")
+def run_task(config, participant_whitelist=None, exclusion_summary_path=None):
+    """One AnalysisConfig's full Markov run: load/compute matrices, exclusion
+    accounting, PCA, consistency analysis, per-panel heatmaps."""
+    print(f"\n{'='*50}")
+    print(f"STARTING: {config.folder_name} - {'Mean Matrix' if config.use_mean_matrix else 'All Panels'} - {'Concatenated Panels' if config.concat_panels else ''} - matrix_type={config.matrix_type}")
+    print(f"{'='*50}")
+    
+    #--------------- Load ---------------#
+    loader = DataManager(config)
+    loader.load_participants_and_scores()
+    if participant_whitelist is not None:
+        for group in list(loader.participants.keys()):
+            loader.participants[group] = {
+                name: p for name, p in loader.participants[group].items() if name in participant_whitelist
+            }
+        print(f"Restricted to whitelist: { {g: list(ps.keys()) for g, ps in loader.participants.items()} }")
+    loader.load_or_compute_matrices(from_scratch=config.from_scratch)
 
-        # # Plot Global Fixations (Mean across panels)
-        # behav_analyzer.plot_metric_global_average(metric="Num_Fixations", title_suffix="Fixations")
-        
-        # # B. GENERATE VISUALIZATIONS
-        
-        # # # Task 2: Line Plots (Mean + Shaded Error Bar)
-        # # behav_analyzer.plot_metric_across_trials(metric="Num_Fixations", title_suffix="Fixations")
-        # # behav_analyzer.plot_metric_across_trials(metric="Num_Symbols", title_suffix="Symbols (Sequence Length)")
-        
-        # # Task 3: Bar Plots (Zero/One/Two items)
-        # behav_analyzer.compute_and_plot_trial_types()
-        # behav_analyzer.compute_and_plot_unique_symbols_distribution()
-        # # Task 4: Correlations with Score
-        # # behav_analyzer.analyze_correlations_with_score()
+    #--------------- Exclusion accounting + <4-panel filter ---------------#
+    loader.filter_by_min_panels()
+    if config.from_scratch:
+        loader.save_exclusion_log()
+    # compute_exclusion_summary scans the FULL eligible population - meaningless
+    # (and misleading in the shared summary table) when restricted to a whitelist,
+    # since everyone else would show up as a false "technical" exclusion.
+    if participant_whitelist is None:
+        summary_stats = loader.compute_exclusion_summary()
+        pipeline_config.append_exclusion_summary_row(
+            f"Markov ({config.folder_name})", config.annotation_method, summary_stats,
+            out_path=exclusion_summary_path)
+
+    # Symbol->symbol (1-9 only) transition asymmetry per panel, count-based - same
+    # values for every matrix_type (computed from trial stats, not the saved matrix).
+    loader.save_digit_asymmetry()
+
+    #--------------- Get Data ---------------#
+    participants = loader.get_flat_participants()
+    print(f"Participants: {len(participants)}")
+    
+    #--------------- Markov Analysis ---------------#
+    # print("\n--- Running Markov Analysis ---")
+
+    analyzer = MarkovAnalyzer(participants, config)
+
+    # A. PCA Analysis (Includes the Colored Plots loop: scatter, weights heatmap, elbow)
+    analyzer.run_pca()
+
+    # A2. Every individual participant x panel matrix projected into the mean-matrix PCA
+    # space above (no-op outside mean-matrix mode)
+    analyzer.run_panel_projection()
+
+    # A3. Squared cosines: how much of each participant's mean matrix PC1/PC2/PC3 explain
+    analyzer.run_squared_cosines()
+
+    # B. Consistency Analysis (Violin + Permutation)
+    analyzer.run_consistency_analysis(n_permutations=1000)
+
+    # C. Per-participant/panel matrix visualization (heatmap only - the network
+    # graph visualization was removed per decision 2026-09-27)
+    viz = MarkovVisualizer(output_dir=config.plot_output_path, matrix_type=config.matrix_type)
+    for p in participants:
+        for panel in p.matrices.keys():
+            viz.plot_heatmap(p, panel)
+
+
+    # ---------------------------------------------------------
+    # 2. RUN BEHAVIORAL ANALYSIS
+    # ---------------------------------------------------------
+    # print("\n--- Running Behavioral Analysis ---")
+    # behav_analyzer = BehavioralAnalyzer(participants, config)
+    
+    # # A. POPULATE DATA (Master Loader)
+    # # force_recompute=True -> Forces calculation of 'Is_One_Fix', 'Is_Two_Fix' etc.
+    # behav_analyzer.populate_trial_stats(force_recompute=False)
+    # # Plot Global Symbols (Mean across panels)
+    # behav_analyzer.plot_metric_global_average(metric="Num_Symbols", title_suffix="Symbols")
+
+    # # Plot Global Fixations (Mean across panels)
+    # behav_analyzer.plot_metric_global_average(metric="Num_Fixations", title_suffix="Fixations")
+    
+    # # B. GENERATE VISUALIZATIONS
+    
+    # # # Task 2: Line Plots (Mean + Shaded Error Bar)
+    # # behav_analyzer.plot_metric_across_trials(metric="Num_Fixations", title_suffix="Fixations")
+    # # behav_analyzer.plot_metric_across_trials(metric="Num_Symbols", title_suffix="Symbols (Sequence Length)")
+    
+    # # Task 3: Bar Plots (Zero/One/Two items)
+    # behav_analyzer.compute_and_plot_trial_types()
+    # behav_analyzer.compute_and_plot_unique_symbols_distribution()
+    # # Task 4: Correlations with Score
+    # # behav_analyzer.analyze_correlations_with_score()
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:

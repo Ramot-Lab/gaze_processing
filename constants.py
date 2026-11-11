@@ -107,6 +107,18 @@ FIXATION_IDX = 1
 # has no equivalent 3rd class.
 PSO_IDX = 3
 
+# "Merge adjacent fixations" post-processing of the gazeNET labels (decision 2026-11-10),
+# applied in GazeModel/recording_data_runner.generate_fixation_model_based so SDMT and fxsp
+# both get it. Two fixations are joined (the samples between them relabeled fixation) when
+# the time between them is <= 75 ms AND the angle between their mean positions is <= 0.5 deg
+# - the Tobii I-VT filter defaults (Olsen, 2012, "The Tobii I-VT Fixation Filter", Tobii
+# Technology white paper; see also Komogortsev et al., 2010, IEEE Trans Biomed Eng
+# 57:2635-2645). gazeNET itself has no such post-processing (Zemblys, Niehorster &
+# Holmqvist, 2019), so a 1-2 sample "saccade" otherwise splits a fixation in two.
+MERGE_ADJACENT_FIXATIONS = True
+MERGE_MAX_TIME_BETWEEN_FIXATIONS_MS = 75
+MERGE_MAX_ANGLE_BETWEEN_FIXATIONS_DEG = 0.5
+
 
 # #fixatio saccade preprossesing constants
 # MIN_FIXATION_POINTS = 90 #600*150/1000  for 150 ms at 600Hz
@@ -126,6 +138,13 @@ SCREEN_SIZE = [1080,1920] #(height, width), (vertical, horizontal)
 PIXEL2METER = 0.000264583  # Conversion factor for 96 DPI (pixels to meters)
 screenDistance = 0.65  
 deg_per_pixel = 2 * math.degrees(math.atan((PIXEL2METER / 2) / screenDistance))
+# Measured lab screen (checked 2026-11-08): 60.4 cm diagonal, 1920x1080, active area
+# 52.7 x 29.65 cm -> 0.02745 cm/px both axes (square pixels). PIXEL2METER above is the
+# 96-DPI default (0.02646 cm/px, ~3.6% smaller) and is left unchanged because the SDMT
+# pipeline (gazeNET degree input, threshold annotation) was built on it.
+SCREEN_WIDTH_CM = 52.7
+SCREEN_HEIGHT_CM = 29.65
+deg_per_cm = 2 * math.degrees(math.atan(0.5 / (screenDistance * 100)))
 
 panel_center_locations = [
         [537.0,296.0],

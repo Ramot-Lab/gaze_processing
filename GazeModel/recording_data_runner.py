@@ -17,6 +17,12 @@ class RecordingDataRunner:
     def __init__(self, model, config = DEFAULT_CONFIG_PATH):
         with open(config, 'r') as f:
             self.config = json.load(f)
+        # config.json's "augment" adds random Gaussian noise (up to 0.495 deg RMS per
+        # 201-sample window, data_loader.EventParser.parse_data) - a training-time
+        # augmentation (Zemblys, Niehorster & Holmqvist, 2019, Behav Res Methods 51:840-864).
+        # At inference it only corrupts the real signal, so it is off here (decision
+        # 2026-11-10); config.json itself is unchanged, so training still augments.
+        self.config['augment'] = False
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.model = model
         #%% prepare model
@@ -117,8 +123,55 @@ class RecordingDataRunner:
                                         shuffle=False)
             return test_loader, test_dataset
 
-def generate_fixation_model_based(recording_data, model):
+def merge_adjacent_fixations(evt, x_deg, y_deg, t_ms,
+                             max_time_ms=MERGE_MAX_TIME_BETWEEN_FIXATIONS_MS,
+                             max_angle_deg=MERGE_MAX_ANGLE_BETWEEN_FIXATIONS_DEG):
+    """Tobii I-VT "merge adjacent fixations" (Olsen, 2012; constants.py): walking the
+    fixations (runs of evt == FIXATION_IDX) in order, the next fixation is joined to the
+    current one when the time from the current one's last sample to the next one's first
+    sample is <= max_time_ms and the distance between their mean positions is
+    <= max_angle_deg; the samples in between are relabeled FIXATION_IDX. A merged fixation's
+    mean position is that of all its samples, and it can absorb further fixations.
+    Returns a new evt array (same dtype)."""
+    evt = np.asarray(evt).copy()
+    is_fix = (evt == FIXATION_IDX).astype(np.int8)
+    edges = np.diff(np.concatenate(([0], is_fix, [0])))
+    starts, ends = np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)  # ends exclusive
+    if len(starts) < 2:
+        return evt
+    x_deg, y_deg, t_ms = (np.asarray(a, dtype=float) for a in (x_deg, y_deg, t_ms))
+    cur_end = ends[0]
+    cur_sum = np.array([x_deg[starts[0]:ends[0]].sum(), y_deg[starts[0]:ends[0]].sum()])
+    cur_n = ends[0] - starts[0]
+    for s, e in zip(starts[1:], ends[1:]):
+        nxt_sum = np.array([x_deg[s:e].sum(), y_deg[s:e].sum()])
+        gap_ms = t_ms[s] - t_ms[cur_end - 1]
+        dist = np.hypot(*(cur_sum / cur_n - nxt_sum / (e - s)))
+        if gap_ms <= max_time_ms and dist <= max_angle_deg:
+            evt[cur_end:s] = FIXATION_IDX
+            cur_sum, cur_n = cur_sum + nxt_sum, cur_n + (e - s)
+        else:
+            cur_sum, cur_n = nxt_sum, e - s
+        cur_end = e
+    return evt
+
+
+def normalized_to_deg(x_norm, y_norm):
+    """Tobii normalized display coordinates -> degrees, on the measured screen and 65 cm
+    viewing distance (constants.SCREEN_WIDTH_CM/HEIGHT_CM, deg_per_cm). Used for the merge
+    angle only; the model's own input still uses deg_per_pixel, as it was trained."""
+    return (np.asarray(x_norm, dtype=float) * SCREEN_WIDTH_CM * deg_per_cm,
+            np.asarray(y_norm, dtype=float) * SCREEN_HEIGHT_CM * deg_per_cm)
+
+
+def generate_fixation_model_based(recording_data, model, merge_adjacent=MERGE_ADJACENT_FIXATIONS):
     recording_ranner = RecordingDataRunner(model)
     annotated_data = recording_ranner.apply_prediction_to_recording_data(recording_data)
     annotated_data.columns = ["t", FIXATION_CSV_KEY_EYE_H, FIXATION_CSV_KEY_EYE_V, FIXATION_VALID_STATUS,FIXATION_CSV_KEY_FIXATION]
+    if merge_adjacent:
+        x_deg, y_deg = normalized_to_deg(annotated_data[FIXATION_CSV_KEY_EYE_H], annotated_data[FIXATION_CSV_KEY_EYE_V])
+        # 't' is the Tobii system timestamp (us) relative to the first sample
+        annotated_data[FIXATION_CSV_KEY_FIXATION] = merge_adjacent_fixations(
+            annotated_data[FIXATION_CSV_KEY_FIXATION].to_numpy(), x_deg, y_deg,
+            annotated_data["t"].to_numpy() / 1000)
     return annotated_data

@@ -14,9 +14,9 @@ import seaborn as sns
 from scipy.stats import mannwhitneyu, ttest_ind
 
 import pipeline_config
-from constants import FIXATION_IDX, SACCADE_IDX, PSO_IDX
+from constants import FIXATION_IDX, SACCADE_IDX, PSO_IDX, SCREEN_SIZE
 from run_preprocessing import iter_all_subject_dirs
-from feature_pipeline import demographics_text, annotate_demographics, resolve_run_dir
+from feature_pipeline import demographics_text, annotate_demographics, resolve_run_dir, _bcea
 
 PANELS = ["0", "i1", "l4", "a3", "a5", "l3"]
 
@@ -80,6 +80,58 @@ def extract_pso_durations(annotated_df):
     return runs.loc[runs["evt"] == PSO_IDX, "duration_ms"].to_numpy()
 
 
+def _extract_event_runs_with_points(annotated_df):
+    """Same run-detection as _extract_event_runs, but also keeps each run's raw
+    (eye_horizontal, eye_vertical) sample points (valid samples only) - needed for
+    per-block dispersion features (e.g. PSO BCEA), not just duration. Less vectorized
+    (a groupby producing per-run point lists) than _extract_event_runs, but only
+    called where point-level data is actually needed."""
+    evt = annotated_df["evt"].to_numpy()
+    t = annotated_df["t"].to_numpy()
+    x = annotated_df["eye_horizontal"].to_numpy()
+    y = annotated_df["eye_vertical"].to_numpy()
+    valid = annotated_df["status"].to_numpy().astype(bool)
+    if len(evt) == 0:
+        return []
+
+    evt_masked = np.where(valid, evt, -1)
+    change = np.empty(len(evt_masked), dtype=bool)
+    change[0] = True
+    change[1:] = evt_masked[1:] != evt_masked[:-1]
+    run_id = np.cumsum(change)
+
+    df_tmp = pd.DataFrame({"run_id": run_id, "evt": evt_masked, "t": t, "x": x, "y": y, "valid": valid})
+    df_tmp = df_tmp[df_tmp["valid"]]
+
+    runs = []
+    for _, g in df_tmp.groupby("run_id"):
+        runs.append({
+            "evt": g["evt"].iloc[0],
+            "duration_ms": (g["t"].max() - g["t"].min()) / 1000.0,
+            "points": list(zip(g["x"], g["y"])),
+        })
+    return runs
+
+
+def extract_pso_bcea_values(annotated_df):
+    """One BCEA value per contiguous PSO block - dispersion of the raw gaze samples
+    within that block (same _bcea formula as fixation_bcea, decision 2026-09-29),
+    computed directly from Stage 1's raw CSV - same 'regardless of SDMT structure'
+    style as PSO duration, not TrialManager/Fixation-object-based.
+
+    Stage 1's saved eye_horizontal/eye_vertical are normalized [0,1] screen
+    coordinates, but fixation_bcea is computed in PIXEL space (TrialManager's
+    prepare_image_and_gaze scales x by SCREEN_SIZE[1] minus a per-panel-image x_offset,
+    y by SCREEN_SIZE[0]). BCEA is invariant to that additive offset (it only depends on
+    std/correlation) and scales multiplicatively with the two axis factors, so
+    BCEA_pixels = BCEA_normalized * SCREEN_SIZE[0] * SCREEN_SIZE[1] exactly, without
+    needing to load each panel's image just for its width - verified numerically
+    against the full x_offset-inclusive scaling."""
+    runs = _extract_event_runs_with_points(annotated_df)
+    pixel_area = SCREEN_SIZE[0] * SCREEN_SIZE[1]
+    return np.array([_bcea(r["points"]) * pixel_area for r in runs if r["evt"] == PSO_IDX])
+
+
 def compute_pso_duration_total(annotated_df):
     """The feature itself (decision 2026-09-27): total time spent in PSO across every
     PSO block in one participant's panel - a single number per participant/panel, not
@@ -108,6 +160,50 @@ def build_duration_table(annotation_method, date_str=None, participant_whitelist
             for d in sacc_durs:
                 records.append({"participant": participant, "group": group, "panel": panel,
                                  "event_type": "saccade", "duration_ms": d})
+    return pd.DataFrame.from_records(records)
+
+
+def build_pso_duration_table(annotation_method, date_str=None, participant_whitelist=None):
+    """Raw, long-format table - one row per individual PSO (post-saccadic oscillation)
+    block, computed directly from Stage 1's raw annotated CSVs (decision 2026-09-28) -
+    same population-scan pattern as build_duration_table, and like fixation/saccade
+    duration, entirely independent of any SDMT trial/search structure (no TrialManager
+    involved). Treated the same way as saccade_latency and fixation_bcea downstream in
+    feature_pipeline.py: merged into df_participants as a mean/std, and its own
+    dedicated reliability run on these raw per-block values."""
+    records = []
+    for group, subject_dir in iter_all_subject_dirs(pipeline_config.main_data_path()):
+        participant = os.path.basename(subject_dir)
+        if participant_whitelist is not None and participant not in participant_whitelist:
+            continue
+        for panel in PANELS:
+            try:
+                df = pipeline_config.load_annotated_csv(annotation_method, group, participant, panel,
+                                                          date_str=date_str, corrected=False)
+            except FileNotFoundError:
+                continue
+            for d in extract_pso_durations(df):
+                records.append({"participant": participant, "group": group, "panel": panel, "pso_duration_ms": d})
+    return pd.DataFrame.from_records(records)
+
+
+def build_pso_bcea_table(annotation_method, date_str=None, participant_whitelist=None):
+    """Raw, long-format table - one row per individual PSO block's own BCEA (dispersion
+    of its raw gaze samples), computed directly from Stage 1's raw CSVs (decision
+    2026-09-29) - same population-scan pattern as build_pso_duration_table."""
+    records = []
+    for group, subject_dir in iter_all_subject_dirs(pipeline_config.main_data_path()):
+        participant = os.path.basename(subject_dir)
+        if participant_whitelist is not None and participant not in participant_whitelist:
+            continue
+        for panel in PANELS:
+            try:
+                df = pipeline_config.load_annotated_csv(annotation_method, group, participant, panel,
+                                                          date_str=date_str, corrected=False)
+            except FileNotFoundError:
+                continue
+            for v in extract_pso_bcea_values(df):
+                records.append({"participant": participant, "group": group, "panel": panel, "pso_bcea": v})
     return pd.DataFrame.from_records(records)
 
 

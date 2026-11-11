@@ -22,15 +22,14 @@ class MarkovAnalyzer:
         # --- FOLDER RENAMING ---
         self.output_dir = config.plot_output_path
         
-        self.pca_dir = os.path.join(self.output_dir, "pca")   
+        self.pca_dir = os.path.join(self.output_dir, "pca")
         self.weights_dir = os.path.join(self.output_dir, "weights")
         self.variance_dir = os.path.join(self.output_dir, "variance")
         self.consistency_dir = os.path.join(self.output_dir, "consistency")
         self.separation_dir = os.path.join(self.output_dir, "separation")
-        self.fix_corr_dir = os.path.join(self.output_dir, "fixation_corr")
-        
-        for d in [self.output_dir, self.pca_dir, self.weights_dir, 
-                  self.variance_dir, self.consistency_dir, self.separation_dir, self.fix_corr_dir]:
+
+        for d in [self.output_dir, self.pca_dir, self.weights_dir,
+                  self.variance_dir, self.consistency_dir, self.separation_dir]:
             os.makedirs(d, exist_ok=True)
         
         self.global_states = self._get_global_states()
@@ -58,11 +57,12 @@ class MarkovAnalyzer:
         n = len(self.participants)
         n_hc = sum(1 for p in self.participants if p.group == "HC")
         n_ms = n - n_hc
+        n_panels = sum(len(p.matrices) for p in self.participants)
         genders = [gender_map.get(p.name, "") for p in self.participants]
         n_f = sum(1 for g in genders if g == "F")
         n_m = sum(1 for g in genders if g == "M")
         n_unknown = n - n_f - n_m
-        text = f"N={n} (HC={n_hc}, pwMS={n_ms})\nSex: F={n_f}, M={n_m}"
+        text = f"N={n} (HC={n_hc}, pwMS={n_ms})\nN panels={n_panels}\nSex: F={n_f}, M={n_m}"
         if n_unknown:
             text += f", unknown={n_unknown}"
         return text
@@ -313,13 +313,16 @@ class MarkovAnalyzer:
 # =========================================================================
     # PART 1: PCA & FEATURE ANALYSIS
     # =========================================================================
-    def run_pca(self, n_components = None, save=True):
+    def _fit_pca(self, n_components=None, save=True):
+        """Builds the feature table and fits StandardScaler + PCA on it - the one fit
+        both run_pca and run_panel_projection use, so a projection is always into
+        exactly the space run_pca plots. Returns None if there isn't enough data."""
         # 1. BUILD OR FETCH DATA
         X, df_metadata, feature_names = self._build_and_save_feature_table(save=save)
         
         if X.size == 0:
             print("No data available for PCA.")
-            return
+            return None
 
         # 2. PCA CLEANING
         X_var = np.var(X, axis=0)
@@ -332,16 +335,33 @@ class MarkovAnalyzer:
         
         if len(X_clean) < 3:
             print("Not enough data.")
-            return
+            return None
 
         # 3. RUN PCA
-        mode_name = "Concatenated Panels" if self.config.concat_panels else ("Mean Matrix" if self.config.use_mean_matrix else "All Panels")
-        
         max_comps = min(len(X_clean), X_clean.shape[1], 20) if n_components is None else n_components
         pca = PCA(n_components=max_comps)
-        X_scaled = StandardScaler().fit_transform(X_clean)
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X_clean)
         coords = pca.fit_transform(X_scaled)
+        return {
+            "pca": pca, "scaler": scaler, "coords": coords, "df_metadata": df_metadata,
+            "X_clean": X_clean,
+            # Columns kept by _build_and_save_feature_table (not all-NaN), the training
+            # column means it imputed remaining NaNs with, and which of those columns
+            # survived the constant-feature filter - everything a new vector needs to go
+            # through the identical preprocessing before pca.transform.
+            "feature_names": feature_names, "col_means": X.mean(axis=0),
+            "valid_mask": valid_mask, "feature_names_clean": feature_names_clean,
+        }
+
+    def run_pca(self, n_components = None, save=True):
+        fit = self._fit_pca(n_components=n_components, save=save)
+        if fit is None:
+            return
+        pca, coords, df_metadata = fit["pca"], fit["coords"], fit["df_metadata"]
+        X_clean, feature_names_clean = fit["X_clean"], fit["feature_names_clean"]
         explained_var = pca.explained_variance_ratio_
+        mode_name = "Concatenated Panels" if self.config.concat_panels else ("Mean Matrix" if self.config.use_mean_matrix else "All Panels")
 
         for i in range(coords.shape[1]):
             df_metadata[f"PC{i+1}"] = coords[:, i]
@@ -377,6 +397,256 @@ class MarkovAnalyzer:
 
         # 7. ELBOW PLOT
         self._plot_elbow(X_clean, mode_name)
+
+    # =========================================================================
+    # PART 1b: PER-PANEL PROJECTION INTO THE MEAN-MATRIX PCA SPACE
+    # =========================================================================
+    def run_panel_projection(self, n_pcs=3):
+        """Fits the mean-matrix PCA exactly as run_pca does (one row per participant,
+        _fit_pca), then projects every individual participant x panel matrix into that
+        SAME space - same feature columns, same training-mean imputation, same
+        StandardScaler and PCA weights; nothing is refit on the panels. Shows how a
+        participant's single panels scatter around their mean-matrix position and
+        whether the mean-matrix axes still order score/group at the single-panel level.
+        Plots (PC1-3 pairwise + 3D), each colored by panel SDMT score and by group, once
+        with each participant's mean-matrix point overlaid and once without, into
+        <plot_output_path>/pca_panel_projection/{with_mean_overlay,no_overlay}/."""
+        if not self.config.use_mean_matrix or self.config.concat_panels:
+            print("run_panel_projection only applies to mean-matrix mode - skipping.")
+            return
+        fit = self._fit_pca(save=False)
+        if fit is None:
+            return
+        pca, scaler = fit["pca"], fit["scaler"]
+        n_pcs = min(n_pcs, pca.n_components_)
+        all_feature_names = self._get_feature_names()
+        keep_cols = np.isin(all_feature_names, fit["feature_names"])
+
+        def project(matrix):
+            vec = self._align_vector(matrix, fill_value=np.nan)[keep_cols]
+            vec = np.where(np.isnan(vec), fit["col_means"], vec)
+            return pca.transform(scaler.transform(vec[fit["valid_mask"]][None, :]))[0, :n_pcs]
+
+        pc_cols = [f"PC{i + 1}" for i in range(n_pcs)]
+        panel_rows = []
+        for p in self.participants:
+            for panel, matrix in p.matrices.items():
+                panel_rows.append({"Participant": p.name, "Group": p.group, "Panel": panel,
+                                   "SDMT_Score": p.get_score(panel),
+                                   **dict(zip(pc_cols, project(matrix)))})
+        df_panels = pd.DataFrame(panel_rows)
+        df_means = fit["df_metadata"][["Participant", "Group", "SDMT_Score"]].copy()
+        for i, c in enumerate(pc_cols):
+            df_means[c] = fit["coords"][:, i]
+
+        out_root = os.path.join(self.output_dir, "pca_panel_projection")
+        os.makedirs(out_root, exist_ok=True)
+        df_panels.to_csv(os.path.join(out_root, "panel_projection_scores.csv"), index=False)
+        df_means.to_csv(os.path.join(out_root, "mean_matrix_scores.csv"), index=False)
+        print(f"Projected {len(df_panels)} panels from {len(df_means)} participants into the mean-matrix PCA space.")
+
+        explained = pca.explained_variance_ratio_
+        for overlay in (True, False):
+            out_dir = os.path.join(out_root, "with_mean_overlay" if overlay else "no_overlay")
+            os.makedirs(out_dir, exist_ok=True)
+            for color_by in ("SDMT_Score", "Group"):
+                for i, j in itertools.combinations(range(n_pcs), 2):
+                    self._plot_projection_2d(df_panels, df_means if overlay else None, i, j, color_by,
+                                             explained, out_dir)
+                if n_pcs >= 3:
+                    self._plot_projection_3d(df_panels, df_means if overlay else None, color_by,
+                                             explained, out_dir)
+
+    _GROUP_COLORS = {"HC": "blue", "pwMS": "red", "MS": "red"}
+
+    # =========================================================================
+    # PART 1c: SQUARED COSINES - HOW WELL EACH PC EXPLAINS EACH PARTICIPANT
+    # =========================================================================
+    def run_squared_cosines(self, n_pcs=3):
+        """Squared cosine ("quality of representation") of each participant's mean
+        matrix with each PC - Abdi & Williams (2010), 'Principal component analysis',
+        WIREs Computational Statistics 2(4):433-459, section on contributions and
+        squared cosines of observations. z = the participant's standardized mean-matrix
+        vector (the exact PCA input, i.e. how they deviate from the average
+        participant); cos2_k = score_k^2 / ||z||^2 = share of that deviation PC k
+        explains. ||z|| is taken over the FULL standardized vector (not just the
+        retained PCs), so cos2 summed over ALL possible PCs is 1 and
+        rest = 1 - sum(cos2_PC1..n_pcs) is genuinely behaviour outside PC1..n_pcs.
+        ||z|| itself = how atypical the participant is overall. Signed cosines are
+        saved too (negative = the opposite pole of that PC). Mean-matrix mode only."""
+        if not self.config.use_mean_matrix or self.config.concat_panels:
+            print("run_squared_cosines only applies to mean-matrix mode - skipping.")
+            return
+        fit = self._fit_pca(save=False)
+        if fit is None:
+            return
+        n_pcs = min(n_pcs, fit["pca"].n_components_)
+        z = fit["scaler"].transform(fit["X_clean"])
+        z_norm_sq = (z ** 2).sum(axis=1)
+        scores = fit["coords"][:, :n_pcs]
+
+        df = fit["df_metadata"][["Participant", "Group", "SDMT_Score"]].copy()
+        pc_names = [f"PC{k + 1}" for k in range(n_pcs)]
+        for k, name in enumerate(pc_names):
+            df[name] = scores[:, k]
+            df[f"cos_{name}"] = scores[:, k] / np.sqrt(z_norm_sq)
+            df[f"cos2_{name}"] = scores[:, k] ** 2 / z_norm_sq
+        cos2_cols = [f"cos2_{n}" for n in pc_names]
+        df[f"cos2_PC1_{n_pcs}_sum"] = df[cos2_cols].sum(axis=1)
+        df["cos2_rest"] = 1 - df[f"cos2_PC1_{n_pcs}_sum"]
+        df["dominant_PC"] = df[cos2_cols].idxmax(axis=1).str.replace("cos2_", "")
+        df["z_norm"] = np.sqrt(z_norm_sq)
+
+        out_dir = os.path.join(self.output_dir, "squared_cosines")
+        os.makedirs(out_dir, exist_ok=True)
+        df.to_csv(os.path.join(out_dir, "squared_cosines_per_participant.csv"), index=False)
+        print(f"Squared cosines for {len(df)} participants: mean share PC1..{n_pcs} = "
+              f"{df[cos2_cols].mean().round(3).to_dict()}, mean rest = {df['cos2_rest'].mean():.3f}")
+        self._plot_squared_cosines(df, pc_names, fit["pca"].explained_variance_ratio_, out_dir)
+        return df
+
+    def _plot_squared_cosines(self, df, pc_names, explained, out_dir):
+        """One stacked bar per participant (PC1..n shares + rest), sorted by mean SDMT
+        score, with a group strip (HC blue / pwMS red) under the bars."""
+        d = df.sort_values("SDMT_Score").reset_index(drop=True)
+        x = np.arange(len(d))
+        colors = ["#4C72B0", "#DD8452", "#55A868"][:len(pc_names)] + ["#D0D0D0"]
+        fig, (ax, ax_grp) = plt.subplots(2, 1, figsize=(max(14, len(d) * 0.16), 7), sharex=True,
+                                         gridspec_kw={"height_ratios": [12, 1], "hspace": 0.05})
+        bottom = np.zeros(len(d))
+        for name, color in zip(pc_names, colors):
+            vals = d[f"cos2_{name}"].values
+            k = int(name[2:]) - 1
+            ax.bar(x, vals, bottom=bottom, color=color, width=0.85,
+                   label=f"{name} (explains {explained[k] * 100:.1f}% of total variance)")
+            bottom += vals
+        ax.bar(x, d["cos2_rest"].values, bottom=bottom, color=colors[-1], width=0.85, label="Rest (outside PC1-3)")
+        ax.set_ylim(0, 1)
+        ax.set_ylabel("Share of participant's deviation explained (cos²)")
+        ax.set_title("How well PC1-3 explain each participant's mean matrix (squared cosines)\n"
+                     f"sorted by mean SDMT score (low -> high) | {self.config.folder_name}", fontsize=11)
+        ax.legend(loc="upper left", bbox_to_anchor=(1.005, 1), fontsize=9)
+        ax.grid(True, axis="y", alpha=0.3)
+
+        ax_grp.bar(x, np.ones(len(d)), width=1.0,
+                   color=[self._GROUP_COLORS.get(g, "gray") for g in d["Group"]])
+        ax_grp.set_yticks([])
+        ax_grp.set_ylabel("Group", rotation=0, ha="right", va="center", fontsize=9)
+        ax_grp.set_xticks(x)
+        ax_grp.set_xticklabels([f"{s:.0f}" if pd.notna(s) else "" for s in d["SDMT_Score"]], rotation=90, fontsize=6)
+        ax_grp.set_xlabel("Participant (label = mean SDMT score)")
+        ax_grp.set_xlim(-0.6, len(d) - 0.4)
+        from matplotlib.patches import Patch
+        ax_grp.legend(handles=[Patch(color="blue", label="HC"), Patch(color="red", label="pwMS")],
+                      loc="upper left", bbox_to_anchor=(1.005, 1.5), fontsize=9)
+        self._annotate_demographics(on_figure=True)
+        fig.savefig(os.path.join(out_dir, "squared_cosines_stacked_by_score.png"), dpi=200, bbox_inches="tight")
+        plt.close(fig)
+
+    def _projection_title(self, color_by, overlay):
+        what = "panel SDMT score" if color_by == "SDMT_Score" else "group"
+        sub = "panels (small) + participant mean matrix (large)" if overlay else "individual panels"
+        return f"Panels projected into mean-matrix PCA space - colored by {what}\n{sub} | {self.config.folder_name}"
+
+    def _plot_projection_2d(self, df_panels, df_means, i, j, color_by, explained, out_dir):
+        x, y = f"PC{i + 1}", f"PC{j + 1}"
+        fig, ax = plt.subplots(figsize=(9, 7))
+        panel_alpha = 0.45 if df_means is not None else 0.8
+        if color_by == "SDMT_Score":
+            vals = pd.concat([df_panels["SDMT_Score"]] + ([df_means["SDMT_Score"]] if df_means is not None else []))
+            norm = plt.Normalize(np.nanmin(vals), np.nanmax(vals))
+            sc = ax.scatter(df_panels[x], df_panels[y], c=df_panels["SDMT_Score"], cmap="viridis", norm=norm,
+                            s=22, alpha=panel_alpha, edgecolors="none")
+            if df_means is not None:
+                ax.scatter(df_means[x], df_means[y], c=df_means["SDMT_Score"], cmap="viridis", norm=norm,
+                           s=110, marker="D", edgecolors="black", linewidths=0.8)
+            fig.colorbar(sc, ax=ax).set_label("SDMT score (panel; mean for overlay)")
+        else:
+            for group, g in df_panels.groupby("Group"):
+                ax.scatter(g[x], g[y], color=self._GROUP_COLORS.get(group, "gray"), s=22, alpha=panel_alpha,
+                           edgecolors="none", label=f"{group} panel")
+            if df_means is not None:
+                for group, g in df_means.groupby("Group"):
+                    ax.scatter(g[x], g[y], color=self._GROUP_COLORS.get(group, "gray"), s=110, marker="D",
+                               edgecolors="black", linewidths=0.8, label=f"{group} mean matrix")
+            ax.legend(loc="upper right", fontsize=9)
+        ax.set_xlabel(f"{x} ({explained[i] * 100:.1f}%)")
+        ax.set_ylabel(f"{y} ({explained[j] * 100:.1f}%)")
+        ax.set_title(self._projection_title(color_by, df_means is not None), fontsize=11)
+        ax.grid(True, alpha=0.3)
+        self._annotate_demographics(ax=ax)
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, f"projection_{x}_{y}_{color_by}.png"), dpi=200)
+        plt.close(fig)
+
+    def _plot_projection_3d(self, df_panels, df_means, color_by, explained, out_dir):
+        """Static PNG (fixed viewing angle) + interactive plotly HTML (rotatable) of PC1-3."""
+        axis_labels = [f"PC{k + 1} ({explained[k] * 100:.1f}%)" for k in range(3)]
+        title = self._projection_title(color_by, df_means is not None)
+        panel_alpha = 0.45 if df_means is not None else 0.8
+
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(projection="3d")
+        if color_by == "SDMT_Score":
+            vals = pd.concat([df_panels["SDMT_Score"]] + ([df_means["SDMT_Score"]] if df_means is not None else []))
+            norm = plt.Normalize(np.nanmin(vals), np.nanmax(vals))
+            sc = ax.scatter(df_panels["PC1"], df_panels["PC2"], df_panels["PC3"], c=df_panels["SDMT_Score"],
+                            cmap="viridis", norm=norm, s=14, alpha=panel_alpha)
+            if df_means is not None:
+                ax.scatter(df_means["PC1"], df_means["PC2"], df_means["PC3"], c=df_means["SDMT_Score"],
+                           cmap="viridis", norm=norm, s=80, marker="D", edgecolors="black", linewidths=0.6)
+            fig.colorbar(sc, ax=ax, shrink=0.6, pad=0.1).set_label("SDMT score")
+        else:
+            for group, g in df_panels.groupby("Group"):
+                ax.scatter(g["PC1"], g["PC2"], g["PC3"], color=self._GROUP_COLORS.get(group, "gray"), s=14,
+                           alpha=panel_alpha, label=f"{group} panel")
+            if df_means is not None:
+                for group, g in df_means.groupby("Group"):
+                    ax.scatter(g["PC1"], g["PC2"], g["PC3"], color=self._GROUP_COLORS.get(group, "gray"), s=80,
+                               marker="D", edgecolors="black", linewidths=0.6, label=f"{group} mean matrix")
+            ax.legend(loc="upper left", fontsize=8)
+        ax.set_xlabel(axis_labels[0]); ax.set_ylabel(axis_labels[1]); ax.set_zlabel(axis_labels[2])
+        ax.set_title(title, fontsize=10)
+        self._annotate_demographics(on_figure=True)
+        fig.savefig(os.path.join(out_dir, f"projection_3D_PC1_PC2_PC3_{color_by}.png"), dpi=200, bbox_inches="tight")
+        plt.close(fig)
+
+        try:
+            import plotly.graph_objects as go
+        except ImportError:
+            print("plotly not installed - skipping interactive 3D HTML.")
+            return
+        traces = []
+
+        def add(df, size, symbol, name_suffix, opacity, line_width):
+            hover = (df["Participant"] + (" / " + df["Panel"] if "Panel" in df.columns else " / mean")
+                     + "<br>score=" + df["SDMT_Score"].round(1).astype(str))
+            if color_by == "SDMT_Score":
+                traces.append(go.Scatter3d(
+                    x=df["PC1"], y=df["PC2"], z=df["PC3"], mode="markers", text=hover, hoverinfo="text",
+                    name=name_suffix, opacity=opacity,
+                    marker=dict(size=size, symbol=symbol, color=df["SDMT_Score"], colorscale="Viridis",
+                                cmin=vals.min(), cmax=vals.max(), line=dict(width=line_width, color="black"),
+                                colorbar=dict(title="SDMT score") if name_suffix == "panels" else None)))
+            else:
+                for group, g in df.groupby("Group"):
+                    traces.append(go.Scatter3d(
+                        x=g["PC1"], y=g["PC2"], z=g["PC3"], mode="markers", text=hover[g.index], hoverinfo="text",
+                        name=f"{group} {name_suffix}", opacity=opacity,
+                        marker=dict(size=size, symbol=symbol, color=self._GROUP_COLORS.get(group, "gray"),
+                                    line=dict(width=line_width, color="black"))))
+
+        vals = pd.concat([df_panels["SDMT_Score"]] + ([df_means["SDMT_Score"]] if df_means is not None else []))
+        add(df_panels, 3, "circle", "panels", panel_alpha, 0)
+        if df_means is not None:
+            add(df_means, 7, "diamond", "mean matrix", 1.0, 1)
+        demo = self.demographics_text.replace("\n", "<br>")
+        layout = go.Layout(title=title.replace("\n", "<br>"),
+                           scene=dict(xaxis_title=axis_labels[0], yaxis_title=axis_labels[1], zaxis_title=axis_labels[2]),
+                           annotations=[dict(text=demo, showarrow=False, xref="paper", yref="paper", x=0, y=0,
+                                             align="left", bordercolor="gray", borderwidth=1, bgcolor="white")])
+        go.Figure(data=traces, layout=layout).write_html(
+            os.path.join(out_dir, f"projection_3D_PC1_PC2_PC3_{color_by}.html"), include_plotlyjs="cdn")
 
     def run_pca_and_pareto(self, n_components=3):
         # 1. Determine Mode
