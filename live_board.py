@@ -30,15 +30,16 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import statsmodels.api as sm
-from dash import Dash, dcc, html, Input, Output, State, ALL, ctx, no_update
+from dash import Dash, dcc, html, dash_table, Input, Output, State, ALL, ctx, no_update
 from plotly.subplots import make_subplots
 from scipy.stats import pearsonr, spearmanr, ttest_ind
 from statsmodels.stats.multitest import multipletests
 
 import feature_pipeline as fp
 from plot_mean_vs_sd import find_mean_sd_pairs
-from live_board_cache import (PARTICIPANT_FEATURES_CSV, CACHE_DIR, SYMBOL_COUNT_STABILITY_ROOT,
-                              reliability_cache_path)
+import live_board_markov
+from live_board_cache import (PARTICIPANT_FEATURES_CSV, CACHE_DIR, SYMBOL_COUNT_STABILITY_DIR, FEATURE_TABLES_DIR,
+                              EXPORT_DIR, reliability_cache_path)
 
 GROUP_COLORS = {"HC": "#1f77b4", "MS": "#ff7f0e", "pwMS": "#ff7f0e"}  # repo convention (tab:blue/tab:orange)
 OUTLIER_COLOR = "#d62728"
@@ -49,9 +50,33 @@ SCORE_KEY = "score"
 # ============================================================
 # 1. DATA
 # ============================================================
+MARKOV_PCS = ("PC1", "PC2", "PC3")
+MARKOV_VARIANTS = live_board_markov.MARKOV_VARIANTS
+AVAILABLE_VARIANTS = live_board_markov.AVAILABLE_VARIANTS
+# PC1-3 of every Markov variant the run has, as their own heatmap columns (decision
+# 2026-11-12) - col -> (variant, pc).
+MARKOV_COLS = {live_board_markov.pc_column(v, pc): (v, pc) for v in AVAILABLE_VARIANTS for pc in MARKOV_PCS}
+DEFAULT_PC_VARIANT = "n_transitions" if "n_transitions" in AVAILABLE_VARIANTS else AVAILABLE_VARIANTS[0]
+
+
+def markov_pc_df(variant):
+    """Participant x PC1-3 of one Markov variant - read through the Markov tab's own
+    loader (live_board_markov.load_variant), so both tabs use the exact same PCA fit."""
+    means = live_board_markov.load_variant(variant)["means"]
+    pcs = [pc for pc in MARKOV_PCS if pc in means.columns]
+    return means[["Participant"] + pcs].rename(
+        columns={"Participant": "participant", **{pc: live_board_markov.pc_column(variant, pc) for pc in pcs}})
+
+
 def load_participants():
     df = pd.read_csv(PARTICIPANT_FEATURES_CSV)
-    return df[~df["participant"].isin(fp.EXCLUDED_PARTICIPANTS)].reset_index(drop=True)
+    df = df[~df["participant"].isin(fp.EXCLUDED_PARTICIPANTS)].reset_index(drop=True)
+    # The pipeline's own Markov_PC1-3 are one variant's PCs; the per-variant columns below
+    # replace them so no PC appears twice under two names.
+    df = df.drop(columns=[c for c in ("Markov_PC1", "Markov_PC2", "Markov_PC3") if c in df.columns])
+    for v in AVAILABLE_VARIANTS:
+        df = df.merge(markov_pc_df(v), on="participant", how="left")
+    return df
 
 
 DF = load_participants()
@@ -66,23 +91,77 @@ def reduced_features(df):
     return fp._reduced_feature_columns(df, extra_exclude=fp.DOMAIN_HEATMAP_EXTRA_EXCLUDE)
 
 
+def markov_key(variant):
+    return f"markov:{variant}"
+
+
 def domain_of(col):
+    if col in MARKOV_COLS:
+        return markov_key(MARKOV_COLS[col][0])
     return SCORE_KEY if col == "score" else fp.FEATURE_DOMAIN.get(fp._domain_base_name(col), "grey")
 
 
 def source_of(col):
+    if col in MARKOV_COLS:
+        return markov_key(MARKOV_COLS[col][0])
     return SCORE_KEY if col == "score" else fp.MEASURE_TYPE.get(fp._domain_base_name(col), "other")
 
 
-DOMAIN_KEYS = fp.DOMAIN_ORDER + [SCORE_KEY]
-DOMAIN_LABEL = {**fp.DOMAIN_LABELS, SCORE_KEY: "SDMT score"}
-DOMAIN_COLOR = {**fp.DOMAIN_COLORS, SCORE_KEY: fp.SCORE_COLOR}
-SOURCE_KEYS = fp.MEASURE_TYPE_ORDER + [SCORE_KEY]
-SOURCE_LABEL = {**fp.MEASURE_TYPE_LABELS, SCORE_KEY: "SDMT score"}
-SOURCE_COLOR = {**fp.MEASURE_TYPE_COLORS, SCORE_KEY: fp.SCORE_COLOR}
+MARKOV_SHADES = ["#2f4b7c", "#5b7db1", "#7a5195", "#a57bc4"]  # one per variant, distinct from the domain colours
+MARKOV_KEYS = [markov_key(v) for v in AVAILABLE_VARIANTS]
+MARKOV_LABEL = {markov_key(v): f"Markov PCs · {MARKOV_VARIANTS[v][1]}" for v in AVAILABLE_VARIANTS}
+MARKOV_COLOR = {markov_key(v): MARKOV_SHADES[list(MARKOV_VARIANTS).index(v)] for v in AVAILABLE_VARIANTS}
+DOMAIN_KEYS = fp.DOMAIN_ORDER + MARKOV_KEYS + [SCORE_KEY]
+DOMAIN_LABEL = {**fp.DOMAIN_LABELS, **MARKOV_LABEL, SCORE_KEY: "SDMT score"}
+DOMAIN_COLOR = {**fp.DOMAIN_COLORS, **MARKOV_COLOR, SCORE_KEY: fp.SCORE_COLOR}
+SOURCE_KEYS = fp.MEASURE_TYPE_ORDER + MARKOV_KEYS + [SCORE_KEY]
+SOURCE_LABEL = {**fp.MEASURE_TYPE_LABELS, **MARKOV_LABEL, SCORE_KEY: "SDMT score"}
+SOURCE_COLOR = {**fp.MEASURE_TYPE_COLORS, **MARKOV_COLOR, SCORE_KEY: fp.SCORE_COLOR}
 
 FEATURES_BY_DOMAIN = {d: [c for c in ALL_FEATURES if domain_of(c) == d] for d in DOMAIN_KEYS}
-DEFAULT_SELECTION = set(reduced_features(DF))
+# Default view = the pipeline's reduced set, with the default variant's PCs standing in for
+# the pipeline's Markov_PC1-3 (same as before this change).
+DEFAULT_SELECTION = {c for c in reduced_features(DF) if c not in MARKOV_COLS} | {
+    live_board_markov.pc_column(DEFAULT_PC_VARIANT, pc) for pc in MARKOV_PCS}
+
+
+def display_name(col, names=None):
+    """Heatmap/scatter label: a Markov PC shows the name typed in the Markov section."""
+    if col in MARKOV_COLS:
+        return live_board_markov.pc_display_name(*MARKOV_COLS[col], names=names)
+    return col
+
+
+# ---------- exclusions (decision 2026-11-12) ----------
+def family_of(col):
+    """The measurement a column belongs to: excluding a participant from one column
+    excludes them from its whole family - mean + std of the same feature, or all three
+    PCs of a Markov variant (one mean matrix)."""
+    if col in MARKOV_COLS:
+        return f"markov_{MARKOV_COLS[col][0]}"
+    return fp._domain_base_name(col)
+
+
+FAMILY_COLUMNS = {}
+for _c in ALL_FEATURES:
+    FAMILY_COLUMNS.setdefault(family_of(_c), []).append(_c)
+
+
+def apply_exclusions(df, excl_key):
+    """excl_key: tuple of (participant, family). Sets those participants' values of every
+    column in the family to NaN, so pairwise deletion drops them from every correlation
+    involving that measurement and from nothing else."""
+    if not excl_key:
+        return df
+    df = df.copy()
+    for participant, family in excl_key:
+        cols = [c for c in FAMILY_COLUMNS.get(family, []) if c in df.columns]
+        df.loc[df["participant"] == participant, cols] = np.nan
+    return df
+
+
+def exclusion_key(rows):
+    return tuple(sorted({(r["participant"], r["family"]) for r in (rows or [])}))
 
 
 def load_reliability_cache():
@@ -97,14 +176,15 @@ def load_reliability_cache():
 
 
 def latest_symbol_count_stability():
-    runs = sorted(d for d in glob.glob(os.path.join(SYMBOL_COUNT_STABILITY_ROOT, "*"))
-                  if os.path.exists(os.path.join(d, "stability_summary.csv")))
-    if not runs:
+    """The board's run folder's own symbol_count_stability/ output (decision 2026-11-11)."""
+    d = SYMBOL_COUNT_STABILITY_DIR
+    if not os.path.exists(os.path.join(d, "stability_summary.csv")):
+        print(f"No symbol-count stability output at {d} - that panel stays empty.")
         return None
-    return {"dir": runs[-1], "summary": pd.read_csv(os.path.join(runs[-1], "stability_summary.csv")),
-            "iterations": pd.read_csv(os.path.join(runs[-1], "per_iteration_metrics.csv")),
-            "splits": pd.read_csv(os.path.join(runs[-1], "per_iteration_splits.csv")),
-            "trajectories": pd.read_csv(os.path.join(runs[-1], "trajectories_all_MS_HC.csv"))}
+    return {"dir": d, "summary": pd.read_csv(os.path.join(d, "stability_summary.csv")),
+            "iterations": pd.read_csv(os.path.join(d, "per_iteration_metrics.csv")),
+            "splits": pd.read_csv(os.path.join(d, "per_iteration_splits.csv")),
+            "trajectories": pd.read_csv(os.path.join(d, "trajectories_all_MS_HC.csv"))}
 
 
 @lru_cache(maxsize=1)
@@ -113,7 +193,7 @@ def symbol_count_matrices():
     trajectories - built by symbol_count_stability's own loader, so the curves are the
     same as that run's 02_example_split figures."""
     import symbol_count_stability as scs
-    trials, panels, people = scs.load_data(scs.DEFAULT_TABLES_DIR)
+    trials, panels, people = scs.load_data(FEATURE_TABLES_DIR)
     return scs, people, scs.build_panel_matrices(trials, panels, people["participant"].tolist())
 
 
@@ -145,8 +225,8 @@ def spearman_matrix(df, features):
 
 
 @lru_cache(maxsize=64)
-def correlation_tables(group, method, features):
-    df = subset_df(group)
+def correlation_tables(group, method, features, excl_key=()):
+    df = apply_exclusions(subset_df(group), excl_key)
     features = list(features)
     if method == "pearson":
         corr, pval, annot = fp.compute_correlation_matrix(df, features)
@@ -171,11 +251,20 @@ def correlation_tables(group, method, features):
     return corr, pval, p_fdr, annot, n
 
 
+def _with_markov_last(ordered_fn, features):
+    """The pipeline's own domain/source ordering for its features, then the Markov PC
+    groups (variant by variant), then score last - same rule as the pipeline's."""
+    markov = [c for c in MARKOV_COLS if c in features]
+    rest = ordered_fn([f for f in features if f not in MARKOV_COLS])
+    score = [f for f in rest if f == "score"]
+    return [f for f in rest if f != "score"] + markov + score
+
+
 def order_features(features, corr, scheme, cluster_abs, target):
     if scheme == "domain":
-        return fp._order_features_by_domain(features)
+        return _with_markov_last(fp._order_features_by_domain, features)
     if scheme == "source":
-        return fp._order_features_by_measure_type(features)
+        return _with_markov_last(fp._order_features_by_measure_type, features)
     if scheme == "cluster":
         return fp._order_features_by_clustering(corr.loc[features, features], absolute=cluster_abs)
     if scheme == "target" and target in features:
@@ -239,9 +328,11 @@ def demo_annotation(fig, df, y=-0.12):
 # ============================================================
 # 3. FIGURES
 # ============================================================
-def heatmap_figure(group, method, features, scheme, cluster_abs, target, mask_ns, cell_text):
+def heatmap_figure(group, method, features, scheme, cluster_abs, target, mask_ns, cell_text,
+                    excl_key=(), names=None):
     df = subset_df(group)
-    corr, pval, p_fdr, annot, n = correlation_tables(group, method, tuple(features))
+    corr, pval, p_fdr, annot, n = correlation_tables(group, method, tuple(features), excl_key)
+    labels_of = {f: display_name(f, names) for f in features}
     order = order_features(features, corr, scheme, cluster_abs, target)
     corr, pval, p_fdr, annot, n = (t.loc[order, order] for t in (corr, pval, p_fdr, annot, n))
     k = len(order)
@@ -271,8 +362,8 @@ def heatmap_figure(group, method, features, scheme, cluster_abs, target, mask_ns
     fig = make_subplots(rows=2, cols=2, column_widths=[0.025, 0.975], row_heights=[0.025, 0.975],
                         horizontal_spacing=0.004, vertical_spacing=0.004, shared_xaxes=True, shared_yaxes=True)
     custom = np.dstack([corr.values, pval.values, p_fdr.values, n.values,
-                        np.array([[a for a in order] for _ in order]),
-                        np.array([[b for _ in order] for b in order])])
+                        np.array([[labels_of[a] for a in order] for _ in order]),
+                        np.array([[labels_of[b] for _ in order] for b in order])])
     fig.add_trace(go.Heatmap(
         z=z, x=list(range(k)), y=list(range(k)), zmin=-1, zmax=1, colorscale=HEATMAP_SCALE,
         text=text, texttemplate="%{text}", textfont=dict(size=max(6, 11 - k // 8)), customdata=custom,
@@ -297,7 +388,7 @@ def heatmap_figure(group, method, features, scheme, cluster_abs, target, mask_ns
         fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", name=labels[g],
                                  marker=dict(size=12, color=colors[g], symbol="square"), legendgroup="groups"))
 
-    ticks = [f"<span style='color:{colors[key_fn(f)]}'>{'<b>' + f + '</b>' if f == 'score' else f}</span>"
+    ticks = [f"<span style='color:{colors[key_fn(f)]}'>{'<b>' + f + '</b>' if f == 'score' else labels_of[f]}</span>"
              for f in order]
     fig.update_xaxes(tickvals=list(range(k)), ticktext=ticks, tickangle=-50, row=2, col=2)
     fig.update_yaxes(autorange="reversed", row=2, col=2)
@@ -311,11 +402,25 @@ def heatmap_figure(group, method, features, scheme, cluster_abs, target, mask_ns
         height=size, width=size + 330, plot_bgcolor="#d9d9d9",
         title=f"Feature correlations - {group} (N={len(df)}), ordered by {scheme}"
               f"{' (1 - |r|)' if scheme == 'cluster' and cluster_abs else ''}"
-              f"{' - non-significant (p_FDR >= .05) masked' if mask_ns else ''}<br>"
+              f"{' - non-significant (p_FDR >= .05) masked' if mask_ns else ''}"
+              f"{f' - {len(excl_key)} participant-measure exclusion(s) applied' if excl_key else ''}<br>"
               "<sup>cell text: " + ("r, * p<.05 ** p<.01 *** p<.001 (uncorrected)" if cell_text == "r" else
                                     "n (pairwise deletion)") + " - click a cell for its scatter</sup>" + demo_sub(df),
         legend=dict(title=title, x=1.09, y=1, xanchor="left"), margin=dict(l=10, r=10, t=110, b=10))
     return fig, order
+
+
+def flagged_by_axis(group, x, y, rule, k, threshold, axes_sel):
+    """{"x": [...], "y": [...]} participants the scatter flags on each axis - same rows
+    (both values present) and same outlier_mask as scatter_figure."""
+    d = subset_df(group)[["participant", x, y]].dropna(subset=[x, y]).reset_index(drop=True)
+    out = {}
+    if rule == "none" or len(d) < 3:
+        return out
+    for axis in axes_sel:
+        col = x if axis == "x" else y
+        out[axis] = d.loc[outlier_mask(d[col], rule, k, threshold), "participant"].tolist()
+    return out
 
 
 def scatter_figure(group, method, x, y, by_group, rule, k, threshold, axes_sel, exclude, covariate):
@@ -388,8 +493,9 @@ def scatter_figure(group, method, x, y, by_group, rule, k, threshold, axes_sel, 
             lines.append(f"Partial r controlling for {covariate} (Pearson on OLS residuals, as "
                          f"run_partial_correlations): r = {pr:.3f}, p = {pp:.4g}, n = {len(base)}")
 
-    fig.update_layout(title=f"{y} vs {x} - {group} ({'Pearson' if method == 'pearson' else 'Spearman'})",
-                      xaxis_title=x, yaxis_title=y, height=560, template="plotly_white",
+    xl, yl = display_name(x), display_name(y)
+    fig.update_layout(title=f"{yl} vs {xl} - {group} ({'Pearson' if method == 'pearson' else 'Spearman'})",
+                      xaxis_title=xl, yaxis_title=yl, height=560, template="plotly_white",
                       legend=dict(orientation="h", y=-0.22), margin=dict(b=130))
     demo_annotation(fig, d, y=-0.36)
     return fig, lines
@@ -479,6 +585,16 @@ def _trajectory_grid(panels):
     return make_subplots(rows=2, cols=3, subplot_titles=panels, vertical_spacing=0.16, horizontal_spacing=0.06)
 
 
+PARTICIPATION_CUTOFF = 0.8  # same 80% rule as behavioral_analyzer / symbol_search_analysis
+
+
+def _participation_cutoff_trial(traj, frac=PARTICIPATION_CUTOFF):
+    """First trial_idx at which fewer than frac of this curve's own participants still
+    contribute (n < frac * n_participants), or None if it never drops that low."""
+    below = traj.loc[traj["n"] < frac * traj["n_participants"].iloc[0], "trial_idx"]
+    return None if below.empty else below.iloc[0]
+
+
 def _add_trajectory(fig, traj, color, name, rr, cc, show_legend):
     # SD is undefined where a single participant contributes (late trials) - the band
     # is drawn only over trials with a real SD, so the polygon never jumps across gaps.
@@ -492,6 +608,10 @@ def _add_trajectory(fig, traj, color, name, rr, cc, show_legend):
                              customdata=np.c_[traj["sd"], traj["n"]],
                              hovertemplate=f"{name}<br>trial %{{x}}<br>mean %{{y:.2f}} ± %{{customdata[0]:.2f}} SD"
                                            "<br>n = %{customdata[1]}<extra></extra>"), row=rr, col=cc)
+    cut = _participation_cutoff_trial(traj)
+    if cut is not None:
+        fig.add_vline(x=cut, line=dict(color=color, width=1.5, dash="dot"), row=rr, col=cc)
+
 
 
 def random_split_trajectory_figure():
@@ -517,9 +637,10 @@ def random_split_trajectory_figure():
     fig.update_xaxes(title_text="Trial index")
     fig.update_yaxes(title_text="Symbols (mean ± SD)", col=1)
     fig.update_annotations(font_size=11)
-    fig.update_layout(height=580, template="plotly_white", margin=dict(t=110),
+    fig.update_layout(height=600, template="plotly_white", margin=dict(t=135),
                       title="Symbol-count trajectory stability: example random split (median-r split per panel)"
-                            + demo_sub(DF), legend=dict(orientation="v", x=1.01, xanchor="left", y=1, yanchor="top"))
+                            "<br><sup>dotted line (curve's color) = first trial where < 80% of that half's "
+                            "participants still contribute</sup>" + demo_sub(DF), legend=dict(orientation="v", x=1.01, xanchor="left", y=1, yanchor="top"))
     return fig
 
 
@@ -541,9 +662,10 @@ def ms_hc_trajectory_figure():
     fig.update_xaxes(title_text="Trial index")
     fig.update_yaxes(title_text="Symbols (mean ± SD)", col=1)
     fig.update_annotations(font_size=11)
-    fig.update_layout(height=580, template="plotly_white", margin=dict(t=110),
+    fig.update_layout(height=600, template="plotly_white", margin=dict(t=135),
                       title="Symbol-count trajectory stability: MS vs HC (r and its random-split percentile)"
-                            + demo_sub(DF), legend=dict(orientation="v", x=1.01, xanchor="left", y=1, yanchor="top"))
+                            "<br><sup>dotted line (group's color) = first trial where < 80% of that group's "
+                            "participants still contribute</sup>" + demo_sub(DF), legend=dict(orientation="v", x=1.01, xanchor="left", y=1, yanchor="top"))
     return fig
 
 
@@ -625,7 +747,8 @@ def feature_selector():
             dcc.Checklist(id={"type": "dom-all", "domain": d},
                           options=[{"label": html.B(DOMAIN_LABEL[d], style={"color": DOMAIN_COLOR[d]}), "value": "all"}],
                           value=["all"] if set(feats) <= DEFAULT_SELECTION else []),
-            dcc.Checklist(id={"type": "feat-list", "domain": d}, options=[{"label": f, "value": f} for f in feats],
+            dcc.Checklist(id={"type": "feat-list", "domain": d},
+                          options=[{"label": display_name(f), "value": f} for f in feats],
                           value=[f for f in feats if f in DEFAULT_SELECTION], style={"marginLeft": "14px"},
                           inputStyle={"marginRight": "4px"}),
         ], style={"marginBottom": "8px"}))
@@ -673,6 +796,9 @@ app.layout = html.Div([
               html.Div(dcc.Loading(dcc.Graph(id="heatmap", config={"displaylogo": False})),
                        style={"flex": 1, "overflow": "auto"})], className="main"),
     dcc.Store(id="order-store"),
+    dcc.Store(id="pc-names-store", data=live_board_markov.load_pc_names()),
+    # Exclusion table lives in the browser's local storage so a refresh doesn't lose it.
+    dcc.Store(id="excl-store", storage_type="local", data=[]),
     html.Div([
         html.H3("Pairwise relationship", style={"marginTop": 0}),
         html.Div([
@@ -704,10 +830,32 @@ app.layout = html.Div([
             html.Div([dcc.Loading(dcc.Graph(id="scatter")), html.Ul(id="scatter-stats")]),
             html.Div(id="info"),
         ], className="two"),
+        html.Div([
+            html.H4("Exclusions (applied to the correlation heatmap)", style={"margin": "10px 0 4px"}),
+            html.Div("Update adds the outliers flagged on the selected axes: an X outlier is excluded from X's whole "
+                     "measurement (mean + std, or all 3 PCs of a Markov variant) and from every correlation with it; "
+                     "same for Y. Delete a row (×) to restore it.", style={"fontSize": "12px", "color": "#666"}),
+            html.Div([
+                html.Button("Update heatmap with flagged outliers", id="excl-add", n_clicks=0),
+                html.Button("Save CSV", id="excl-save", n_clicks=0),
+                html.Button("Clear all", id="excl-clear", n_clicks=0),
+                html.Span(id="excl-status", style={"fontSize": "12px", "color": "#444"}),
+            ], className="btn-row", style={"display": "flex", "gap": "6px", "alignItems": "center",
+                                           "margin": "6px 0"}),
+            dash_table.DataTable(
+                id="excl-table", row_deletable=True, page_size=15,
+                columns=[{"name": n, "id": i} for n, i in (
+                    ("participant", "participant"), ("group", "group"), ("excluded from", "family"),
+                    ("columns", "features"), ("flagged on", "flagged_on"), ("rule", "rule"), ("added", "added"))],
+                style_cell={"fontSize": "12px", "textAlign": "left", "padding": "3px 6px",
+                            "whiteSpace": "normal", "height": "auto"},
+                style_header={"fontWeight": "bold"}),
+        ]),
     ], className="panel"),
     html.Div([html.H3("Stability", style={"marginTop": 0}), html.Div(id="stability", className="two")],
              className="panel"),
     html.Div(id="meansd", className="panel", style={"display": "none"}),
+    live_board_markov.layout(feature_options),
 ])
 
 
@@ -737,16 +885,80 @@ def update_selection(_r, _a, _n, dom_all, current, ids):
 @app.callback(Output("heatmap", "figure"), Output("order-store", "data"),
               Input("group", "value"), Input("method", "value"), Input("scheme", "value"),
               Input("cluster-abs", "value"), Input("target", "value"), Input("mask-ns", "value"),
-              Input("cell-text", "value"), Input({"type": "feat-list", "domain": ALL}, "value"))
-def update_heatmap(group, method, scheme, cluster_abs, target, mask_ns, cell_text, lists):
+              Input("cell-text", "value"), Input({"type": "feat-list", "domain": ALL}, "value"),
+              Input("excl-store", "data"), Input("pc-names-store", "data"))
+def update_heatmap(group, method, scheme, cluster_abs, target, mask_ns, cell_text, lists, excl_rows, names):
     selected = [f for f in ALL_FEATURES if any(f in l for l in lists)]
     df = subset_df(group)
     selected = [f for f in selected if df[f].dropna().nunique() > 1]
     if len(selected) < 2:
         return go.Figure().update_layout(title="Select at least two features"), []
     fig, order = heatmap_figure(group, method, selected, scheme, cluster_abs == "abs", target, bool(mask_ns),
-                                cell_text)
+                                cell_text, exclusion_key(excl_rows), names)
     return fig, order
+
+
+@app.callback(Output("x-feat", "options"), Output("y-feat", "options"), Output("target", "options"),
+              Output("covariate", "options"), Output({"type": "feat-list", "domain": ALL}, "options"),
+              Input("pc-names-store", "data"), State({"type": "feat-list", "domain": ALL}, "id"))
+def name_options(names, ids):
+    """Markov PCs carry the names typed in the Markov section everywhere they're listed."""
+    opts = [{"label": display_name(f, names), "value": f} for f in ALL_FEATURES]
+    side = [[{"label": display_name(f, names), "value": f} for f in FEATURES_BY_DOMAIN[i["domain"]]] for i in ids]
+    return opts, opts, opts, [{"label": "None", "value": ""}] + opts, side
+
+
+@app.callback(Output("excl-store", "data"), Output("excl-table", "data"), Output("excl-status", "children"),
+              Input("excl-add", "n_clicks"), Input("excl-clear", "n_clicks"), Input("excl-table", "data"),
+              State("excl-store", "data"), State("group", "value"), State("x-feat", "value"), State("y-feat", "value"),
+              State("out-rule", "value"), State("out-k", "value"), State("out-thr", "value"),
+              State("out-axes", "value"))
+def update_exclusions(_add, _clear, table_rows, store, group, x, y, rule, k, thr, axes_sel):
+    trig = ctx.triggered_id
+    store = store or []
+    if trig is None:  # page load: show what local storage kept
+        return store, store, ""
+    if trig == "excl-clear":
+        return [], [], "Cleared all exclusions."
+    if trig == "excl-table":  # a row was deleted in the table
+        rows = table_rows or []
+        return rows, no_update, f"{len(store) - len(rows)} row(s) removed." if len(rows) < len(store) else ""
+    flagged = flagged_by_axis(group, x, y, rule, k or 2, thr if thr is not None else 0, axes_sel or [])
+    if not any(flagged.values()):
+        return no_update, no_update, "No flagged outliers to add - pick an outlier rule first."
+    rule_txt = {"sd": f"mean ± {k}·SD", "mad": f"median ± {k}·MAD", "abs": f"value > {thr}"}[rule]
+    have = {(r["participant"], r["family"]) for r in store}
+    added = []
+    for axis, col in (("x", x), ("y", y)):
+        fam = family_of(col)
+        for p in flagged.get(axis, []):
+            if (p, fam) in have:
+                continue
+            have.add((p, fam))
+            grp = DF.loc[DF["participant"] == p, "group"]
+            added.append({"participant": p, "group": grp.iloc[0] if len(grp) else "", "family": fam,
+                          "features": ", ".join(display_name(c) for c in FAMILY_COLUMNS.get(fam, [col])),
+                          "flagged_on": f"{display_name(col)} ({'X' if axis == 'x' else 'Y'} of {display_name(x)} "
+                                        f"vs {display_name(y)}, group={group})",
+                          "rule": rule_txt, "added": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")})
+    rows = store + added
+    return rows, rows, f"Added {len(added)} exclusion(s); heatmap updated." if added else "Already in the table."
+
+
+@app.callback(Output("excl-status", "children", allow_duplicate=True), Input("excl-save", "n_clicks"),
+              State("excl-store", "data"), prevent_initial_call=True)
+def save_exclusions(_n, rows):
+    if not rows:
+        return "Nothing to save - the table is empty."
+    # Long format (one row per participant x excluded column) so it can be fed straight back
+    # in: set those cells to NaN before computing the heatmap outside the board.
+    long = [{**{k: r[k] for k in ("participant", "group", "family", "flagged_on", "rule", "added")}, "column": c}
+            for r in rows for c in FAMILY_COLUMNS.get(r["family"], [])]
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    path = os.path.join(EXPORT_DIR, f"heatmap_exclusions_{pd.Timestamp.now().strftime('%Y_%m_%d_%H%M%S')}.csv")
+    pd.DataFrame(long, columns=["participant", "group", "family", "column", "flagged_on", "rule", "added"]) \
+        .to_csv(path, index=False)
+    return f"Saved {len(rows)} exclusion(s) ({len(long)} participant × column rows) -> {path}"
 
 
 @app.callback(Output("x-feat", "value"), Output("y-feat", "value"),
@@ -782,6 +994,9 @@ def toggle_meansd(n, group):
     if not n or n % 2 == 0:
         return [], {"display": "none"}
     return [html.H3("Mean vs SD", style={"marginTop": 0}), dcc.Graph(figure=mean_sd_grid(group))], {}
+
+
+live_board_markov.register_callbacks(app)
 
 
 if __name__ == "__main__":

@@ -46,7 +46,7 @@ OUT_ROOT = os.path.join(pc.noam_m_root(), "markov_feature_analysis_02_11_26")
 # matrix_type -> feature_analysis sub-folder name
 VARIANTS = {
     "conditional": "regular",
-    "normalized_by_score": "normalized_by_score",
+    # "normalized_by_score": "normalized_by_score",  # off (decision 2026-11-11)
     "normalized_by_n_transitions": "normalized_by_n_transitions",
 }
 
@@ -73,7 +73,7 @@ def _load_saved_variant(matrix_type):
     with the same >= MIN_PANELS_FOR_MARKOV filter the full run applies."""
     cfg = AnalysisConfig(with_repeats=False, only_1_to_9=False, use_mean_matrix=True, from_scratch=False,
                          annotation_method=ANNOTATION_METHOD, output_base_path=os.path.join(OUT_ROOT, "markov_analysis"),
-                         matrix_type=matrix_type)
+                         matrix_type=matrix_type, legacy_layout=True)
     loader = DataManager(cfg)
     loader.load_participants_and_scores()
     loader.load_or_compute_matrices(from_scratch=False)
@@ -119,17 +119,17 @@ def run():
     for matrix_type, feature_folder in VARIANTS.items():
         cfg = AnalysisConfig(with_repeats=False, only_1_to_9=False, use_mean_matrix=True, from_scratch=True,
                              annotation_method=ANNOTATION_METHOD, output_base_path=markov_base,
-                             matrix_type=matrix_type)
+                             matrix_type=matrix_type, legacy_layout=True)
         # Every variant (conditional included) reads the SAME source run's trial stats.
         cfg.trial_stats_source_dir = os.path.join(src_markov, AnalysisConfig(
             with_repeats=False, only_1_to_9=False, use_mean_matrix=True, from_scratch=False,
-            annotation_method=ANNOTATION_METHOD, output_base_path=src_markov).folder_name)
+            annotation_method=ANNOTATION_METHOD, output_base_path=src_markov, legacy_layout=True).folder_name)
         markov_main.run_task(cfg, exclusion_summary_path=exclusion_summary_path)
 
         run_dir = os.path.join(OUT_ROOT, "feature_analysis", feature_folder)
         os.makedirs(run_dir, exist_ok=True)
         df = fp.merge_markov_pca_scores(src_features.copy(), ANNOTATION_METHOD,
-                                        markov_output_base_path=markov_base, analysis_folder=cfg.folder_name)
+                                        pca_dir=cfg.plot_output_path)
         df.to_csv(os.path.join(run_dir, "participant_features.csv"), index=False)
         run_correlations(df, run_dir)
 

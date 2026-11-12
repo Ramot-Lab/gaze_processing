@@ -25,11 +25,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import cv2
 
-from constants import KEY_ANALYSIS_EYE, KEY_TASK_PANEL_IMG, SACCADE_IDX, SCREEN_SIZE
+from constants import KEY_ANALYSIS_EYE, KEY_INTERPOLATED_MASK, KEY_TASK_PANEL_IMG, SACCADE_IDX, SCREEN_SIZE
 from exclusion_policy import load_manually_excluded_participants, load_tobii_sucks_excluded_participants
 from participant_gaze_data_manager import ParticipantGazeDataManager
 from pipeline_config import (DICTIONARY_BOUNDARY_RATIO, EXCLUDE_TOBII_SUCKS, MAX_SACCADE_FRACTION,
-                              TEXT_BOUNDARY_RATIO, annotated_gaze_dir, main_data_path)
+                              TEXT_BOUNDARY_RATIO, annotated_gaze_dir, interpolated_samples_path,
+                              main_data_path)
 from signal_quality_checks import TIMESTAMP_GAP_THRESHOLD_MS, find_timestamp_gaps
 
 
@@ -268,6 +269,18 @@ def run(method, date_str=None):
             os.makedirs(participant_out_dir, exist_ok=True)
             fname = f"panel_{panel}_annotated_gaze_data.csv"
             annotated.to_csv(os.path.join(participant_out_dir, fname), index=False)
+            # Which samples were filled in by interpolation (decision 2026-11-10), for the
+            # BCEA interpolation rules in feature_pipeline - saved only when it lines up
+            # row-for-row with the annotated output (model_based does; the mask is the
+            # cleaned panel's, which is what the model annotated).
+            mask = sd.matched_data[panel].get(KEY_INTERPOLATED_MASK)
+            if mask is not None and len(mask) == len(annotated):
+                pd.DataFrame({"t": annotated["t"].to_numpy(), "interpolated": mask.astype(int)}).to_csv(
+                    os.path.join(participant_out_dir, os.path.basename(
+                        interpolated_samples_path(method, group, participant, panel, date_str))), index=False)
+            else:
+                print(f"  {participant}/{panel}: interpolated-sample mask not saved "
+                      f"({'missing' if mask is None else f'{len(mask)} vs {len(annotated)} rows'})")
             n_panels_saved += 1
             print(f"  {participant}/{panel} (eye={eye_used}) -> {fname}")
 
@@ -292,5 +305,11 @@ if __name__ == "__main__":
         print("usage: python run_preprocessing.py <threshold_based|model_based> [date_str]")
         sys.exit(1)
     method_arg = sys.argv[1]
-    date_arg = sys.argv[2] if len(sys.argv) > 2 else None
+    # No date -> TODAY (decision 2026-11-12): a new Stage 1 run gets its own
+    # <Noam_M>/<today>/SDMT_annotated_gaze_<today>_<method>. Defaulting to the newest
+    # existing folder instead would "resume" an old, finished run and annotate nothing.
+    # Pass the date explicitly to resume a run that crossed midnight.
+    from datetime import datetime
+    date_arg = sys.argv[2] if len(sys.argv) > 2 else datetime.now().strftime("%d_%m_%y")
+    print(f"Stage 1 date folder: {date_arg}")
     run(method_arg, date_arg)

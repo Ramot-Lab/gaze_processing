@@ -38,22 +38,59 @@ import pipeline_config as pc
 import feature_pipeline as fp
 
 NOAM_M = pc.noam_m_root()
-BOARD_ROOT = os.path.join(NOAM_M, "live_board")
+
+# The run the board shows (decision 2026-11-12 layout): a <Noam_M>/<DD_MM_YY>/ folder.
+# LIVE_BOARD_RUN_ROOT pins one - run_full_pipeline.py sets it so the cache it builds comes
+# from the run it just wrote; otherwise the newest date folder with feature tables.
+RUN_ROOT = os.environ.get("LIVE_BOARD_RUN_ROOT") or pc.latest_date_root()
+RESULTS_ROOT = os.path.join(RUN_ROOT, "analysis_results")
+FEATURE_RUN_DIR = os.path.join(RESULTS_ROOT, "features")
+FEATURE_TABLES_DIR = fp.tables_dir(FEATURE_RUN_DIR)
+BOARD_ROOT = os.path.join(RUN_ROOT, "live_board")  # the board's files live with its run
 CACHE_DIR = os.path.join(BOARD_ROOT, "cache")
 EXPORT_DIR = os.path.join(BOARD_ROOT, "exports")
-
-# Existing outputs the board reads (newest full-cohort run that has each table).
-FEATURE_RUN_DIR = os.path.join(NOAM_M, "markov_features_results_27_09_26", "feature_analysis")
-PARTICIPANT_FEATURES_CSV = os.path.join(FEATURE_RUN_DIR, "participant_features.csv")
-TRIAL_FEATURES_CSV = os.path.join(FEATURE_RUN_DIR, "trial_features.csv")
-PANEL_FEATURES_CSV = os.path.join(FEATURE_RUN_DIR, "panel_features.csv")
-SACCADE_LATENCY_CSV = os.path.join(NOAM_M, "preliminary_results_model_based", "feature_analysis", "2026_11_08",
-                                   "saccade_latency", "compiled_latencies.csv")
+PARTICIPANT_FEATURES_CSV = os.path.join(FEATURE_TABLES_DIR, "participant_features.csv")
+TRIAL_FEATURES_CSV = os.path.join(FEATURE_TABLES_DIR, "trial_features.csv")
+PANEL_FEATURES_CSV = os.path.join(FEATURE_TABLES_DIR, "panel_features.csv")
+# The run's own copy of the saccade-latency table - no fallback to another run's table.
+SACCADE_LATENCY_CSV = fp.saccade_latency_csv_path(FEATURE_RUN_DIR)
 FIXATION_BCEA_TABLE_CSV = fp.fixation_bcea_table_path(FEATURE_RUN_DIR)
-# Interim (decision 2026-11-10): until a fresh run saves the per-fixation table, the board
-# shows the 27_09 run's own saved fixation-BCEA reliability plots.
-SAVED_FIXATION_BCEA_PLOTS_DIR = os.path.join(FEATURE_RUN_DIR, "reliability", "fixation_bcea", "fixation_bcea")
-SYMBOL_COUNT_STABILITY_ROOT = os.path.join(NOAM_M, "symbol_count_stability")
+SAVED_FIXATION_BCEA_PLOTS_DIR = os.path.join(FEATURE_RUN_DIR, "reliability", "per_event", "fixation_bcea",
+                                             "fixation_bcea")
+# Markov mean-matrix PCA outputs shown on the board: with / without the ENTER-EXIT states
+# (decision 2026-11-12), each as plain transition probabilities and normalized by number
+# of transitions. Value = (label, short label, the variant's folder under
+# analysis_results/markov = markov_core.AnalysisConfig.folder_name).
+MARKOV_VARIANTS = {
+    "probabilities": ("With ENTER/EXIT · transition probabilities", "w/ ENTER-EXIT · prob",
+                      os.path.join("w_exit_enter", "probabilities")),
+    "n_transitions": ("With ENTER/EXIT · normalized by n transitions", "w/ ENTER-EXIT · n-trans",
+                      os.path.join("w_exit_enter", "n_transitions")),
+    "wo_probabilities": ("Digits only (no ENTER/EXIT) · transition probabilities", "digits · prob",
+                         os.path.join("wo_exit_enter", "probabilities")),
+    "wo_n_transitions": ("Digits only (no ENTER/EXIT) · normalized by n transitions", "digits · n-trans",
+                         os.path.join("wo_exit_enter", "n_transitions")),
+}
+MARKOV_RUN_ROOT = RUN_ROOT
+
+
+def markov_dir(variant):
+    """<run>/analysis_results/markov/<variant>/pca - markov_analyzer's output_dir."""
+    return os.path.join(RESULTS_ROOT, "markov", MARKOV_VARIANTS[variant][2], "pca")
+
+
+def available_markov_variants():
+    """Variants this run actually produced (a run only has the ones main.py configured)."""
+    return [v for v in MARKOV_VARIANTS
+            if os.path.exists(os.path.join(markov_dir(v), "panel_projection", "panel_projection_scores.csv"))]
+
+
+# Names the user gives each variant's PCs on the board (decision 2026-11-12) - stored with
+# the run, since a PC's meaning belongs to that run's fit.
+MARKOV_PC_NAMES_JSON = os.path.join(BOARD_ROOT, "markov_pc_names.json")
+
+
+SYMBOL_COUNT_STABILITY_DIR = os.path.join(RESULTS_ROOT, "symbol_count_over_panels")
 ANNOTATION_METHOD = "model_based"
 
 RELIABILITY_SEED = 20261109
@@ -119,9 +156,28 @@ def build_panel_level():
 
 
 def build_saccade_latency():
+    if not os.path.exists(SACCADE_LATENCY_CSV):
+        print(f"No saccade latency table at {SACCADE_LATENCY_CSV} - not cached.")
+        return
     df = _excluded(pd.read_csv(SACCADE_LATENCY_CSV))
     _write("saccade_latency", [_reliability_record(df, "saccade_latency_ms", fp.MIN_SACCADE_LATENCY_RELIABILITY,
                                                    "saccade_latency", SACCADE_LATENCY_CSV, "saccade_latency_ms_mean")])
+
+
+def markov_reliability_level(variant):
+    return f"markov_{os.path.basename(MARKOV_RUN_ROOT)}_{variant}"
+
+
+def build_markov_pc(variant):
+    """Panel-level split-half reliability (the pipeline's own definition, as for every
+    other panel-level feature) of each participant's per-panel PC scores, where those
+    scores are markov_analyzer.run_panel_projection's projections of each single panel
+    onto the MEAN-MATRIX PCs - read from its saved CSV, nothing refit."""
+    path = os.path.join(markov_dir(variant), "panel_projection", "panel_projection_scores.csv")
+    df = _excluded(pd.read_csv(path).rename(columns={"Participant": "participant"}))
+    level = markov_reliability_level(variant)
+    _write(level, [_reliability_record(df, pc, fp.MIN_PANELS_RELIABILITY, level, path, f"markov_{variant}_{pc}")
+                   for pc in ("PC1", "PC2", "PC3")])
 
 
 def build_pso_duration():
@@ -130,6 +186,19 @@ def build_pso_duration():
     _write("pso_duration", [_reliability_record(df, "pso_duration_ms", fp.MIN_PSO_DURATION_RELIABILITY,
                                                 "pso_duration", f"build_pso_duration_table({ANNOTATION_METHOD})",
                                                 "pso_duration_ms_mean")])
+
+
+def build_event_durations():
+    """Fixation and saccade duration (decision 2026-11-12) - from the run's saved raw
+    per-event table, the same split-half as the pipeline's run_event_duration_reliability."""
+    path = fp.event_durations_table_path(FEATURE_RUN_DIR)
+    df = _excluded(pd.read_csv(path))
+    records = []
+    for event_type, feature in fp.EVENT_DURATION_FEATURES.items():
+        d = df[df["event_type"] == event_type].rename(columns={"duration_ms": feature})
+        records.append(_reliability_record(d, feature, fp.MIN_PSO_DURATION_RELIABILITY, "event_durations", path,
+                                           f"{feature}_mean"))
+    _write("event_durations", records)
 
 
 def build_fixation_bcea():
@@ -143,6 +212,10 @@ def main(argv):
     steps = [("trial", build_trial_level), ("panel", build_panel_level), ("saccade_latency", build_saccade_latency)]
     if "--with-pso" in argv:
         steps.append(("pso_duration", build_pso_duration))
+    for variant in available_markov_variants():
+        steps.append((markov_reliability_level(variant), lambda v=variant: build_markov_pc(v)))
+    if os.path.exists(fp.event_durations_table_path(FEATURE_RUN_DIR)):
+        steps.append(("event_durations", build_event_durations))
     if os.path.exists(FIXATION_BCEA_TABLE_CSV):
         steps.append(("fixation_bcea", build_fixation_bcea))
     else:

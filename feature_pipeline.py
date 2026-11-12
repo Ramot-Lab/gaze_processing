@@ -34,7 +34,7 @@ SCORES_CSV = "/Volumes/ramot/Noam_M/preliminary_results/behavior_scores/all_scor
 # it per run via saccade_latency_analysis.main (gazeNET @ 600 Hz on fxsp) into
 # <run_dir>/saccade_latency/compiled_latencies.csv. Always model-based, whatever this
 # run's annotation_method, since fxsp has no threshold-based Stage 1 output.
-IDO_TABLE_XLSX = "/Volumes/ramot/Noam_M/df_filtered_behavioral_summary_20260427_131437.xlsx"
+IDO_TABLE_XLSX = pipeline_config.BEHAVIORAL_SUMMARY_XLSX  # decision 2026-11-12: the current summary table
 # Legacy fallback only - main() resolves the real, per-method output dir via
 # pipeline_config.feature_output_dir(annotation_method).
 OUTPUT_BASE_DIR = "/Volumes/ramot/Noam_M/preliminary_results/all_features/"
@@ -67,6 +67,8 @@ MIN_FIXATION_BCEA_RELIABILITY = 60
 MIN_PSO_DURATION_RELIABILITY = 60
 RELIABILITY_REPETITIONS = 1000
 TYPICALITY_COVERAGE_PCTL = 20  # keep participants above this percentile of total trials (~top 80%)
+TYPICALITY_SLOPE_COVERAGE_PCT = 80  # % of a panel's own participants that must have reached a trial_idx
+                                     # for it to count toward typicality_slope's "last 10" window
 SYMBOL_CORR_SCORE_SD_CUTOFF = 2.0  # #symbols_corr_to_mean: keep participants within +-2 SD of a panel's own mean score
 MIN_TRIALS_FOR_SYMBOL_CORR = 5  # minimum matched trial_idx positions required to compute a participant's own r
 
@@ -141,7 +143,40 @@ RUN_RELIABILITY = True
 RUN_CORRELATIONS = True
 RUN_GROUP_COMPARISON = True
 RUN_PCA = True
-RUN_PARTIAL_CORR = True
+RUN_PARTIAL_CORR = False  # off (decision 2026-11-12) - new logic to be defined
+RUN_KEY_ENTRY_STRATEGY = True
+RUN_SYMBOL_COUNT_STABILITY = True
+
+
+# ============================================================
+# 0. OUTPUT LAYOUT (decision 2026-11-12)
+# ============================================================
+# run_dir is the features folder (<date>/analysis_results/features in a full run):
+#   csvs/                 trial/panel/participant_features.csv, exclusion_log.csv,
+#                         event_durations.csv (raw fixation/saccade durations)
+#   non_SDMT/             saccade_latency/ (copied fxsp table), fixation_bcea/
+#                         (per-fixation table), demographics/ (copy of the summary xlsx)
+#   reliability/          trial_level/, panel_level/, per_event/<feature>/
+#   group_t_tests/        stats.csv, ranked grids, boxplots/
+#   correlations/<all|MS|HC>/<reduced|full>/   heatmap_by_<domain|source|cluster>.png,
+#                         correlation_values.csv, scatterplots/
+#   PCA/
+# key_entry_strategy/ and symbol_count_over_panels/ are siblings of run_dir.
+def tables_dir(run_dir):
+    return os.path.join(run_dir, "csvs")
+
+
+def non_sdmt_dir(run_dir, name):
+    return os.path.join(run_dir, "non_SDMT", name)
+
+
+def sibling_analysis_dir(run_dir, name):
+    """<analysis_results>/<name> - analyses that sit next to features/, not inside it."""
+    return os.path.join(os.path.dirname(os.path.normpath(run_dir)), name)
+
+
+def group_t_tests_dir(run_dir):
+    return os.path.join(run_dir, "group_t_tests")
 
 
 # ============================================================
@@ -302,6 +337,11 @@ def build_trial_managers(participants, data_path=NOAM_DATA_PATH, annotation_meth
                     participant.trial_managers[panel] = TrialManager(
                         participant_data, panel, annotated_data=annotated_data,
                         annotation_method=annotation_method)
+                    # Which samples were interpolated (Stage 1, decision 2026-11-10), for
+                    # the BCEA interpolation rules in _collect_fixation_bcea_records; None
+                    # for Stage 1 folders saved before the mask existed.
+                    participant.trial_managers[panel].interpolated_t = pipeline_config.load_interpolated_t(
+                        annotation_method, participant.group, participant.name, panel, date_str=date_str)
                     has_any_data = True
                 except Exception as e:
                     print(f"  Error loading {participant.name} - {panel}: {e}")
@@ -323,7 +363,8 @@ def build_trial_managers(participants, data_path=NOAM_DATA_PATH, annotation_meth
 
 
 def save_exclusion_log(exclusions, run_dir):
-    out_path = os.path.join(run_dir, "exclusion_log.csv")
+    os.makedirs(tables_dir(run_dir), exist_ok=True)
+    out_path = os.path.join(tables_dir(run_dir), "exclusion_log.csv")
     pd.DataFrame(exclusions).to_csv(out_path, index=False)
     print(f"Saved {len(exclusions)} exclusion rows to {out_path}")
 
@@ -414,6 +455,55 @@ def compute_typicality(df_trials, coverage_pctl=TYPICALITY_COVERAGE_PCTL):
     print(f"Typicality: {len(eligible_participants)}/{df_trials['participant'].nunique()} participants "
           f"above the {coverage_pctl}th percentile cutoff ({cutoff:.1f} total trials).")
     return df_trials
+
+
+def compute_typicality_slope(df_trials, df_panels, coverage_pct=TYPICALITY_SLOPE_COVERAGE_PCT):
+    """typicality_slope - panel-level feature (decision 2026-11-12). Unlike
+    first5_last5_slope (each participant's own first-5/last-5 trials, by their own
+    trial count), this uses a FIXED trial_idx window that is the SAME for every
+    participant in a given panel: trial_idx 0-9 ('first 10') vs. the last 10 trial_idx
+    positions that at least `coverage_pct`% of the panel's OWN participants actually
+    reached ('last 10') - found once per panel from the whole population's per-trial-
+    position coverage curve, not per participant. Requires df_trials["typicality"] to
+    already be populated (compute_typicality must run first).
+
+    slope = (mean typicality over the last-10 window - mean typicality over the
+    first-10 window) / (mean trial_idx of the last-10 window actually used - mean
+    trial_idx of the first-10 window actually used) - a two-point slope in real
+    typicality-per-trial units, matching first5_last5_slope's own units convention.
+    NaN if a participant has no valid typicality value in either window, or if a
+    panel's last-10 window would overlap the first-10 window (too few trials overall
+    to form two separate blocks)."""
+    rows = []
+    for panel, panel_trials in df_trials.groupby("panel"):
+        n_participants = panel_trials["participant"].nunique()
+        coverage = panel_trials.groupby("trial_idx")["participant"].nunique() / n_participants * 100
+        eligible_trial_idx = coverage[coverage >= coverage_pct].index
+        if len(eligible_trial_idx) == 0:
+            print(f"typicality_slope: panel {panel} has no trial_idx reached by >= {coverage_pct}% "
+                  f"of its participants - skipped.")
+            continue
+        last_trial_idx = eligible_trial_idx.max()
+        if last_trial_idx - 9 < 10:
+            print(f"typicality_slope: panel {panel}'s last-10 window (ending at trial_idx "
+                  f"{last_trial_idx}) would overlap the first-10 window - skipped.")
+            continue
+        first10_idx = set(range(0, 10))
+        last10_idx = set(range(last_trial_idx - 9, last_trial_idx + 1))
+
+        for participant, g in panel_trials.groupby("participant"):
+            g = g.dropna(subset=["typicality"])
+            first_vals = g.loc[g["trial_idx"].isin(first10_idx), ["trial_idx", "typicality"]]
+            last_vals = g.loc[g["trial_idx"].isin(last10_idx), ["trial_idx", "typicality"]]
+            if first_vals.empty or last_vals.empty:
+                rows.append({"participant": participant, "panel": panel, "typicality_slope": np.nan})
+                continue
+            x_first, x_last = first_vals["trial_idx"].mean(), last_vals["trial_idx"].mean()
+            slope = (last_vals["typicality"].mean() - first_vals["typicality"].mean()) / (x_last - x_first)
+            rows.append({"participant": participant, "panel": panel, "typicality_slope": slope})
+
+    slopes = pd.DataFrame(rows)
+    return df_panels.merge(slopes, on=["participant", "panel"], how="left")
 
 
 def compute_symbols_corr_to_mean(df_trials, df_panels, sd_cutoff=SYMBOL_CORR_SCORE_SD_CUTOFF,
@@ -556,6 +646,81 @@ def run_symbols_corr_to_mean_diagnostics(df_trials, df_panels, df_participants, 
 
 
 # ============================================================
+# 3b. KEY-ENTRY STRATEGY (decision 2026-11-11: wired in from key_entry_strategy.py)
+# ============================================================
+def key_entry_dir(run_dir):
+    return sibling_analysis_dir(run_dir, "key_entry_strategy")
+
+
+def key_entry_trial_table_path(run_dir):
+    return os.path.join(key_entry_dir(run_dir), "keyent_trial_table.csv")
+
+
+def build_and_save_key_entry_table(participants, run_dir):
+    """Compute mode only (needs the built TrialManagers): one row per trial, saved
+    before anything is derived from it, like the per-fixation BCEA table."""
+    import key_entry_strategy as kes
+    df_keyent = kes.build_keyent_trial_table(participants)
+    os.makedirs(key_entry_dir(run_dir), exist_ok=True)
+    df_keyent.to_csv(key_entry_trial_table_path(run_dir), index=False)
+    print(f"Saved key-entry trial table ({len(df_keyent)} trials) -> {key_entry_trial_table_path(run_dir)}")
+    return df_keyent
+
+
+def merge_key_entry_strategy(df_participants, df_keyent):
+    import key_entry_strategy as kes
+    if df_keyent is None or df_keyent.empty:
+        print("Warning: empty key-entry trial table - keyent_* features not merged.")
+        return df_participants
+    return df_participants.merge(kes.build_participant_features(df_keyent), on="participant", how="left")
+
+
+def run_key_entry_strategy_analysis(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANTS):
+    """All key-entry plots, from this run's saved trial table (so it also works in load
+    mode), into <run_dir>/key_entry_strategy/: the ternary simplex, the 4 standalone
+    breakdown/histogram/regression PNGs, the participant summaries, and one MS-vs-HC
+    boxplot + Welch's t-test per category (group_comparison/)."""
+    import key_entry_strategy as kes
+    try:
+        df_keyent = pd.read_csv(key_entry_trial_table_path(run_dir))
+    except FileNotFoundError:
+        print(f"No key-entry trial table at {key_entry_trial_table_path(run_dir)} - skipping key-entry analysis.")
+        return
+    out_dir = key_entry_dir(run_dir)
+    excluded = list(excluded)
+    # Gender carried onto every trial row so key_entry_strategy's summaries (and so every
+    # plot's demographics box) report the F/M split.
+    if "Gender" in df_participants.columns and "Gender" not in df_keyent.columns:
+        df_keyent = df_keyent.merge(df_participants[["participant", "Gender"]], on="participant", how="left")
+
+    summary = kes.plot_strategy_ternary(df_keyent, os.path.join(out_dir, "strategy_ternary.png"), excluded=excluded)
+    summary.to_csv(os.path.join(out_dir, "participant_strategy_summary.csv"), index=False)
+    kes.build_participant_full_breakdown(df_keyent).to_csv(
+        os.path.join(out_dir, "participant_full_breakdown.csv"), index=False)
+    kes.build_participant_panel_sd(df_keyent).to_csv(os.path.join(out_dir, "participant_panel_sd.csv"), index=False)
+    kes.plot_strategy_breakdown_bar(df_keyent, df_participants, os.path.join(out_dir, "strategy_1_breakdown_bar.png"),
+                                    excluded=excluded)
+    kes.plot_strategy_histograms(df_keyent, df_participants, os.path.join(out_dir, "strategy_2_histograms.png"),
+                                 excluded=excluded)
+    kes.plot_strategy_regression_vs_score(df_keyent, df_participants,
+                                          os.path.join(out_dir, "strategy_3_regression_mean.png"), excluded=excluded)
+    kes.plot_strategy_sd_regression_vs_score(df_keyent, df_participants,
+                                             os.path.join(out_dir, "strategy_4_regression_sd.png"), excluded=excluded)
+
+    # With every other group t-test (decision 2026-11-12)
+    box_dir = os.path.join(group_t_tests_dir(run_dir), "boxplots")
+    os.makedirs(box_dir, exist_ok=True)
+    df = df_participants[~df_participants["participant"].isin(excluded)]
+    demographics = demographics_text(df)
+    for cat in kes.EVENT_CATS:
+        feature = f"keyent_{cat}_pct_mean"
+        if feature in df.columns:
+            plot_group_boxplot_with_ttest(df, feature, f"Key entry: {cat} (% of all trials)",
+                                          os.path.join(box_dir, f"{feature}_boxplot.png"), demographics=demographics)
+    print(f"Key-entry strategy outputs saved to {out_dir}")
+
+
+# ============================================================
 # 4. WHOLE-PANEL FIXATION DISPERSION (compute mode only)
 # ============================================================
 def _bcea(positions, p=0.68):
@@ -570,23 +735,58 @@ def _bcea(positions, p=0.68):
     return 2 * np.pi * k * std_x * std_y * np.sqrt(1 - rho ** 2)
 
 
-def _collect_fixation_bcea_values(participant):
-    """Per-INDIVIDUAL-fixation BCEA values (each fixation's own microsaccade point
-    cloud) keyed by panel - distinct from trial_features.py's "global" dispersion
-    (dispersions_global_bcea/rms, which pools a whole TRIAL's fixations into one
-    cloud). Shared by the panel-level and participant-level aggregations below so
-    both read from exactly the same underlying values."""
-    values_by_panel = {}
+_warned_no_interpolation_mask = set()
+
+
+def _collect_fixation_bcea_records(participant):
+    """Per-INDIVIDUAL-fixation BCEA (each fixation's own microsaccade point cloud) keyed
+    by panel, as dicts (fixation_bcea, n_samples_in_bcea, n_interpolated_samples_in_fixation,
+    longest_filled_in_stretch) - distinct from trial_features.py's "global" dispersion
+    (dispersions_global_bcea/rms, which pools a whole TRIAL's fixations into one cloud).
+    Shared by the panel-level/participant-level aggregations and the per-fixation table
+    so all read from exactly the same underlying values.
+
+    Interpolation rules (decision 2026-11-10, same as fxsp - see
+    saccade_latency_analysis.filled_in_rule and constants.BCEA_MAX_FILLED_IN_*): a
+    fixation is left out if it has more than 5 consecutive interpolated samples or
+    >= 15% interpolated samples. Interpolated samples are looked up by t in the panel's
+    Stage 1 mask (tm.interpolated_t); "consecutive" is along the fixation's own samples
+    (FixationHandler skips non-fixation rows such as PSO inside a fixation). Without a
+    mask (Stage 1 folders from before 2026-11-10) the rules can't be applied - every
+    fixation is kept, n_interpolated is NaN, and a warning is printed once per panel."""
+    from saccade_latency_analysis import filled_in_rule
+    records_by_panel = {}
     for panel, tm in participant.trial_managers.items():
-        panel_values = []
+        interpolated_t = getattr(tm, "interpolated_t", None)
+        if interpolated_t is None and (participant.name, panel) not in _warned_no_interpolation_mask:
+            _warned_no_interpolation_mask.add((participant.name, panel))
+            print(f"  {participant.name}/{panel}: no Stage 1 interpolated-sample mask - "
+                  f"BCEA interpolation rules NOT applied (re-run run_preprocessing.py)")
+        panel_records = []
         for f in tm.fixations:
             pts = list(zip(f.microsaccades["x"], f.microsaccades["y"]))
-            if len(pts) > 2:
-                val = _bcea(pts)
-                if not np.isnan(val) and not np.isinf(val):
-                    panel_values.append(val)
-        values_by_panel[panel] = panel_values
-    return values_by_panel
+            if len(pts) <= 2:
+                continue
+            if interpolated_t is not None:
+                t_int = np.round(f.microsaccades["t"].to_numpy()).astype(np.int64)
+                reject, n_filled, longest = filled_in_rule([t in interpolated_t for t in t_int])
+                if reject is not None:
+                    continue
+            else:
+                n_filled, longest = np.nan, np.nan
+            val = _bcea(pts)
+            if not np.isnan(val) and not np.isinf(val):
+                panel_records.append({"fixation_bcea": val, "n_samples_in_bcea": len(pts),
+                                      "n_interpolated_samples_in_fixation": n_filled,
+                                      "longest_filled_in_stretch": longest})
+        records_by_panel[panel] = panel_records
+    return records_by_panel
+
+
+def _collect_fixation_bcea_values(participant):
+    """Just the BCEA values of _collect_fixation_bcea_records, keyed by panel."""
+    return {panel: [r["fixation_bcea"] for r in recs]
+            for panel, recs in _collect_fixation_bcea_records(participant).items()}
 
 
 def compute_fixation_dispersion_by_panel(participants, df_bcea=None):
@@ -639,11 +839,54 @@ def build_participant_table(df_trials, df_panels, participants):
     mean_score = df_panels.groupby("participant")["score"].mean().rename("score").reset_index()
     group_lookup = pd.DataFrame([{"participant": p.name, "group": p.group} for p in participants])
     slopes = df_panels.groupby("participant")["first5_last5_slope"].mean().rename("first5_last5_slope_mean").reset_index()
+    typicality_slopes = (df_panels.groupby("participant")["typicality_slope"].mean()
+                          .rename("typicality_slope_mean").reset_index())
 
     df_participants = stats.merge(mean_score, on="participant", how="left")
     df_participants = df_participants.merge(group_lookup, on="participant", how="left")
     df_participants = df_participants.merge(slopes, on="participant", how="left")
+    df_participants = df_participants.merge(typicality_slopes, on="participant", how="left")
     return df_participants
+
+
+def saccade_latency_csv_path(run_dir):
+    return os.path.join(non_sdmt_dir(run_dir, "saccade_latency"), "compiled_latencies.csv")
+
+
+def copy_demographics_table(run_dir, source_xlsx=None):
+    """Copy of the behavioral summary table this run merged (decision 2026-11-12), so the
+    run folder records exactly which demographics/cognitive-test values it used."""
+    import shutil
+    source_xlsx = source_xlsx or IDO_TABLE_XLSX
+    out_dir = non_sdmt_dir(run_dir, "demographics")
+    os.makedirs(out_dir, exist_ok=True)
+    try:
+        shutil.copy(source_xlsx, out_dir)
+        print(f"Demographics table copied: {source_xlsx} -> {out_dir}")
+    except Exception as e:
+        print(f"Warning: could not copy demographics table {source_xlsx}: {e}")
+
+
+def copy_saccade_latency_table(run_dir, source_csv=None):
+    """Saccade latency is the one feature NOT recomputed from raw on each run (decision
+    2026-11-11): the most current standalone table (pipeline_config.
+    latest_saccade_latency_csv, e.g. saccade_latency_no_noise_10_11_26) is copied into
+    this run's <run_dir>/non_SDMT/saccade_latency/compiled_latencies.csv, and everything
+    downstream (the merged feature, its reliability, the live board) reads that copy.
+    Returns the copied path, or None if no source table exists."""
+    import shutil
+    try:
+        source_csv = source_csv or pipeline_config.latest_saccade_latency_csv()
+    except FileNotFoundError as e:
+        print(f"Warning: {e} - saccade_latency_ms_* not merged.")
+        return None
+    dst = saccade_latency_csv_path(run_dir)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copy(source_csv, dst)
+    with open(os.path.join(os.path.dirname(dst), "SOURCE.txt"), "w") as f:
+        f.write(f"Copied from {source_csv}\n")
+    print(f"Saccade latency table copied: {source_csv} -> {dst}")
+    return dst
 
 
 def merge_saccade_latency(df_participants, saccade_csv):
@@ -660,6 +903,58 @@ def merge_saccade_latency(df_participants, saccade_csv):
         saccade_latency_ms_mean="mean", saccade_latency_ms_std="std"
     ).reset_index()
     return df_participants.merge(lat_stats, on="participant", how="left")
+
+
+EVENT_DURATION_FEATURES = {"fixation": "fixation_duration_ms", "saccade": "saccade_duration_ms"}
+
+
+def event_durations_table_path(run_dir):
+    return os.path.join(tables_dir(run_dir), "event_durations.csv")
+
+
+def build_and_save_event_durations(annotation_method, run_dir, date_str=None):
+    """Raw long-format table, one row per fixation / saccade (decision 2026-11-12: these
+    are features now, replacing the standalone duration analysis). Computed from Stage 1's
+    annotated CSVs - the interpolated signal, every sample valid - with
+    duration_analysis.build_duration_table (run = consecutive samples with the same
+    label; duration = last t - first t). Saved first; features and reliability read it."""
+    from duration_analysis import build_duration_table
+    df = build_duration_table(annotation_method, date_str=date_str)
+    os.makedirs(tables_dir(run_dir), exist_ok=True)
+    df.to_csv(event_durations_table_path(run_dir), index=False)
+    print(f"Saved event-duration table ({len(df)} events) -> {event_durations_table_path(run_dir)}")
+    return df
+
+
+def merge_event_durations(df_participants, df_durations):
+    """fixation_duration_ms_mean/std and saccade_duration_ms_mean/std per participant,
+    mean-of-panel-means like pso_duration (decision 2026-09-29): each panel's mean
+    duration first, then mean/std across that participant's panels."""
+    if df_durations is None or df_durations.empty:
+        print("Warning: no fixation/saccade durations found - duration features not merged.")
+        return df_participants
+    for event_type, feature in EVENT_DURATION_FEATURES.items():
+        d = df_durations[df_durations["event_type"] == event_type]
+        panel_means = d.groupby(["participant", "panel"])["duration_ms"].mean().reset_index()
+        stats = panel_means.groupby("participant")["duration_ms"].agg(["mean", "std"]).reset_index()
+        stats.columns = ["participant", f"{feature}_mean", f"{feature}_std"]
+        df_participants = df_participants.merge(stats, on="participant", how="left")
+    return df_participants
+
+
+def run_event_duration_reliability(run_dir, min_events=MIN_PSO_DURATION_RELIABILITY, df_participants=None):
+    """Split-half reliability on the raw per-event durations, as for PSO duration."""
+    try:
+        df = pd.read_csv(event_durations_table_path(run_dir))
+    except FileNotFoundError:
+        print(f"No event-duration table at {event_durations_table_path(run_dir)} - skipping its reliability.")
+        return
+    for event_type, feature in EVENT_DURATION_FEATURES.items():
+        d = df[df["event_type"] == event_type].rename(columns={"duration_ms": feature})
+        out_dir = os.path.join(run_dir, "reliability", "per_event", f"{event_type}_duration")
+        os.makedirs(out_dir, exist_ok=True)
+        print(f"Running {event_type}-duration reliability (min_events={min_events})...")
+        evaluate_feature_reliability(d, feature, min_events, out_dir, df_participants=df_participants)
 
 
 def merge_pso_duration(df_participants, annotation_method, date_str=None):
@@ -771,7 +1066,7 @@ def resolve_run_dir(mode, base_dir=OUTPUT_BASE_DIR, load_date=None):
         for name in os.listdir(base_dir):
             path = os.path.join(base_dir, name)
             if os.path.isdir(path) and re.match(r"^\d{4}_\d{2}_\d{2}$", name):
-                if os.path.exists(os.path.join(path, "participant_features.csv")):
+                if os.path.exists(os.path.join(tables_dir(path), "participant_features.csv")):
                     candidates.append(name)
         if not candidates:
             raise FileNotFoundError(f"No previous runs with saved tables found under {base_dir}")
@@ -781,17 +1076,20 @@ def resolve_run_dir(mode, base_dir=OUTPUT_BASE_DIR, load_date=None):
 
 
 def save_tables(df_trials, df_panels, df_participants, run_dir):
-    df_trials.to_csv(os.path.join(run_dir, "trial_features.csv"), index=False)
-    df_panels.to_csv(os.path.join(run_dir, "panel_features.csv"), index=False)
-    df_participants.to_csv(os.path.join(run_dir, "participant_features.csv"), index=False)
-    print(f"Saved tables to {run_dir}")
+    out_dir = tables_dir(run_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    df_trials.to_csv(os.path.join(out_dir, "trial_features.csv"), index=False)
+    df_panels.to_csv(os.path.join(out_dir, "panel_features.csv"), index=False)
+    df_participants.to_csv(os.path.join(out_dir, "participant_features.csv"), index=False)
+    print(f"Saved tables to {out_dir}")
 
 
 def load_tables(run_dir):
-    df_trials = pd.read_csv(os.path.join(run_dir, "trial_features.csv"))
-    df_panels = pd.read_csv(os.path.join(run_dir, "panel_features.csv"))
-    df_participants = pd.read_csv(os.path.join(run_dir, "participant_features.csv"))
-    print(f"Loaded tables from {run_dir}")
+    in_dir = tables_dir(run_dir)
+    df_trials = pd.read_csv(os.path.join(in_dir, "trial_features.csv"))
+    df_panels = pd.read_csv(os.path.join(in_dir, "panel_features.csv"))
+    df_participants = pd.read_csv(os.path.join(in_dir, "participant_features.csv"))
+    print(f"Loaded tables from {in_dir}")
     return df_trials, df_panels, df_participants
 
 
@@ -967,19 +1265,22 @@ def build_fixation_bcea_table(participants):
     compiled_latencies.csv (saccade latency's own raw table)."""
     rows = []
     for participant in participants:
-        for panel, values in _collect_fixation_bcea_values(participant).items():
-            for i, v in enumerate(values):
+        for panel, records in _collect_fixation_bcea_records(participant).items():
+            for i, r in enumerate(records):
                 rows.append({"participant": participant.name, "group": participant.group, "panel": panel,
-                             "fixation_order": i, "fixation_bcea": v})
-    return pd.DataFrame(rows, columns=["participant", "group", "panel", "fixation_order", "fixation_bcea"])
+                             "fixation_order": i, **r})
+    return pd.DataFrame(rows, columns=["participant", "group", "panel", "fixation_order", "fixation_bcea",
+                                       "n_samples_in_bcea", "n_interpolated_samples_in_fixation",
+                                       "longest_filled_in_stretch"])
 
 
 def fixation_bcea_table_path(run_dir):
-    return os.path.join(run_dir, "fixation_bcea_per_fixation.csv")
+    return os.path.join(non_sdmt_dir(run_dir, "fixation_bcea"), "fixation_bcea_per_fixation.csv")
 
 
 def save_fixation_bcea_table(df_bcea, run_dir):
     path = fixation_bcea_table_path(run_dir)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     df_bcea.to_csv(path, index=False)
     print(f"Saved per-fixation BCEA table ({len(df_bcea)} fixations, "
           f"{df_bcea['participant'].nunique()} participants) -> {path}")
@@ -1005,7 +1306,7 @@ def run_fixation_bcea_reliability(run_dir, df_bcea=None, min_trials=MIN_FIXATION
         print("No fixation BCEA values found - skipping fixation BCEA reliability.")
         return
 
-    out_dir = os.path.join(run_dir, "reliability", "fixation_bcea")
+    out_dir = os.path.join(run_dir, "reliability", "per_event", "fixation_bcea")
     os.makedirs(out_dir, exist_ok=True)
     print(f"Running fixation-BCEA reliability (min_trials={min_trials})...")
     evaluate_feature_reliability(df_bcea, "fixation_bcea", min_trials, out_dir, df_participants=df_participants)
@@ -1024,14 +1325,14 @@ def run_saccade_latency_reliability(run_dir, saccade_csv=None,
     times) already used for trial-/panel-level features - this also gives a reliability
     growth curve and scatterplots, which the one-off notebook version did not.
     """
-    saccade_csv = saccade_csv or saccade_latency_analysis.compiled_latencies_path(run_dir)
+    saccade_csv = saccade_csv or saccade_latency_csv_path(run_dir)
     try:
         df_lat = pd.read_csv(saccade_csv)
     except Exception as e:
         print(f"Warning: could not load saccade latency CSV for reliability: {e}")
         return
 
-    out_dir = os.path.join(run_dir, "reliability", "saccade_latency")
+    out_dir = os.path.join(run_dir, "reliability", "per_event", "saccade_latency")
     os.makedirs(out_dir, exist_ok=True)
     print(f"Running saccade-latency reliability (min_trials={min_trials})...")
     evaluate_feature_reliability(df_lat, "saccade_latency_ms", min_trials, out_dir, df_participants=df_participants)
@@ -1048,7 +1349,7 @@ def run_pso_duration_reliability(annotation_method, run_dir, date_str=None,
         print("No PSO duration values found - skipping PSO reliability.")
         return
 
-    out_dir = os.path.join(run_dir, "reliability", "pso_duration")
+    out_dir = os.path.join(run_dir, "reliability", "per_event", "pso_duration")
     os.makedirs(out_dir, exist_ok=True)
     print(f"Running PSO-duration reliability (min_trials={min_trials})...")
     evaluate_feature_reliability(df_pso, "pso_duration_ms", min_trials, out_dir, df_participants=df_participants)
@@ -1107,12 +1408,17 @@ def plot_heatmap(corr, annot, title, out_path, demographics=None):
     plt.close()
 
 
-def plot_significant_scatterplots(df, features, corr, pval, out_dir, score_col="score", demographics=None):
+def plot_significant_scatterplots(df, features, corr, pval, out_dir, score_col="score", demographics=None,
+                                  only_pairs_with=None):
+    """only_pairs_with: a set of columns - draw only significant pairs involving at least
+    one of them (e.g. features added to an existing run); None draws every significant pair."""
     os.makedirs(out_dir, exist_ok=True)
     count = 0
     for i in range(len(features)):
         for j in range(i + 1, len(features)):
             col1, col2 = features[i], features[j]
+            if only_pairs_with is not None and col1 not in only_pairs_with and col2 not in only_pairs_with:
+                continue
             p_val = pval.loc[col1, col2]
             r_val = corr.loc[col1, col2]
             if pd.isna(p_val) or p_val >= 0.05:
@@ -1158,7 +1464,9 @@ def run_correlation_analysis(df_participants, run_dir, excluded=EXCLUDED_PARTICI
             print(f"Skipping correlation subset '{name}': only {len(subset)} participants.")
             continue
 
-        out_dir = os.path.join(run_dir, "correlations", name)
+        # correlations/all_features/<subset>/ (decision 2026-11-11), next to the three
+        # colored by_domain / by_measure_type / by_cluster organizations
+        out_dir = os.path.join(run_dir, "correlations", "all_features", name)
         os.makedirs(out_dir, exist_ok=True)
 
         features = _select_feature_columns(subset)
@@ -1182,9 +1490,11 @@ def run_correlation_analysis(df_participants, run_dir, excluded=EXCLUDED_PARTICI
 
 
 # Decision 2026-09-27: a second, smaller feature set for run_correlation_analysis_reduced
-# - drops every "_std" column (means only) plus typicality, unique_counts_per_trial, and
+# - drops every "_std" column (means only) plus unique_counts_per_trial and
 # dispersions_global_rms entirely, on top of _select_feature_columns' usual filtering.
-REDUCED_CORR_EXCLUDE = {"mean_typicality", "typicality_std", "unique_counts_per_trial_mean",
+# mean_typicality is back in (decision 2026-11-12) - typicality_std still drops via the
+# plain "_std" suffix rule below, consistent with every other feature's std column.
+REDUCED_CORR_EXCLUDE = {"unique_counts_per_trial_mean",
                          "unique_counts_per_trial_std", "dispersions_global_rms_mean", "dispersions_global_rms_std"}
 
 
@@ -1239,6 +1549,7 @@ FEATURE_DOMAIN = {
     "num_of_searches_per_trial": "red",
     "revisits_per_trial": "red",
     "first5_last5_slope": "red",
+    "typicality_slope": "red",
     "CCMT_Acc_Combined": "red",
     "CFMT_Acc_Combined": "red",
     # yellow = motor
@@ -1246,6 +1557,8 @@ FEATURE_DOMAIN = {
     "pso_bcea": "yellow",
     "saccade_latency_ms": "yellow",
     "pso_duration_ms": "yellow",
+    "fixation_duration_ms": "yellow",
+    "saccade_duration_ms": "yellow",
     # orange = motor + memory
     "search_distance_per_trial": "orange",
     # blue = information processing
@@ -1254,6 +1567,13 @@ FEATURE_DOMAIN = {
     "symbol_counts_per_trial": "purple",
     # derived from symbol_counts_per_trial's trajectory - inherit its domain (decision 2026-11-09)
     "symbols_corr_to_mean": "purple",
+    # key-entry strategy (decision 2026-11-11): where gaze first enters the key relative to
+    # the remembered target location - memory-driven, like num_of_searches/revisits
+    "keyent_memory_pct": "red",
+    "keyent_proximity_pct": "red",
+    "keyent_undershoot_pct": "red",
+    "keyent_overshoot_pct": "red",
+    "keyent_away_pct": "red",
     "typicality": "purple",
     # green = information processing + motor
     "dispersions_global_bcea": "green",
@@ -1266,6 +1586,7 @@ FEATURE_DOMAIN = {
     "Markov_PC1": "grey",
     "Markov_PC2": "grey",
     "Markov_PC3": "grey",
+    "mean_typicality": "grey",
 }
 
 # Dropped from this heatmap entirely (decision 2026-10-29): clinical/demographic
@@ -1497,6 +1818,8 @@ MEASURE_TYPE = {
     "saccade_latency_ms": "oculomotor",
     "fixation_bcea": "oculomotor",
     "pso_duration_ms": "oculomotor",
+    "fixation_duration_ms": "oculomotor",
+    "saccade_duration_ms": "oculomotor",
     "pso_bcea": "oculomotor",
     "time_in_relevant_fixations_ms": "oculomotor",
     "dispersions_global_bcea": "oculomotor",
@@ -1510,6 +1833,12 @@ MEASURE_TYPE = {
     "trial_in_search_durations_ms": "task_behavior",
     "fixation_counts_per_trial": "task_behavior",
     "first5_last5_slope": "task_behavior",
+    "typicality_slope": "task_behavior",
+    "keyent_memory_pct": "task_behavior",
+    "keyent_proximity_pct": "task_behavior",
+    "keyent_undershoot_pct": "task_behavior",
+    "keyent_overshoot_pct": "task_behavior",
+    "keyent_away_pct": "task_behavior",
     # standardized cognitive/neuropsych tests - external validated scores
     "CCMT_Acc_Combined": "cognitive_test",
     "CFMT_Acc_Combined": "cognitive_test",
@@ -1519,6 +1848,7 @@ MEASURE_TYPE = {
     "Markov_PC1": "other",
     "Markov_PC2": "other",
     "Markov_PC3": "other",
+    "mean_typicality": "other",
 }
 MEASURE_TYPE_ORDER = ["oculomotor", "task_behavior", "cognitive_test", "other"]
 MEASURE_TYPE_COLORS = {
@@ -1689,6 +2019,58 @@ def run_importance_correlation_analysis(df_participants, run_dir, excluded=EXCLU
 
 
 # ============================================================
+# 8f. CORRELATION HEATMAPS - ONE DRIVER (decision 2026-11-12)
+# ============================================================
+# correlations/<all|MS|HC>/<reduced|full>/: the three orderings the live board offers
+# (cognitive domain, source = measure type, clustered - colored by domain), the
+# correlation values, and ONE scatterplots/ folder (the significant pairs are the same
+# whatever the ordering). reduced = the board's default set (_reduced_feature_columns +
+# DOMAIN_HEATMAP_EXTRA_EXCLUDE: means only, no typicality/unique-counts/global RMS, no
+# clinical/dummy columns); full = every feature column (_select_feature_columns).
+CORRELATION_FEATURE_SETS = {
+    "reduced": lambda df: _reduced_feature_columns(df, extra_exclude=DOMAIN_HEATMAP_EXTRA_EXCLUDE),
+    "full": lambda df: _select_feature_columns(df),
+}
+
+
+def run_correlation_heatmaps(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANTS,
+                             subset_names=("all", "MS", "HC"), scatter_only_for=None):
+    """scatter_only_for: passed to plot_significant_scatterplots(only_pairs_with=...)."""
+    base = df_participants[~df_participants["participant"].isin(excluded)].copy()
+    for name in subset_names:
+        subset = base[CORRELATION_SUBSETS[name](base)].copy()
+        if len(subset) < 5:
+            print(f"Skipping correlation subset '{name}': only {len(subset)} participants.")
+            continue
+        demographics = demographics_text(subset)
+        for set_name, select in CORRELATION_FEATURE_SETS.items():
+            out_dir = os.path.join(run_dir, "correlations", name, set_name)
+            os.makedirs(out_dir, exist_ok=True)
+            features = select(subset)
+            corr, pval, annot = compute_correlation_matrix(subset, features)
+            corr.to_csv(os.path.join(out_dir, "correlation_values.csv"))
+            title = f"Feature Correlations ({set_name}) - {name} (N={len(subset)})"
+
+            by_domain = _order_features_by_domain(features)
+            plot_domain_grouped_heatmap(corr.loc[by_domain, by_domain], annot.loc[by_domain, by_domain], by_domain,
+                                        f"{title}, by cognitive domain",
+                                        os.path.join(out_dir, "heatmap_by_domain.png"), demographics=demographics)
+            by_source = _order_features_by_measure_type(features)
+            plot_measure_type_heatmap(corr.loc[by_source, by_source], annot.loc[by_source, by_source], by_source,
+                                      f"{title}, by source",
+                                      os.path.join(out_dir, "heatmap_by_source.png"), demographics=demographics)
+            by_cluster = _order_features_by_clustering(corr)
+            plot_domain_grouped_heatmap(corr.loc[by_cluster, by_cluster], annot.loc[by_cluster, by_cluster], by_cluster,
+                                        f"{title}, clustered",
+                                        os.path.join(out_dir, "heatmap_by_cluster.png"), demographics=demographics)
+
+            n_sig = plot_significant_scatterplots(subset, features, corr, pval, os.path.join(out_dir, "scatterplots"),
+                                                  demographics=demographics, only_pairs_with=scatter_only_for)
+            print(f"Correlations {name}/{set_name}: N={len(subset)}, {len(features)} features, "
+                  f"{n_sig} significant scatterplots.")
+
+
+# ============================================================
 # 9. GROUP COMPARISON (MS vs HC)
 # ============================================================
 def plot_group_boxplot_with_ttest(df_participants, feature, ylabel, out_path, demographics=None,
@@ -1729,7 +2111,7 @@ def plot_group_boxplot_with_ttest(df_participants, feature, ylabel, out_path, de
 
 
 def run_group_comparison(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANTS):
-    out_dir = os.path.join(run_dir, "group_comparison")
+    out_dir = group_t_tests_dir(run_dir)
     os.makedirs(out_dir, exist_ok=True)
 
     df = df_participants[~df_participants["participant"].isin(excluded)].copy()
@@ -1790,7 +2172,7 @@ def run_group_comparison(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANT
 # 10. PCA / PARETO
 # ============================================================
 def run_pca_pareto(df_participants, run_dir, excluded=EXCLUDED_PARTICIPANTS):
-    out_dir = os.path.join(run_dir, "pca_pareto")
+    out_dir = os.path.join(run_dir, "PCA")  # was pca_pareto/ (renamed 2026-11-12)
     os.makedirs(out_dir, exist_ok=True)
 
     df = df_participants[~df_participants["participant"].isin(excluded)].copy()
@@ -1998,7 +2380,7 @@ def run_partial_correlations(df_participants, run_dir, excluded=EXCLUDED_PARTICI
 # 12. MERGE MARKOV'S PC1-3 SCORES INTO df_participants
 # ============================================================
 def merge_markov_pca_scores(df_participants, annotation_method, markov_output_base_path=None, n_components=3,
-                            analysis_folder="analysis_NO_repeats_ALL_states"):
+                            pca_dir=None):
     """Merges Markov's per-participant PC1..PC{n_components} scores (mean-matrix mode -
     one row per participant, since use_mean_matrix=True means each participant
     contributes exactly one vector, decision 2026-09-27) into df_participants, so they
@@ -2009,15 +2391,17 @@ def merge_markov_pca_scores(df_participants, annotation_method, markov_output_ba
     Prefixed "Markov_PC{i}" so there's no ambiguity with any future feature-pipeline-
     native PCA. No-op (prints a warning, returns df unchanged) if the file doesn't
     exist yet - most likely because Markov's mean-matrix run hasn't been done for this
-    base path yet. analysis_folder: which Markov variant's folder to read
-    (markov_core.AnalysisConfig.folder_name) - e.g. a matrix_type variant's
-    analysis_NO_repeats_ALL_states_NORMALIZED_BY_SCORE."""
-    if markov_output_base_path is None:
-        markov_output_base_path = pipeline_config.preliminary_results_dir(annotation_method)
-    # Default matches markov_core.AnalysisConfig(with_repeats=False, only_1_to_9=False,
-    # use_mean_matrix=True).folder_name / .plot_output_path exactly.
-    pca_csv = os.path.join(markov_output_base_path, analysis_folder,
-                            "plots", "mean_matrix", "separation", "pca_scores_and_features.csv")
+    base path yet. pca_dir: the Markov variant's analyzer output folder
+    (AnalysisConfig.plot_output_path); None -> w_exit_enter/probabilities under
+    markov_output_base_path."""
+    if pca_dir is None:
+        from markov_core import AnalysisConfig
+        if markov_output_base_path is None:
+            markov_output_base_path = pipeline_config.preliminary_results_dir(annotation_method)
+        pca_dir = AnalysisConfig(with_repeats=False, only_1_to_9=False, use_mean_matrix=True, from_scratch=False,
+                                 annotation_method=annotation_method,
+                                 output_base_path=markov_output_base_path).plot_output_path
+    pca_csv = os.path.join(pca_dir, "separation", "pca_scores_and_features.csv")
     try:
         df_pca = pd.read_csv(pca_csv)
     except Exception as e:
@@ -2147,6 +2531,7 @@ def main(annotation_method="threshold_based", date_str=None, run_dir=None, marko
         df_panels = build_panel_table(df_trials, participants)
         df_panels = compute_panel_slopes(df_trials, df_panels)
         df_trials = compute_typicality(df_trials)
+        df_panels = compute_typicality_slope(df_trials, df_panels)
 
         # Per-fixation BCEA is saved as its own table FIRST, and the panel/participant
         # fixation_bcea features are aggregated from that saved table (decision
@@ -2160,22 +2545,34 @@ def main(annotation_method="threshold_based", date_str=None, run_dir=None, marko
         dispersion_df = compute_whole_panel_dispersion(participants, df_bcea=df_bcea)
         df_participants = df_participants.merge(dispersion_df, on="participant", how="left")
 
-        # Computed here, per run (fast: gazeNET labels come from the shared
-        # fxsp_annotation_cache_dir; only never-annotated participants run the model). A
-        # failure only drops this one feature, as the old missing-CSV path did.
-        try:
-            saccade_csv = saccade_latency_analysis.main(run_dir=run_dir, participant_whitelist=participant_whitelist)
-        except Exception as e:
-            print(f"Warning: saccade latency computation failed ({type(e).__name__}: {e}) - feature skipped.")
-            saccade_csv = None
+        # Key-entry strategy (decision 2026-11-11): trial table saved first, participant
+        # features derived from it - computed fresh from this run's TrialManagers.
+        df_keyent = build_and_save_key_entry_table(participants, run_dir)
+        df_participants = merge_key_entry_strategy(df_participants, df_keyent)
+
+        # Saccade latency is NOT recomputed per run (decision 2026-11-11): the most
+        # current standalone table is copied into this run folder and used from there.
+        # (Per-run recomputation: saccade_latency_analysis.main(run_dir=run_dir, ...).)
+        saccade_csv = copy_saccade_latency_table(run_dir)
         df_participants = merge_saccade_latency(df_participants, saccade_csv)
         df_participants = merge_pso_duration(df_participants, annotation_method, date_str=date_str)
+        df_durations = build_and_save_event_durations(annotation_method, run_dir, date_str=date_str)
+        df_participants = merge_event_durations(df_participants, df_durations)
         df_panels, df_participants = merge_pso_bcea(df_panels, df_participants, annotation_method, date_str=date_str)
         df_panels, df_participants = merge_symbols_corr_to_mean(df_trials, df_panels, df_participants)
         df_participants = merge_ido_table(df_participants)
+        copy_demographics_table(run_dir)
         df_participants = add_encoded_demographics(df_participants)
-        df_participants = merge_markov_pca_scores(df_participants, annotation_method,
-                                                    markov_output_base_path=markov_output_base_path)
+        # Markov_PC1-3 come from the n-transitions-normalized matrices (decision
+        # 2026-11-12), not the row-conditional-probability ones - each cell =
+        # count(A->B) / all transitions in the panel, rather than P(B|A).
+        from markov_core import AnalysisConfig
+        markov_pca_dir = AnalysisConfig(
+            with_repeats=False, only_1_to_9=False, use_mean_matrix=True, from_scratch=False,
+            annotation_method=annotation_method, matrix_type="normalized_by_n_transitions",
+            output_base_path=markov_output_base_path or pipeline_config.preliminary_results_dir(annotation_method)
+        ).plot_output_path  # <markov>/w_exit_enter/n_transitions/pca
+        df_participants = merge_markov_pca_scores(df_participants, annotation_method, pca_dir=markov_pca_dir)
 
         save_tables(df_trials, df_panels, df_participants, run_dir)
     else:
@@ -2187,24 +2584,24 @@ def main(annotation_method="threshold_based", date_str=None, run_dir=None, marko
         run_saccade_latency_reliability(run_dir, df_participants=df_participants)
         run_pso_duration_reliability(annotation_method, run_dir, date_str=date_str, df_participants=df_participants)
         run_fixation_bcea_reliability(run_dir, df_participants=df_participants)
+        run_event_duration_reliability(run_dir, df_participants=df_participants)
     if RUN_CORRELATIONS:
-        run_correlation_analysis(df_participants, run_dir)
-        run_correlation_analysis_reduced(df_participants, run_dir)
-        run_domain_grouped_correlation_analysis(df_participants, run_dir)
-        run_clustered_correlation_analysis(df_participants, run_dir)
-        run_measure_type_correlation_analysis(df_participants, run_dir)
-        run_importance_correlation_analysis(df_participants, run_dir)
+        # correlations/<all|MS|HC>/<reduced|full>/heatmap_by_<domain|source|cluster>.png -
+        # the live board's three orderings (decision 2026-11-12; importance ordering off).
+        run_correlation_heatmaps(df_participants, run_dir)
     if RUN_GROUP_COMPARISON:
         run_group_comparison(df_participants, run_dir)
         # Dedicated boxplot+t-test for the 3 "signal-level" features (decision
         # 2026-09-28) - these already appear in run_group_comparison's generic ranked
         # grid too, but buried among every other feature; this gives each its own
         # prominent plot, matching the demographics/N convention used everywhere else.
-        signal_out_dir = os.path.join(run_dir, "group_comparison", "signal_features")
+        signal_out_dir = os.path.join(group_t_tests_dir(run_dir), "boxplots")
         os.makedirs(signal_out_dir, exist_ok=True)
         demographics = demographics_text(df_participants[~df_participants["participant"].isin(EXCLUDED_PARTICIPANTS)])
         for feature, ylabel in [
             ("pso_duration_ms_mean", "PSO Duration (ms)"),
+            ("fixation_duration_ms_mean", "Fixation Duration (ms)"),
+            ("saccade_duration_ms_mean", "Saccade Duration (ms)"),
             ("fixation_bcea_mean", "Individual-Fixation BCEA"),
             ("saccade_latency_ms_mean", "Saccade Latency (ms)"),
         ]:
@@ -2214,7 +2611,16 @@ def main(annotation_method="threshold_based", date_str=None, run_dir=None, marko
                                                demographics=demographics)
             else:
                 print(f"Skipping group boxplot for {feature}: column not found in df_participants.")
-        run_symbols_corr_to_mean_diagnostics(df_trials, df_panels, df_participants, run_dir)
+        # #symbols_corr_to_mean is a regular feature now - no separate diagnostics folder
+        # (decision 2026-11-12); it is tested in the ranked grid above like every feature.
+        # run_symbols_corr_to_mean_diagnostics(df_trials, df_panels, df_participants, run_dir)
+    if RUN_KEY_ENTRY_STRATEGY:
+        run_key_entry_strategy_analysis(df_participants, run_dir)
+    if RUN_SYMBOL_COUNT_STABILITY:
+        # Reads this run's just-saved tables (circular import otherwise - it imports us).
+        import symbol_count_stability
+        symbol_count_stability.main(tables_dir=tables_dir(run_dir),
+                                    out_dir=sibling_analysis_dir(run_dir, "symbol_count_over_panels"))
     if RUN_PCA:
         run_pca_pareto(df_participants, run_dir)
     if RUN_PARTIAL_CORR:

@@ -385,7 +385,10 @@ class ParticipantGazeDataManager:
             audio_file = None if len(audio_files) == 0 else audio_files[0]
             preprocess_gaze_method = self.clean_outliers if clean_gaze_data else self.clean_outliers_no_interpolation
             messages = self.messages_for_panel(i+1)
-            matched_data_files[task_code_lower] = {KEY_TOBII_DATA: preprocess_gaze_method(tobii_data_file[f"panel_{i+1}"]),
+            panel_gaze = preprocess_gaze_method(tobii_data_file[f"panel_{i+1}"])
+            interpolated_mask = self._last_interpolated_mask if clean_gaze_data else np.zeros(len(panel_gaze), dtype=bool)
+            matched_data_files[task_code_lower] = {KEY_TOBII_DATA: panel_gaze,
+                                                   KEY_INTERPOLATED_MASK: interpolated_mask,
                                                    KEY_TASK_PANEL_IMG : png_img,
                                                    KEY_PANEL_MESSAGES : messages,
                                                    KEY_CALIBRATION_INFO : calibration_info,
@@ -817,8 +820,15 @@ class ParticipantGazeDataManager:
         
 
     def clean_outliers(self, eyes):
-        eyes[:, 0] = self.clean_outliers_single_eye(eyes[:, 0])
-        eyes[:, 1] = self.clean_outliers_single_eye(eyes[:, 1])
+        """Same result as cleaning+interpolating x and y separately (each axis is
+        independent), but records which samples got filled in - missing in the recording,
+        set to NaN by the out-of-range policy, or removed as outlier jumps - in
+        self._last_interpolated_mask (decision 2026-11-10: the BCEA interpolation rules,
+        saccade_latency_analysis.filled_in_rule, need it; Stage 1 saves it per panel)."""
+        eyes = self.clean_outliers_no_interpolation(eyes)
+        self._last_interpolated_mask = np.isnan(eyes[:, :2]).any(axis=1)
+        eyes[:, 0] = self.interpulate_nan_values(eyes[:, 0])
+        eyes[:, 1] = self.interpulate_nan_values(eyes[:, 1])
         return eyes
     
     def clean_outliers_nan_removal(self, eyes):

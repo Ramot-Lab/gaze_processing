@@ -9,6 +9,9 @@ import pipeline_config
 
 # AnalysisConfig.matrix_type -> output folder suffix ("" keeps the original folder names).
 MATRIX_TYPE_SUFFIXES = {"conditional": "", "normalized_by_n_transitions": "_NORMALIZED_BY_N_TRANSITIONS", "normalized_by_score": "_NORMALIZED_BY_SCORE"}
+# Nested layout (decision 2026-11-12): <base>/<w_exit_enter|wo_exit_enter>/<matrix type>/
+MATRIX_TYPE_FOLDERS = {"conditional": "probabilities", "normalized_by_n_transitions": "n_transitions",
+                       "normalized_by_score": "normalized_by_score"}
 
 @dataclass
 class AnalysisConfig:
@@ -56,6 +59,14 @@ class AnalysisConfig:
     # count time, so any earlier run's trial_stats serves every variant.
     trial_stats_source_dir: str = None
 
+    # Where all_scores.csv is read from / written to; None -> <output_base_path>/behavior_scores.
+    scores_dir: str = None
+
+    # True keeps the pre-2026-11-12 flat folder names (analysis_NO_repeats_ALL_states...,
+    # markov_matrices/, digit_asymmetry/, plots/mean_matrix/) - for scripts that read
+    # runs saved in that layout (run_markov_normalization_comparison.py).
+    legacy_layout: bool = False
+
     def __post_init__(self):
         if self.matrix_type not in MATRIX_TYPE_SUFFIXES:
             raise ValueError(f"matrix_type must be one of {list(MATRIX_TYPE_SUFFIXES)}, got {self.matrix_type!r}")
@@ -66,9 +77,25 @@ class AnalysisConfig:
 
     @property
     def folder_name(self):
-        repeat_str = "WITH_repeats" if self.with_repeats else "NO_repeats"
-        state_str = "ONLY_1_9" if self.only_1_to_9 else "ALL_states"
-        return f"analysis_{repeat_str}_{state_str}{MATRIX_TYPE_SUFFIXES[self.matrix_type]}"
+        """Path of this variant under output_base_path (also its label in printouts and
+        in the exclusion summary). New layout: w_exit_enter = all states incl. ENTER/EXIT,
+        wo_exit_enter = digits 1-9 only; "_with_repeats" appended when repeats are kept."""
+        if self.legacy_layout:
+            repeat_str = "WITH_repeats" if self.with_repeats else "NO_repeats"
+            state_str = "ONLY_1_9" if self.only_1_to_9 else "ALL_states"
+            return f"analysis_{repeat_str}_{state_str}{MATRIX_TYPE_SUFFIXES[self.matrix_type]}"
+        states = "wo_exit_enter" if self.only_1_to_9 else "w_exit_enter"
+        if self.with_repeats:
+            states += "_with_repeats"
+        return os.path.join(states, MATRIX_TYPE_FOLDERS[self.matrix_type])
+
+    @property
+    def matrices_dirname(self):
+        return "markov_matrices" if self.legacy_layout else "matrices"
+
+    @property
+    def asymmetry_dirname(self):
+        return "digit_asymmetry" if self.legacy_layout else "asymmetry"
 
     @property
     def main_output_path(self):
@@ -76,6 +103,7 @@ class AnalysisConfig:
 
     @property
     def plot_output_path(self):
+        """MarkovAnalyzer's output dir: <variant>/pca (mean-matrix mode) in the new layout."""
         if self.use_mean_matrix:
             sub_folder = "mean_matrix"
         else:
@@ -83,7 +111,9 @@ class AnalysisConfig:
                 sub_folder = "concat_panels"
             else:
                 sub_folder = "all_panels"
-        return os.path.join(self.main_output_path, "plots", sub_folder)
+        if self.legacy_layout:
+            return os.path.join(self.main_output_path, "plots", sub_folder)
+        return os.path.join(self.main_output_path, "pca" if self.use_mean_matrix else f"pca_{sub_folder}")
 
 
 class Participant:

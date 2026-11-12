@@ -2,7 +2,7 @@
 # Resilient wrapper for run_preprocessing.py: waits out network-mount drops, retries
 # on failure. Usage: bash run_preprocessing_with_resume.sh <threshold_based|model_based> [date_str]
 METHOD="$1"
-DATE_STR="$2"
+DATE_STR="${2:-$(date +%d_%m_%y)}"  # pinned once, so a retry after midnight resumes the same folder
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAX_OUTER_ITERS=40
 
@@ -31,7 +31,9 @@ check_done_count() {
   DATE_FOR_PATH="${DATE_STR:-$(date +%d_%m_%y)}"
   SUFFIX="threshold"
   if [ "$METHOD" = "model_based" ]; then SUFFIX="model"; fi
-  CSV="$MOUNT/Noam_M/SDMT_annotated_gaze_${DATE_FOR_PATH}_${SUFFIX}/processed_participants.csv"
+  # <Noam_M>/<date>/SDMT_annotated_gaze_<date>_<suffix> (2026-11-12 layout); older runs sit flat in Noam_M
+  CSV="$MOUNT/Noam_M/${DATE_FOR_PATH}/SDMT_annotated_gaze_${DATE_FOR_PATH}_${SUFFIX}/processed_participants.csv"
+  [ -f "$CSV" ] || CSV="$MOUNT/Noam_M/SDMT_annotated_gaze_${DATE_FOR_PATH}_${SUFFIX}/processed_participants.csv"
   python3 -c "
 import pandas as pd
 try:

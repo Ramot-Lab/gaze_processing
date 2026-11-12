@@ -13,6 +13,8 @@ importing this module never touches the filesystem and never fails just because 
 mount happened to be down at import time.
 """
 import os
+
+import numpy as np
 from datetime import datetime
 
 ANNOTATION_METHODS = ("threshold_based", "model_based")
@@ -45,6 +47,11 @@ MAX_SACCADE_FRACTION = 0.8
 DICTIONARY_BOUNDARY_RATIO = 0.1843 #bottom of ROI boxes for dictionary digit row
 TEXT_BOUNDARY_RATIO = 0.22
 
+# Behavioral/demographic summary table (decision 2026-11-12) - the single source for
+# demographics, cognitive tests and the Tobii_Sucks flag (exclusion_policy,
+# feature_pipeline.merge_ido_table). Copied into each run's features/non_SDMT/demographics/.
+BEHAVIORAL_SUMMARY_XLSX = "/Volumes/ramot/Noam_M/df_clean_behavioral_summary_20261110_183415.xlsx"
+
 
 def find_ramot_mount():
     """Whichever /Volumes/ramot* actually has the expected Noam_M path mounted right now."""
@@ -75,9 +82,12 @@ def latest_annotated_gaze_date(method):
     import glob
     import re
     suffix = _METHOD_FOLDER_SUFFIX[method]
-    pattern = os.path.join(noam_m_root(), f"SDMT_annotated_gaze_*_{suffix}")
+    # Both layouts: <Noam_M>/<date>/SDMT_annotated_gaze_<date>_<suffix> (decision
+    # 2026-11-12) and the older flat <Noam_M>/SDMT_annotated_gaze_<date>_<suffix>.
+    paths = (glob.glob(os.path.join(noam_m_root(), "*", f"SDMT_annotated_gaze_*_{suffix}"))
+             + glob.glob(os.path.join(noam_m_root(), f"SDMT_annotated_gaze_*_{suffix}")))
     candidates = []
-    for path in glob.glob(pattern):
+    for path in paths:
         m = re.match(rf"^SDMT_annotated_gaze_(\d{{2}}_\d{{2}}_\d{{2}})_{suffix}$", os.path.basename(path))
         if m:
             candidates.append(m.group(1))
@@ -86,13 +96,45 @@ def latest_annotated_gaze_date(method):
     return max(candidates, key=lambda d: datetime.strptime(d, "%d_%m_%y"))
 
 
+def date_root(date_str):
+    """One folder per Stage 1 run date (decision 2026-11-12): <Noam_M>/<DD_MM_YY>/ holds
+    that run's SDMT_annotated_gaze_<date>_<method>/, analysis_results/, behavior_scores/,
+    live_board/ and analysis_participant_exclusion_summary.csv."""
+    return os.path.join(noam_m_root(), date_str)
+
+
+def analysis_results_dir(date_str):
+    return os.path.join(date_root(date_str), "analysis_results")
+
+
 def annotated_gaze_dir(method, date_str=None):
-    """Stage 1 output root for one method: .../Noam_M/SDMT_annotated_gaze_<date>_<method>.
-    date_str=None resolves to the most recent existing folder for this method if one
-    exists (correct for reading back a previous run), else today (correct for starting a
-    genuinely new preprocessing run)."""
+    """Stage 1 output root for one method: SDMT_annotated_gaze_<date>_<method>, <date> being
+    the Stage 1 run's date. date_str=None resolves to the most recent existing folder for
+    this method if one exists (correct for reading back a previous run), else today
+    (correct for starting a genuinely new preprocessing run).
+    Where it lives: wherever it already exists - inside any <Noam_M>/<DD_MM_YY>/ date
+    folder (the date folder may be named after the analysis day, not the Stage 1 day -
+    e.g. 12_11_26/SDMT_annotated_gaze_11_11_26_model), or flat in Noam_M (saved before
+    2026-11-12); a new one is created in <Noam_M>/<its own date>/."""
+    import glob
     resolved = date_str or latest_annotated_gaze_date(method) or datetime.now().strftime("%d_%m_%y")
-    return os.path.join(noam_m_root(), f"SDMT_annotated_gaze_{resolved}_{_METHOD_FOLDER_SUFFIX[method]}")
+    name = f"SDMT_annotated_gaze_{resolved}_{_METHOD_FOLDER_SUFFIX[method]}"
+    existing = sorted(glob.glob(os.path.join(noam_m_root(), "*", name)))
+    if existing:
+        return existing[0]
+    flat = os.path.join(noam_m_root(), name)
+    return flat if os.path.isdir(flat) else os.path.join(date_root(resolved), name)
+
+
+def stage1_date_root(method, date_str=None):
+    """The <Noam_M>/<DD_MM_YY>/ folder holding this Stage 1 run - where its analysis is
+    written (decision 2026-11-12: results sit next to the Stage 1 data they came from).
+    A flat pre-2026-11-12 Stage 1 folder falls back to <Noam_M>/<its date>/."""
+    gaze_dir = annotated_gaze_dir(method, date_str)
+    parent = os.path.dirname(gaze_dir)
+    if os.path.normpath(parent) != os.path.normpath(noam_m_root()):
+        return parent
+    return date_root(date_str or latest_annotated_gaze_date(method))
 
 
 def preliminary_results_dir(method):
@@ -133,6 +175,56 @@ def consolidated_results_dir(date_str=None):
     scripts' run_dir - nothing defaults to it on its own."""
     resolved = date_str or datetime.now().strftime("%d_%m_%y")
     return os.path.join(noam_m_root(), f"markov_features_results_{resolved}")
+
+
+def _dd_mm_yy_suffix_date(path):
+    """Date of a folder named <anything>_DD_MM_YY; None if it has no such suffix."""
+    import re
+    m = re.search(r"(\d{2})_(\d{2})_(\d{2})$", os.path.basename(path.rstrip("/")))
+    if not m:
+        return None
+    try:
+        return datetime.strptime("_".join(m.groups()), "%d_%m_%y")
+    except ValueError:
+        return None
+
+
+def latest_dated_dir(pattern, required_relpath):
+    """Newest folder under Noam_M matching `pattern` (glob, e.g. "markov_features_results_*")
+    whose DD_MM_YY suffix is the latest AND that contains required_relpath. TEST folders
+    are ignored. Used wherever a step reads an existing table instead of computing it, so
+    it always gets the most current one rather than a hard-coded date (decision
+    2026-11-11). Raises FileNotFoundError if none qualifies."""
+    import glob
+    candidates = [d for d in glob.glob(os.path.join(noam_m_root(), pattern))
+                  if "TEST" not in os.path.basename(d) and _dd_mm_yy_suffix_date(d)
+                  and os.path.exists(os.path.join(d, required_relpath))]
+    if not candidates:
+        raise FileNotFoundError(f"No {pattern} folder under {noam_m_root()} contains {required_relpath}")
+    return max(candidates, key=_dd_mm_yy_suffix_date)
+
+
+def latest_saccade_latency_csv():
+    """The most current standalone saccade-latency table
+    (.../Noam_M/saccade_latency_<tag>_DD_MM_YY/compiled_latencies.csv, decision
+    2026-11-11). Saccade latency is the ONE feature the pipeline does not recompute from
+    raw on each run - feature_pipeline.main copies this table into its run folder."""
+    return os.path.join(latest_dated_dir("saccade_latency_*", "compiled_latencies.csv"), "compiled_latencies.csv")
+
+
+FEATURE_TABLES_RELPATH = os.path.join("analysis_results", "features", "csvs")
+
+
+def latest_date_root():
+    """Newest <Noam_M>/<DD_MM_YY> folder whose analysis_results has the feature tables."""
+    return latest_dated_dir("[0-9][0-9]_[0-9][0-9]_[0-9][0-9]",
+                            os.path.join(FEATURE_TABLES_RELPATH, "participant_features.csv"))
+
+
+def latest_feature_tables_dir():
+    """Folder holding trial/panel/participant_features.csv of the newest run - the default
+    input for standalone scripts that read the pipeline's tables."""
+    return os.path.join(latest_date_root(), FEATURE_TABLES_RELPATH)
 
 
 def annotated_csv_path(method, group, participant, panel, date_str=None, corrected=False):
@@ -185,6 +277,29 @@ def load_annotated_csv(method, group, participant, panel, date_str=None, correct
 
     path = annotated_csv_path(method, group, participant, panel, date_str, corrected=False)
     return pd.read_csv(path)
+
+
+def interpolated_samples_path(method, group, participant, panel, date_str=None):
+    """Stage 1's per-panel record of which samples were filled in by interpolation
+    (decision 2026-11-10) - a separate file next to the annotated CSV, NOT a new column in
+    it, because FixationHandler unpacks the annotated CSV's 5 columns positionally and the
+    drift-corrected CSV keeps a fixed column list. Columns: t (same values as the
+    annotated CSV's t), interpolated (0/1)."""
+    return os.path.join(annotated_gaze_dir(method, date_str), group, participant,
+                         f"panel_{panel}_interpolated_samples.csv")
+
+
+def load_interpolated_t(method, group, participant, panel, date_str=None):
+    """Set of t values (rounded to int, the annotated CSV's us timestamps) whose sample
+    was filled in by interpolation, or None if Stage 1 didn't save the file (Stage 1
+    folders from before 2026-11-10) - callers then can't apply the BCEA interpolation
+    rules and should say so."""
+    import pandas as pd
+    path = interpolated_samples_path(method, group, participant, panel, date_str)
+    if not os.path.exists(path):
+        return None
+    df = pd.read_csv(path)
+    return set(np.round(df.loc[df["interpolated"] == 1, "t"].to_numpy()).astype(np.int64).tolist())
 
 
 _stage1_exclusion_cache = {}

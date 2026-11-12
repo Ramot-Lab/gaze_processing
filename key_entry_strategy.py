@@ -445,6 +445,24 @@ def build_participant_panel_sd(trial_df):
     return pd.DataFrame(rows)
 
 
+def build_participant_features(trial_df):
+    """Participant-level key-entry features merged into participant_features.csv
+    (decision 2026-11-11), one pair per category:
+      keyent_<cat>_pct_mean - % of ALL the participant's trials, pooled across panels
+                              (the spec's pooling rule - equivalently the trial-weighted
+                              mean of the panel percentages), as in PNG 3;
+      keyent_<cat>_pct_std  - SD of that % across the participant's own panels, as in PNG 4.
+    The _mean/_std naming lets the reduced heatmaps keep only the level and lets the
+    mean-vs-SD views pair them."""
+    level = build_participant_full_breakdown(trial_df)
+    sd = build_participant_panel_sd(trial_df)
+    out = level[["participant"]].copy()
+    for cat in EVENT_CATS:
+        out[f"keyent_{cat}_pct_mean"] = level[f"{cat}_pct"].to_numpy()
+    out = out.merge(sd[["participant"] + [f"{cat}_pct_sd" for cat in EVENT_CATS]], on="participant", how="left")
+    return out.rename(columns={f"{cat}_pct_sd": f"keyent_{cat}_pct_std" for cat in EVENT_CATS})
+
+
 def plot_strategy_sd_regression_vs_score(trial_df, df_participants, out_path, excluded=()):
     """PNG 4/4: each category's panel-to-panel SD (one value per participant, see
     build_participant_panel_sd) regressed against SDMT score - does how INCONSISTENT a

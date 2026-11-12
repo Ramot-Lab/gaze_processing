@@ -25,14 +25,14 @@ class DataManager:
         self.cfg = config
         self.participants = {"HC": {}, "pwMS": {}}
 
-        self.matrix_save_dir = os.path.join(self.cfg.main_output_path, "markov_matrices")
+        self.matrix_save_dir = os.path.join(self.cfg.main_output_path, self.cfg.matrices_dirname)
         os.makedirs(self.matrix_save_dir, exist_ok=True)
 
         # Nothing ever writes here (save_score_summary_table is dead code - never
         # called) - _load_scores_for_participant only ever READS from this path
         # (falling back to WAV-file parsing if it's missing), so the folder doesn't
         # need to be pre-created (decision 2026-09-27).
-        self.score_save_dir = os.path.join(self.cfg.output_base_path, "behavior_scores")
+        self.score_save_dir = self.cfg.scores_dir or os.path.join(self.cfg.output_base_path, "behavior_scores")
 
         # One row per participant/panel dropped during load_or_compute_matrices - saved to
         # exclusion_log.csv the same way Stage 1 logs its own drops, so both stages'
@@ -323,7 +323,11 @@ class DataManager:
         GazeMarkovModel.from_trial_stats. Saves matrices + a copy of the trial stats
         into this run's own folder, same layout as the normal from_scratch path."""
         source_reasons = self._load_source_exclusion_reasons()
-        src_folder = os.path.join(self.cfg.trial_stats_source_dir, "markov_matrices", group, p_name)
+        # "matrices" in the 2026-11-12 layout, "markov_matrices" in runs saved before it
+        src_root = os.path.join(self.cfg.trial_stats_source_dir, "matrices")
+        if not os.path.isdir(src_root):
+            src_root = os.path.join(self.cfg.trial_stats_source_dir, "markov_matrices")
+        src_folder = os.path.join(src_root, group, p_name)
         for panel in PANELS:
             src_path = os.path.join(src_folder, f"trial_stats_{p_name}_panel_{panel}.csv")
             if not os.path.exists(src_path):
@@ -400,12 +404,47 @@ class DataManager:
 
     def save_digit_asymmetry(self):
         per_panel, per_participant = self.compute_digit_asymmetry()
-        out_dir = os.path.join(self.cfg.main_output_path, "digit_asymmetry")
+        out_dir = os.path.join(self.cfg.main_output_path, self.cfg.asymmetry_dirname)
         os.makedirs(out_dir, exist_ok=True)
         per_panel.to_csv(os.path.join(out_dir, "digit_asymmetry_per_panel.csv"), index=False)
         per_participant.to_csv(os.path.join(out_dir, "digit_asymmetry_per_participant.csv"), index=False)
+        self._plot_digit_asymmetry_histogram(per_participant, out_dir)
         print(f"Saved digit asymmetry for {len(per_panel)} panels / {len(per_participant)} participants to {out_dir}")
         return per_panel, per_participant
+
+    def _plot_digit_asymmetry_histogram(self, per_participant, out_dir):
+        """Histogram of participant-level digit asymmetry (mean over panels), HC and MS
+        overlaid on shared bins (decision 2026-11-12: first asymmetry plot)."""
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from exclusion_policy import DEFAULT_TOBII_SUCKS_XLSX
+        from feature_pipeline import demographics_text, annotate_demographics
+
+        df = per_participant.dropna(subset=["digit_asymmetry_mean"]).rename(columns={"Group": "group"})
+        if df.empty:
+            print("No digit asymmetry values - histogram skipped.")
+            return
+        try:
+            demo = pd.read_excel(DEFAULT_TOBII_SUCKS_XLSX)[["Patient_ID", "Gender"]]
+            df = df.merge(demo.rename(columns={"Patient_ID": "Participant"}), on="Participant", how="left")
+        except Exception:
+            pass
+
+        bins = np.histogram_bin_edges(df["digit_asymmetry_mean"], bins=20)
+        fig, ax = plt.subplots(figsize=(8, 6))
+        for group, color in (("HC", "tab:blue"), ("pwMS", "tab:orange")):
+            vals = df.loc[df["group"] == group, "digit_asymmetry_mean"]
+            ax.hist(vals, bins=bins, alpha=0.55, color=color, edgecolor="black",
+                    label=f"{'MS' if group == 'pwMS' else group} (N={len(vals)})")
+        ax.set_xlabel("Digit asymmetry (participant mean over panels)")
+        ax.set_ylabel("N participants")
+        ax.set_title(f"Symbol->symbol transition asymmetry | {self.cfg.folder_name}")
+        ax.legend(loc="upper right")
+        annotate_demographics(demographics_text(df), ax=ax, loc="upper left")
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "digit_asymmetry_histogram.png"), dpi=150)
+        plt.close(fig)
 
     def filter_by_min_panels(self, min_panels=MIN_PANELS_FOR_MARKOV):
         """Drop participants with 1..min_panels-1 valid panel matrices from the analysis

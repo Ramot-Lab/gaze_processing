@@ -18,7 +18,6 @@ from scipy.stats import pearsonr
 
 from feature_pipeline import demographics_text, EXCLUDED_PARTICIPANTS
 
-DEFAULT_RUN_DIR = "/Volumes/ramot/Noam_M/markov_features_results_27_09_26/feature_analysis"
 
 
 def find_mean_std_pairs(df):
@@ -98,7 +97,11 @@ def plot_mean_vs_std(df, mean_col, std_col, score_col, title, out_path, demograp
     print(f"Saved: {out_path} (N={len(valid)}, r={r_val:.3f}, p={p_val:.3g})")
 
 
-def main(run_dir=DEFAULT_RUN_DIR, excluded=EXCLUDED_PARTICIPANTS):
+def main(run_dir=None, excluded=EXCLUDED_PARTICIPANTS):
+    # Default (decision 2026-11-11): the newest consolidated run, not a hard-coded date.
+    if run_dir is None:
+        import pipeline_config as pc
+        run_dir = pc.latest_feature_tables_dir()
     df_panels = pd.read_csv(os.path.join(run_dir, "panel_features.csv"))
     df_participants = pd.read_csv(os.path.join(run_dir, "participant_features.csv"))
 
@@ -145,7 +148,8 @@ def main(run_dir=DEFAULT_RUN_DIR, excluded=EXCLUDED_PARTICIPANTS):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-dir", default=DEFAULT_RUN_DIR,
-                         help="Feature-analysis run folder containing panel_features.csv/participant_features.csv")
+    parser.add_argument("--run-dir", default=None,
+                         help="Feature-analysis run folder containing panel_features.csv/participant_features.csv "
+                              "(default: the newest consolidated run)")
     args = parser.parse_args()
     main(run_dir=args.run_dir)

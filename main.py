@@ -9,89 +9,36 @@ import pipeline_config
 from pipeline_config import ANNOTATION_METHODS
 
 def run_pipeline(annotation_method="threshold_based", date_str=None, output_base_path=None,
-                  participant_whitelist=None, exclusion_summary_path=None):
+                  participant_whitelist=None, exclusion_summary_path=None, scores_dir=None):
     """date_str: which Stage 1 date-folder to read annotated CSVs from (None
     auto-resolves to the most recent existing one). output_base_path: override where
     this run's own output goes (None uses the normal preliminary_results_<method>
-    default) - e.g. a folder shared with the same day's feature-analysis run
-    (pipeline_config.consolidated_results_dir). participant_whitelist: restrict to just
-    these participant names (None runs the full population). exclusion_summary_path:
-    where the shared cross-stage exclusion summary CSV lives (None uses the old global
-    default - see pipeline_config.append_exclusion_summary_row)."""
+    default) - e.g. <date>/analysis_results/markov (run_full_pipeline.py).
+    participant_whitelist: restrict to just these participant names (None runs the
+    full population). exclusion_summary_path: where the shared cross-stage exclusion
+    summary CSV lives (None uses the old global default - see
+    pipeline_config.append_exclusion_summary_row). scores_dir: folder of the shared
+    all_scores.csv (None -> <output_base_path>/behavior_scores)."""
 
+    common = dict(with_repeats=False, use_mean_matrix=True, from_scratch=True, annotation_method=annotation_method,
+                  date_str=date_str, output_base_path=output_base_path, scores_dir=scores_dir)
+    # Decision 2026-11-12: four mean-matrix variants, without repeats -
+    #   w_exit_enter  (all states incl. ENTER/EXIT) and wo_exit_enter (digits 1-9 only),
+    #   each as probabilities (row-conditional P(B | A)) and n_transitions
+    #   (count(A->B) / all transitions in the panel; the matrix sums to 1).
+    # Only the first reads Stage 1's annotated gaze; the other three are rebuilt from its
+    # saved trial_stats CSVs (repeats/states are applied at count time), so it stays first.
+    # "normalized_by_score" (count / the panel's SDMT score) is off (decision 2026-11-11).
     tasks = [
-        # #----------------  WITHOUT REPEATS  ----------------#
-        # 1.  with Enter, Exit + Mean Matrix (decision 2026-09-27: analyze each
-        # participant's mean transition matrix, not every panel as its own row)
-        AnalysisConfig(with_repeats=False, only_1_to_9=False, use_mean_matrix=True, from_scratch=True,
-                       annotation_method=annotation_method, date_str=date_str, output_base_path=output_base_path),
-
-        # 1b/1c. Same as 1, but instead of row-conditional P(B | A):
-        #   1b "normalized_by_score":         count(A->B) / the panel's SDMT score
-        #   1c "normalized_by_n_transitions": count(A->B) / all transitions in the panel
-        #                                     (matrix sums to 1)
-        # Built from task 1's freshly saved trial_stats CSVs (no second pass over Stage
-        # 1's annotated gaze), so they must stay AFTER task 1. Each lands in its own
-        # analysis_..._NORMALIZED_BY_SCORE / analysis_..._NORMALIZED_BY_N_TRANSITIONS folder.
-        AnalysisConfig(with_repeats=False, only_1_to_9=False, use_mean_matrix=True, from_scratch=True,
-                       annotation_method=annotation_method, date_str=date_str, output_base_path=output_base_path,
-                       matrix_type="normalized_by_score"),
-        AnalysisConfig(with_repeats=False, only_1_to_9=False, use_mean_matrix=True, from_scratch=True,
-                       annotation_method=annotation_method, date_str=date_str, output_base_path=output_base_path,
-                       matrix_type="normalized_by_n_transitions"),
-
-        # # 2. with Enter, Exit + Mean Matrix
-        # AnalysisConfig(with_repeats=False, only_1_to_9=False, use_mean_matrix=True, from_scratch=False),
-        
-        # # # 3. Only 1-9 States + All Panels
-        # AnalysisConfig(with_repeats=False, only_1_to_9=True, use_mean_matrix=False, from_scratch=False),
-    
-        # # # 3. Only 1-9 States + Mean Matrix
-        # # AnalysisConfig(with_repeats=False, only_1_to_9=True, use_mean_matrix=True, from_scratch=False),
-    
-
-        # # #----------------  WITH REPEATS  ----------------#
-        # # # 1.  with Enter, Exit + All Panels
-        # AnalysisConfig(with_repeats=True, only_1_to_9=False, use_mean_matrix=False, from_scratch=False),
-        
-        # # # 2.  with Enter, Exit + Mean Matrix
-        # # AnalysisConfig(with_repeats=True, only_1_to_9=False, use_mean_matrix=True, from_scratch=False),
-        
-        # # # 3.  1-9 + All Panels
-        # AnalysisConfig(with_repeats=True, only_1_to_9=True, use_mean_matrix=False, from_scratch=False),
-    
-        # # 3. 1-9 + Mean Matrix
-        # AnalysisConfig(with_repeats=True, only_1_to_9=True, use_mean_matrix=True, from_scratch=False),
-
-        #----------------  CONCATENATED PANELS  ----------------#
-
-        # #------- WITH REPEATS -------#
-        # 1.  with Enter, Exit + Concatenated Panels
-        # AnalysisConfig(with_repeats=True, only_1_to_9=False, use_mean_matrix=False, from_scratch=False, concat_panels=True),
-
-        # 2.  1-9 + Concatenated Panels
-        # AnalysisConfig(with_repeats=True, only_1_to_9=True, use_mean_matrix=False, from_scratch=False, concat_panels=True),
-
-        # #------- WITHOUT REPEATS -------#
-        # # 3.  with Enter, Exit + Concatenated Panels
-        # AnalysisConfig(with_repeats=False, only_1_to_9=False, use_mean_matrix=False, from_scratch=False, concat_panels=True),
-
-        # # 4.  1-9 + Concatenated Panels
-        # AnalysisConfig(with_repeats=False, only_1_to_9=True, use_mean_matrix=False, from_scratch=False, concat_panels=True),
-
-    
+        AnalysisConfig(only_1_to_9=False, matrix_type="conditional", **common),
+        AnalysisConfig(only_1_to_9=False, matrix_type="normalized_by_n_transitions", **common),
+        AnalysisConfig(only_1_to_9=True, matrix_type="conditional", **common),
+        AnalysisConfig(only_1_to_9=True, matrix_type="normalized_by_n_transitions", **common),
+        # AnalysisConfig(only_1_to_9=False, matrix_type="normalized_by_score", **common),
     ]
-
-    # Non-conditional tasks with no explicit trial_stats source read the conditional task with the
-    # same repeats/states settings from this same run (listed earlier in tasks).
-    for config in tasks:
-        if config.matrix_type != "conditional" and config.from_scratch and config.trial_stats_source_dir is None:
-            config.trial_stats_source_dir = AnalysisConfig(
-                with_repeats=config.with_repeats, only_1_to_9=config.only_1_to_9,
-                use_mean_matrix=config.use_mean_matrix, from_scratch=False,
-                annotation_method=config.annotation_method, date_str=config.date_str,
-                raw_behavior_path=config.raw_behavior_path,
-                output_base_path=config.output_base_path).main_output_path
+    for config in tasks[1:]:
+        if config.trial_stats_source_dir is None:
+            config.trial_stats_source_dir = tasks[0].main_output_path
 
     for config in tasks:
         run_task(config, participant_whitelist=participant_whitelist,
@@ -155,12 +102,12 @@ def run_task(config, participant_whitelist=None, exclusion_summary_path=None):
     # B. Consistency Analysis (Violin + Permutation)
     analyzer.run_consistency_analysis(n_permutations=1000)
 
-    # C. Per-participant/panel matrix visualization (heatmap only - the network
-    # graph visualization was removed per decision 2026-09-27)
-    viz = MarkovVisualizer(output_dir=config.plot_output_path, matrix_type=config.matrix_type)
-    for p in participants:
-        for panel in p.matrices.keys():
-            viz.plot_heatmap(p, panel)
+    # C. Per-participant/panel matrix heatmap images - off (decision 2026-11-12); the
+    # matrices themselves are saved as CSVs under <variant>/matrices/.
+    # viz = MarkovVisualizer(output_dir=config.plot_output_path, matrix_type=config.matrix_type)
+    # for p in participants:
+    #     for panel in p.matrices.keys():
+    #         viz.plot_heatmap(p, panel)
 
 
     # ---------------------------------------------------------

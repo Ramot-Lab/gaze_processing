@@ -22,10 +22,19 @@ class MarkovAnalyzer:
         # --- FOLDER RENAMING ---
         self.output_dir = config.plot_output_path
         
-        self.pca_dir = os.path.join(self.output_dir, "pca")
+        # Sub-folder names of the 2026-11-12 layout (<variant>/pca/<name>); legacy runs
+        # keep their original names.
+        legacy = config.legacy_layout
+        self.subdir_names = {"pc_scatter": "pca" if legacy else "pc_scatter",
+                             "consistency": "consistency_within_vs_between" if legacy else "consistency",
+                             "panel_projection": "pca_panel_projection" if legacy else "panel_projection",
+                             "squared_cos": "squared_cosines" if legacy else "squared_cos"}
+        self.pca_dir = os.path.join(self.output_dir, self.subdir_names["pc_scatter"])
         self.weights_dir = os.path.join(self.output_dir, "weights")
         self.variance_dir = os.path.join(self.output_dir, "variance")
-        self.consistency_dir = os.path.join(self.output_dir, "consistency")
+        # Whole-matrix reliability: within- vs between-participant matrix correlations
+        # (violin + Mann-Whitney) and the within-participant permutation test.
+        self.consistency_dir = os.path.join(self.output_dir, self.subdir_names["consistency"])
         self.separation_dir = os.path.join(self.output_dir, "separation")
 
         for d in [self.output_dir, self.pca_dir, self.weights_dir,
@@ -366,6 +375,14 @@ class MarkovAnalyzer:
         for i in range(coords.shape[1]):
             df_metadata[f"PC{i+1}"] = coords[:, i]
 
+        # Numeric weights + explained variance (decision 2026-11-11): the heatmaps below
+        # are PNG-only, and live_board.py needs the actual values for its weights view.
+        pc_names = [f"PC{i + 1}" for i in range(pca.n_components_)]
+        pd.DataFrame(pca.components_.T, index=feature_names_clean, columns=pc_names).rename_axis("feature") \
+            .to_csv(os.path.join(self.weights_dir, "pca_weights.csv"))
+        pd.DataFrame({"PC": pc_names, "explained_variance_ratio": explained_var}) \
+            .to_csv(os.path.join(self.weights_dir, "pca_explained_variance.csv"), index=False)
+
         # 4. GROUP SEPARATION (still computed/saved for reference, no longer used to
         # pick which PCs to plot - decision 2026-09-27: always plot every PC1-3 pairwise
         # combination, a fixed and predictable set, rather than sometimes substituting
@@ -439,7 +456,7 @@ class MarkovAnalyzer:
         for i, c in enumerate(pc_cols):
             df_means[c] = fit["coords"][:, i]
 
-        out_root = os.path.join(self.output_dir, "pca_panel_projection")
+        out_root = os.path.join(self.output_dir, self.subdir_names["panel_projection"])
         os.makedirs(out_root, exist_ok=True)
         df_panels.to_csv(os.path.join(out_root, "panel_projection_scores.csv"), index=False)
         df_means.to_csv(os.path.join(out_root, "mean_matrix_scores.csv"), index=False)
@@ -497,7 +514,7 @@ class MarkovAnalyzer:
         df["dominant_PC"] = df[cos2_cols].idxmax(axis=1).str.replace("cos2_", "")
         df["z_norm"] = np.sqrt(z_norm_sq)
 
-        out_dir = os.path.join(self.output_dir, "squared_cosines")
+        out_dir = os.path.join(self.output_dir, self.subdir_names["squared_cos"])
         os.makedirs(out_dir, exist_ok=True)
         df.to_csv(os.path.join(out_dir, "squared_cosines_per_participant.csv"), index=False)
         print(f"Squared cosines for {len(df)} participants: mean share PC1..{n_pcs} = "

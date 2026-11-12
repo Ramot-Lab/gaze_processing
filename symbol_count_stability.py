@@ -38,7 +38,8 @@ import pandas as pd
 import pipeline_config as pc
 from feature_pipeline import EXCLUDED_PARTICIPANTS, PANELS, demographics_text, annotate_demographics
 
-DEFAULT_TABLES_DIR = os.path.join(pc.noam_m_root(), "markov_features_results_27_09_26", "feature_analysis")
+# Standalone default (decision 2026-11-11): the newest consolidated run's tables, not a
+# hard-coded date. feature_pipeline.main passes its own run_dir and an out_dir inside it.
 OUTPUT_ROOT = os.path.join(pc.noam_m_root(), "symbol_count_stability")
 
 METRIC = "symbol_counts_per_trial"
@@ -319,8 +320,9 @@ def write_readme(out_dir, tables_dir, people, summary):
 # ============================================================
 # 6. MAIN
 # ============================================================
-def main(tables_dir=DEFAULT_TABLES_DIR):
-    out_dir = os.path.join(OUTPUT_ROOT, date.today().strftime("%Y_%m_%d"))
+def main(tables_dir=None, out_dir=None):
+    tables_dir = tables_dir or pc.latest_feature_tables_dir()
+    out_dir = out_dir or os.path.join(OUTPUT_ROOT, date.today().strftime("%Y_%m_%d"))
     os.makedirs(out_dir, exist_ok=True)
 
     trials, panels, people = load_data(tables_dir)
@@ -357,4 +359,4 @@ def main(tables_dir=DEFAULT_TABLES_DIR):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_TABLES_DIR)
+    main(sys.argv[1] if len(sys.argv) > 1 else None)

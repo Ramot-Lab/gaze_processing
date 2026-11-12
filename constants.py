@@ -12,6 +12,7 @@ KEY_AUDIO_DATA = "audio_data"  # Key for the audio data file path
 KEY_STRIKE_SCORE = "strike_score"
 KEY_REACTION_TIMES = "reaction_times"  # Key for the raw per-press reaction-time deltas (seconds), fallback for panels with no "press N" messages
 KEY_RECORDING_DATE = "recording_date"
+KEY_INTERPOLATED_MASK = "interpolated_mask"  # per-sample bool: missing / out-of-range / outlier sample filled by np.interp
 TIME_STAMP = "t"
 SIGNAL_IDX = "signal_index"
 SENTENCE_BREAK = "sentence_breaks"
@@ -118,6 +119,26 @@ PSO_IDX = 3
 MERGE_ADJACENT_FIXATIONS = True
 MERGE_MAX_TIME_BETWEEN_FIXATIONS_MS = 75
 MERGE_MAX_ANGLE_BETWEEN_FIXATIONS_DEG = 0.5
+
+# BCEA interpolation rules, shared by fxsp (saccade_latency_analysis) and SDMT
+# (feature_pipeline) via saccade_latency_analysis.filled_in_rule.
+# Filled-in (interpolated) samples (decision 2026-11-10): the tracker drops isolated
+# samples constantly (fxsp: ~5% of panel-1 samples, 98.7% of filled-in samples inside fixations
+# are recording gaps, mostly 1-sample stretches), and a straight line across 1-5 samples
+# (<= 8.3 ms) between real samples is essentially the real position. A fixation is
+# dropped only if it contains a filled-in stretch LONGER than this (a blink / track
+# loss, where gaze was really not measured); otherwise all its samples, filled-in ones
+# included, go into BCEA. Was: any filled-in sample dropped the fixation (kept 61% of
+# fixation samples; this rule keeps ~93%).
+BCEA_MAX_FILLED_IN_STRETCH_SAMPLES = 5
+# ...AND it must have < 15% filled-in samples overall (decision 2026-11-10). The stretch
+# rule alone lets through "flicker" - many short dropouts (e.g. NS960: 214 of 716 samples
+# filled in, all in 1-5 sample stretches). Such data loss goes with poor tracking quality
+# (Wass, Smith & Johnson, 2013, Behav Res Methods 45:229-250), and in this data BCEA rises
+# with the filled-in share (>= 300 ms fixations, relative to the participant's median:
+# 1.2x at 0%, 1.8x at 5-20%, 2.2x at 20-30%, 3.1x above 30%). The 15% cutoff is a
+# data-driven choice, not a published standard; it removes ~3% of fixations.
+BCEA_MAX_FILLED_IN_FIXATION_PCT = 15
 
 
 # #fixatio saccade preprossesing constants

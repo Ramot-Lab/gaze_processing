@@ -50,7 +50,8 @@ import pandas as pd
 import scipy.io as scio
 
 import pipeline_config
-from constants import SACCADE_IDX, FIXATION_IDX, PSO_IDX, SCREEN_WIDTH_CM, SCREEN_HEIGHT_CM, deg_per_cm
+from constants import (SACCADE_IDX, FIXATION_IDX, PSO_IDX, SCREEN_WIDTH_CM, SCREEN_HEIGHT_CM, deg_per_cm,
+                       BCEA_MAX_FILLED_IN_STRETCH_SAMPLES, BCEA_MAX_FILLED_IN_FIXATION_PCT)
 
 TASK = "fxsp"
 GROUPS = ["pwMS", "HC"]
@@ -74,23 +75,11 @@ MIN_TRIALS_PER_PARTICIPANT = 2
 # a run of consecutive evt == FIXATION_IDX samples (after merge-adjacent-fixations, see
 # constants.MERGE_ADJACENT_FIXATIONS); kept only if >= 30 ms long.
 FIXATION_MIN_DURATION_MS = 30
-# Filled-in (interpolated) samples (decision 2026-11-10): the tracker drops isolated
-# samples constantly (~5% of panel-1 samples, 98.7% of filled-in samples inside fixations
-# are recording gaps, mostly 1-sample stretches), and a straight line across 1-5 samples
-# (<= 8.3 ms) between real samples is essentially the real position. A fixation is
-# dropped only if it contains a filled-in stretch LONGER than this (a blink / track
-# loss, where gaze was really not measured); otherwise all its samples, filled-in ones
-# included, go into BCEA. Was: any filled-in sample dropped the fixation (kept 61% of
-# fixation samples; this rule keeps ~93%).
-MAX_FILLED_IN_STRETCH_SAMPLES = 5
-# ...AND it must have < 15% filled-in samples overall (decision 2026-11-10). The stretch
-# rule alone lets through "flicker" - many short dropouts (e.g. NS960: 214 of 716 samples
-# filled in, all in 1-5 sample stretches). Such data loss goes with poor tracking quality
-# (Wass, Smith & Johnson, 2013, Behav Res Methods 45:229-250), and in this data BCEA rises
-# with the filled-in share (>= 300 ms fixations, relative to the participant's median:
-# 1.2x at 0%, 1.8x at 5-20%, 2.2x at 20-30%, 3.1x above 30%). The 15% cutoff is a
-# data-driven choice, not a published standard; it removes ~3% of fixations.
-MAX_FILLED_IN_FIXATION_PCT = 15
+# Interpolation rules for BCEA fixations: constants.BCEA_MAX_FILLED_IN_STRETCH_SAMPLES and
+# constants.BCEA_MAX_FILLED_IN_FIXATION_PCT (rationale and citations there), applied by
+# filled_in_rule - shared with the SDMT fixation BCEA in feature_pipeline.
+MAX_FILLED_IN_STRETCH_SAMPLES = BCEA_MAX_FILLED_IN_STRETCH_SAMPLES
+MAX_FILLED_IN_FIXATION_PCT = BCEA_MAX_FILLED_IN_FIXATION_PCT
 # BCEA reported in deg^2, the visual-angle unit of the fixation-stability literature
 # (Steinman, 1965, JOSA 55:1158; Castet & Crossland, 2012, Seeing Perceiving 25:449),
 # in cm^2 on the screen, and in Tobii normalized units (for comparison with
@@ -316,6 +305,25 @@ def filter_latencies(latencies):
     return {k: v for k, v in latencies.items() if k in keep and LATENCY_MIN_S <= v <= LATENCY_MAX_S}
 
 
+def filled_in_rule(filled):
+    """The BCEA interpolation rules (constants.BCEA_MAX_FILLED_IN_*), for one fixation.
+    filled: per-sample bool, True where the sample was filled in by interpolation.
+    Returns (reject, n_filled, longest_stretch); reject is None (keep), "long_stretch"
+    (> MAX_FILLED_IN_STRETCH consecutive filled-in samples) or "high_pct"
+    (>= MAX_FILLED_IN_FIXATION_PCT % of the fixation filled in)."""
+    filled = np.asarray(filled, dtype=bool)
+    n_filled = int(filled.sum())
+    if n_filled == 0:
+        return None, 0, 0
+    fe = np.diff(np.concatenate(([0], filled.astype(np.int8), [0])))
+    longest = int((np.flatnonzero(fe == -1) - np.flatnonzero(fe == 1)).max())
+    if longest > MAX_FILLED_IN_STRETCH_SAMPLES:
+        return "long_stretch", n_filled, longest
+    if n_filled / len(filled) * 100 >= MAX_FILLED_IN_FIXATION_PCT:
+        return "high_pct", n_filled, longest
+    return None, n_filled, longest
+
+
 def compute_fixation_bcea(samples_df, interpolated, panel_messages, sampling_rate_hz=SAMPLING_RATE_HZ):
     """One row per fixation (run of consecutive evt == FIXATION_IDX samples) in panel 1.
     BCEA uses feature_pipeline._bcea (the same formula/p as the SDMT fixation_bcea
@@ -343,15 +351,11 @@ def compute_fixation_bcea(samples_df, interpolated, panel_messages, sampling_rat
             n_short += 1
             continue
         filled = interpolated[s:e]
-        if filled.any():
-            fe = np.diff(np.concatenate(([0], filled.astype(np.int8), [0])))
-            longest_filled = int((np.flatnonzero(fe == -1) - np.flatnonzero(fe == 1)).max())
-        else:
-            longest_filled = 0
-        if longest_filled > MAX_FILLED_IN_STRETCH_SAMPLES:
+        reject, n_filled, longest_filled = filled_in_rule(filled)
+        if reject == "long_stretch":
             n_interp += 1
             continue
-        if filled.sum() / (e - s) * 100 >= MAX_FILLED_IN_FIXATION_PCT:
+        if reject == "high_pct":
             n_high_pct += 1
             continue
         bcea_norm = _bcea(list(zip(x[s:e], y[s:e])))
@@ -361,7 +365,7 @@ def compute_fixation_bcea(samples_df, interpolated, panel_messages, sampling_rat
             "onset_ms": ts[s],
             "duration_ms": (e - s) * 1000 / sampling_rate_hz,
             "n_samples_in_bcea": e - s,  # every fixation sample, interpolated ones included
-            "n_interpolated_samples_in_fixation": int(filled.sum()), "longest_filled_in_stretch": longest_filled,
+            "n_interpolated_samples_in_fixation": n_filled, "longest_filled_in_stretch": longest_filled,
             "mean_x_norm": x[s:e].mean(), "mean_y_norm": y[s:e].mean(),
             "std_x_norm": x[s:e].std(ddof=1), "std_y_norm": y[s:e].std(ddof=1),
             "mean_x_cm": x[s:e].mean() * SCREEN_WIDTH_CM, "mean_y_cm": y[s:e].mean() * SCREEN_HEIGHT_CM,

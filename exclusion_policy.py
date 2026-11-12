@@ -33,7 +33,11 @@ run_preprocessing.py logs for each one is traceable back to why.
 """
 import pandas as pd
 
-DEFAULT_TOBII_SUCKS_XLSX = "/Volumes/ramot/Noam_M/df_filtered_behavioral_summary_20260427_131437.xlsx"
+from pipeline_config import BEHAVIORAL_SUMMARY_XLSX
+
+# The current behavioral summary table (decision 2026-11-12, was
+# df_filtered_behavioral_summary_20260427_131437.xlsx).
+DEFAULT_TOBII_SUCKS_XLSX = BEHAVIORAL_SUMMARY_XLSX
 ACCURACY_EXCLUSION_THRESHOLD_DEG = 2.5
 
 MANUALLY_EXCLUDED_PARTICIPANTS = {

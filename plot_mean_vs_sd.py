@@ -21,9 +21,8 @@ from scipy.stats import linregress, t as t_dist
 import pipeline_config as pc
 from feature_pipeline import EXCLUDED_PARTICIPANTS, demographics_text, annotate_demographics
 
-DEFAULT_FEATURES_CSV = os.path.join(pc.noam_m_root(), "markov_features_results_27_09_26",
-                                    "feature_analysis", "participant_features.csv")
-DEFAULT_OUT_DIR = os.path.join(pc.noam_m_root(), "markov_feature_analysis_02_11_26", "mean_vs_sd_shape")
+# Defaults (decision 2026-11-11): the newest consolidated run's participant table, with the
+# plots written next to it - resolved at call time, not a hard-coded run date.
 
 GROUP_COLORS = {"HC": "tab:blue", "MS": "tab:orange", "pwMS": "tab:orange"}
 
@@ -76,7 +75,10 @@ def plot_pair(df, feature, mean_col, sd_col, out_path):
             "slope": fit.slope, "intercept": fit.intercept}
 
 
-def main(features_csv=DEFAULT_FEATURES_CSV, out_dir=DEFAULT_OUT_DIR):
+def main(features_csv=None, out_dir=None):
+    if features_csv is None:
+        features_csv = os.path.join(pc.latest_feature_tables_dir(), "participant_features.csv")
+    out_dir = out_dir or os.path.join(os.path.dirname(features_csv), "mean_vs_sd")
     os.makedirs(out_dir, exist_ok=True)
     df = pd.read_csv(features_csv)
     df = df[~df["participant"].isin(EXCLUDED_PARTICIPANTS)]
