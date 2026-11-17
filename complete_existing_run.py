@@ -147,12 +147,17 @@ def markov_step():
         markov_main.run_task(cfg, exclusion_summary_path=os.path.join(ROOT, "analysis_participant_exclusion_summary.csv"))
 
 
-def features_step():
+def features_step(reference_csv=None):
+    """reference_csv: the old participant table to diff against (default: the moved one,
+    read before it is overwritten). Safe to re-run: every merge drops its columns first,
+    and the event-duration table is reused if already saved."""
     import feature_pipeline as fp
     from markov_core import AnalysisConfig
 
     df_trials, df_panels, df_old = fp.load_tables(FEATURES)
     df = df_old.copy()
+    if reference_csv is not None:
+        df_old = pd.read_csv(reference_csv)
 
     # typicality_slope (panel level -> participant mean), from the saved trial table
     df_panels = fp.compute_typicality_slope(df_trials, df_panels.drop(columns=["typicality_slope"], errors="ignore"))
@@ -160,7 +165,10 @@ def features_step():
     df = df.drop(columns=["typicality_slope_mean"], errors="ignore").merge(slope, on="participant", how="left")
 
     # fixation / saccade duration (one scan of the Stage 1 CSVs)
-    df_durations = fp.build_and_save_event_durations(METHOD, FEATURES, date_str=DATE)
+    if os.path.exists(fp.event_durations_table_path(FEATURES)):
+        df_durations = pd.read_csv(fp.event_durations_table_path(FEATURES))
+    else:
+        df_durations = fp.build_and_save_event_durations(METHOD, FEATURES, date_str=DATE)
     df = fp.merge_event_durations(df.drop(columns=[c for c in df.columns if c.startswith(("fixation_duration_ms",
                                                                                             "saccade_duration_ms"))]),
                                   df_durations)
@@ -180,6 +188,8 @@ def features_step():
     # columns that are new, or whose values changed, vs. the old participant table
     new_or_changed = set()
     for col in df.columns:
+        if col == "participant":
+            continue
         if col not in df_old.columns:
             new_or_changed.add(col)
             continue
@@ -218,11 +228,17 @@ if __name__ == "__main__":
     import matplotlib
     matplotlib.use("Agg")
     dry = "--dry-run" in sys.argv[1:]
-    print(f"Old run: {OLD_RUN}\nNew root: {ROOT}\n")
-    do_moves(dry)
-    if dry:
-        sys.exit(0)
-    for name, fn in (("Markov", markov_step), ("Features", features_step), ("Live board cache", board_step)):
+    # --from-features <reference participant_features.csv>: resume after the Markov step
+    if "--from-features" in sys.argv[1:]:
+        ref = sys.argv[sys.argv.index("--from-features") + 1]
+        steps = (("Features", lambda: features_step(ref)), ("Live board cache", board_step))
+    else:
+        print(f"Old run: {OLD_RUN}\nNew root: {ROOT}\n")
+        do_moves(dry)
+        if dry:
+            sys.exit(0)
+        steps = (("Markov", markov_step), ("Features", features_step), ("Live board cache", board_step))
+    for name, fn in steps:
         print(f"\n{'=' * 60}\n{name}\n{'=' * 60}", flush=True)
         fn()
     print("\nDone.")

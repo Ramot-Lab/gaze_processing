@@ -450,6 +450,10 @@ def compute_typicality(df_trials, coverage_pctl=TYPICALITY_COVERAGE_PCTL):
         df_trials["symbol_counts_per_trial"] - df_trials["trial_mean"],
         np.nan,
     )
+    # typicality_abs (decision 2026-11-15): |typicality| - undirected "how far from the
+    # population's pace" instead of typicality's own signed "above/below the population's
+    # pace" - same eligibility/trial_mean, just the magnitude.
+    df_trials["typicality_abs"] = df_trials["typicality"].abs()
     df_trials = df_trials.drop(columns=["trial_mean"])
 
     print(f"Typicality: {len(eligible_participants)}/{df_trials['participant'].nunique()} participants "
@@ -457,50 +461,55 @@ def compute_typicality(df_trials, coverage_pctl=TYPICALITY_COVERAGE_PCTL):
     return df_trials
 
 
-def compute_typicality_slope(df_trials, df_panels, coverage_pct=TYPICALITY_SLOPE_COVERAGE_PCT):
+def compute_typicality_slope(df_trials, df_panels, coverage_pct=TYPICALITY_SLOPE_COVERAGE_PCT,
+                              value_col="typicality", out_col=None):
     """typicality_slope - panel-level feature (decision 2026-11-12). Unlike
     first5_last5_slope (each participant's own first-5/last-5 trials, by their own
     trial count), this uses a FIXED trial_idx window that is the SAME for every
     participant in a given panel: trial_idx 0-9 ('first 10') vs. the last 10 trial_idx
     positions that at least `coverage_pct`% of the panel's OWN participants actually
     reached ('last 10') - found once per panel from the whole population's per-trial-
-    position coverage curve, not per participant. Requires df_trials["typicality"] to
+    position coverage curve, not per participant. Requires df_trials[value_col] to
     already be populated (compute_typicality must run first).
 
-    slope = (mean typicality over the last-10 window - mean typicality over the
-    first-10 window) / (mean trial_idx of the last-10 window actually used - mean
-    trial_idx of the first-10 window actually used) - a two-point slope in real
-    typicality-per-trial units, matching first5_last5_slope's own units convention.
-    NaN if a participant has no valid typicality value in either window, or if a
-    panel's last-10 window would overlap the first-10 window (too few trials overall
-    to form two separate blocks)."""
+    slope = (mean value over the last-10 window - mean value over the first-10 window)
+    / (mean trial_idx of the last-10 window actually used - mean trial_idx of the
+    first-10 window actually used) - a two-point slope in real value-per-trial units,
+    matching first5_last5_slope's own units convention. NaN if a participant has no
+    valid value in either window, or if a panel's last-10 window would overlap the
+    first-10 window (too few trials overall to form two separate blocks).
+
+    value_col/out_col (decision 2026-11-15): same mechanism reused for typicality_abs_slope
+    (value_col="typicality_abs") - out_col defaults to f"{value_col}_slope" (so
+    "typicality" -> "typicality_slope", "typicality_abs" -> "typicality_abs_slope")."""
+    out_col = out_col or f"{value_col}_slope"
     rows = []
     for panel, panel_trials in df_trials.groupby("panel"):
         n_participants = panel_trials["participant"].nunique()
         coverage = panel_trials.groupby("trial_idx")["participant"].nunique() / n_participants * 100
         eligible_trial_idx = coverage[coverage >= coverage_pct].index
         if len(eligible_trial_idx) == 0:
-            print(f"typicality_slope: panel {panel} has no trial_idx reached by >= {coverage_pct}% "
+            print(f"{out_col}: panel {panel} has no trial_idx reached by >= {coverage_pct}% "
                   f"of its participants - skipped.")
             continue
         last_trial_idx = eligible_trial_idx.max()
         if last_trial_idx - 9 < 10:
-            print(f"typicality_slope: panel {panel}'s last-10 window (ending at trial_idx "
+            print(f"{out_col}: panel {panel}'s last-10 window (ending at trial_idx "
                   f"{last_trial_idx}) would overlap the first-10 window - skipped.")
             continue
         first10_idx = set(range(0, 10))
         last10_idx = set(range(last_trial_idx - 9, last_trial_idx + 1))
 
         for participant, g in panel_trials.groupby("participant"):
-            g = g.dropna(subset=["typicality"])
-            first_vals = g.loc[g["trial_idx"].isin(first10_idx), ["trial_idx", "typicality"]]
-            last_vals = g.loc[g["trial_idx"].isin(last10_idx), ["trial_idx", "typicality"]]
+            g = g.dropna(subset=[value_col])
+            first_vals = g.loc[g["trial_idx"].isin(first10_idx), ["trial_idx", value_col]]
+            last_vals = g.loc[g["trial_idx"].isin(last10_idx), ["trial_idx", value_col]]
             if first_vals.empty or last_vals.empty:
-                rows.append({"participant": participant, "panel": panel, "typicality_slope": np.nan})
+                rows.append({"participant": participant, "panel": panel, out_col: np.nan})
                 continue
             x_first, x_last = first_vals["trial_idx"].mean(), last_vals["trial_idx"].mean()
-            slope = (last_vals["typicality"].mean() - first_vals["typicality"].mean()) / (x_last - x_first)
-            rows.append({"participant": participant, "panel": panel, "typicality_slope": slope})
+            slope = (last_vals[value_col].mean() - first_vals[value_col].mean()) / (x_last - x_first)
+            rows.append({"participant": participant, "panel": panel, out_col: slope})
 
     slopes = pd.DataFrame(rows)
     return df_panels.merge(slopes, on=["participant", "panel"], how="left")
@@ -831,9 +840,9 @@ def compute_whole_panel_dispersion(participants, df_bcea=None):
 # 5. PARTICIPANT TABLE + EXTERNAL MERGES
 # ============================================================
 def build_participant_table(df_trials, df_panels, participants):
-    stats = df_trials.groupby("participant")[TRIAL_FEATURE_ATTRS + ["typicality"]].agg(["mean", "std"])
+    stats = df_trials.groupby("participant")[TRIAL_FEATURE_ATTRS + ["typicality", "typicality_abs"]].agg(["mean", "std"])
     stats.columns = [f"{col}_{stat}" for col, stat in stats.columns]
-    stats = stats.rename(columns={"typicality_mean": "mean_typicality"})
+    stats = stats.rename(columns={"typicality_mean": "mean_typicality", "typicality_abs_mean": "mean_typicality_abs"})
     stats = stats.reset_index()
 
     mean_score = df_panels.groupby("participant")["score"].mean().rename("score").reset_index()
@@ -841,11 +850,14 @@ def build_participant_table(df_trials, df_panels, participants):
     slopes = df_panels.groupby("participant")["first5_last5_slope"].mean().rename("first5_last5_slope_mean").reset_index()
     typicality_slopes = (df_panels.groupby("participant")["typicality_slope"].mean()
                           .rename("typicality_slope_mean").reset_index())
+    typicality_abs_slopes = (df_panels.groupby("participant")["typicality_abs_slope"].mean()
+                              .rename("typicality_abs_slope_mean").reset_index())
 
     df_participants = stats.merge(mean_score, on="participant", how="left")
     df_participants = df_participants.merge(group_lookup, on="participant", how="left")
     df_participants = df_participants.merge(slopes, on="participant", how="left")
     df_participants = df_participants.merge(typicality_slopes, on="participant", how="left")
+    df_participants = df_participants.merge(typicality_abs_slopes, on="participant", how="left")
     return df_participants
 
 
@@ -1550,6 +1562,7 @@ FEATURE_DOMAIN = {
     "revisits_per_trial": "red",
     "first5_last5_slope": "red",
     "typicality_slope": "red",
+    "typicality_abs_slope": "red",
     "CCMT_Acc_Combined": "red",
     "CFMT_Acc_Combined": "red",
     # yellow = motor
@@ -1587,6 +1600,7 @@ FEATURE_DOMAIN = {
     "Markov_PC2": "grey",
     "Markov_PC3": "grey",
     "mean_typicality": "grey",
+    "mean_typicality_abs": "grey",
 }
 
 # Dropped from this heatmap entirely (decision 2026-10-29): clinical/demographic
@@ -1830,10 +1844,12 @@ MEASURE_TYPE = {
     "symbol_counts_per_trial": "task_behavior",
     "symbols_corr_to_mean": "task_behavior",
     "typicality": "task_behavior",
+    "typicality_abs": "task_behavior",
     "trial_in_search_durations_ms": "task_behavior",
     "fixation_counts_per_trial": "task_behavior",
     "first5_last5_slope": "task_behavior",
     "typicality_slope": "task_behavior",
+    "typicality_abs_slope": "task_behavior",
     "keyent_memory_pct": "task_behavior",
     "keyent_proximity_pct": "task_behavior",
     "keyent_undershoot_pct": "task_behavior",
@@ -1849,6 +1865,7 @@ MEASURE_TYPE = {
     "Markov_PC2": "other",
     "Markov_PC3": "other",
     "mean_typicality": "other",
+    "mean_typicality_abs": "other",
 }
 MEASURE_TYPE_ORDER = ["oculomotor", "task_behavior", "cognitive_test", "other"]
 MEASURE_TYPE_COLORS = {
@@ -2532,6 +2549,7 @@ def main(annotation_method="threshold_based", date_str=None, run_dir=None, marko
         df_panels = compute_panel_slopes(df_trials, df_panels)
         df_trials = compute_typicality(df_trials)
         df_panels = compute_typicality_slope(df_trials, df_panels)
+        df_panels = compute_typicality_slope(df_trials, df_panels, value_col="typicality_abs")
 
         # Per-fixation BCEA is saved as its own table FIRST, and the panel/participant
         # fixation_bcea features are aggregated from that saved table (decision
